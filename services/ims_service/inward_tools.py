@@ -2,6 +2,7 @@ import base64
 import json
 import re
 import time
+import threading
 from datetime import datetime
 from typing import Optional, List
 
@@ -32,6 +33,10 @@ from services.ims_service.inward_models import (
 )
 
 logger = get_logger("ims.inward")
+
+# Global lock to prevent concurrent PO extractions (each extraction fires
+# many sequential Claude API calls; concurrent extractions overwhelm rate limits)
+_extraction_lock = threading.Lock()
 
 
 # ---------- Helpers ----------
@@ -1140,7 +1145,7 @@ def _split_pdf_pages(file_bytes: bytes) -> list[bytes]:
 
 
 _PO_EXTRACT_PROMPT = (
-    "This page (or set of pages) is from a Purchase Order PDF. "
+    "This page is from a Purchase Order PDF. "
     "Extract ALL Purchase Orders found and return ONLY valid JSON "
     "(no markdown, no code fences, no explanation).\n\n"
     "Return this exact structure:\n"
@@ -1196,6 +1201,9 @@ _PO_EXTRACT_PROMPT = (
     "- Examples of WRONG item_description: \"California Pista Inshell 43000 LB, RATE $4.29\", "
     "\"Cashew 210 W210\", \"PVC Pipe 100 meters @ Rs 250\"\n"
     "- Extract EVERY line item from the PO — do not skip or merge any rows.\n"
+    "- NEVER use newline characters in item_description. If the product name or pack size "
+    "(e.g. \"1*2\", \"10KG\", \"25-27 count\") appears on a separate line in the PDF, "
+    "join it with the main description using a space.\n"
     "- If a single row has a long description with sub-items separated by commas or line breaks, "
     "split them into separate article objects.\n"
     "- IMPORTANT: In these POs, each line item has a MAIN description in the Description column, "
@@ -1212,7 +1220,7 @@ _PO_EXTRACT_PROMPT = (
 
 
 def _call_claude_extract(client, pdf_b64: str) -> dict:
-    """Call Claude API with retry for a single PDF chunk."""
+    """Call Claude API with retry for a single PDF page."""
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -1239,7 +1247,7 @@ def _call_claude_extract(client, pdf_b64: str) -> dict:
             break
         except anthropic.RateLimitError:
             if attempt < max_retries - 1:
-                wait = (attempt + 1) * 30
+                wait = (attempt + 1) * 10
                 logger.warning(f"Rate limited, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(wait)
             else:
@@ -1265,6 +1273,19 @@ def _call_claude_extract(client, pdf_b64: str) -> dict:
 
 def extract_po_from_pdf(file_bytes: bytes) -> dict:
     """Split PDF by page, send each page to Claude, merge all POs."""
+    if not _extraction_lock.acquire(blocking=False):
+        raise HTTPException(
+            429,
+            "Another PO extraction is already in progress. Please wait and try again.",
+        )
+    try:
+        return _extract_po_from_pdf_inner(file_bytes)
+    finally:
+        _extraction_lock.release()
+
+
+def _extract_po_from_pdf_inner(file_bytes: bytes) -> dict:
+    """Internal extraction logic (called under lock)."""
     client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
     pages = _split_pdf_pages(file_bytes)
@@ -1273,12 +1294,20 @@ def extract_po_from_pdf(file_bytes: bytes) -> dict:
     all_pos: list[dict] = []
     seen_po_numbers: dict[str, int] = {}  # po_number -> index in all_pos
 
-    for i, page_bytes in enumerate(pages):
-        page_b64 = base64.standard_b64encode(page_bytes).decode("utf-8")
+    # Pacing: after every 120s of continuous API calls, pause 5s to avoid rate limits
+    batch_start = time.time()
+    PACE_WINDOW = 120  # seconds
+    PACE_PAUSE = 5     # seconds
 
-        # Wait between pages to respect rate limits
-        if i > 0:
-            time.sleep(2)
+    for i, page_bytes in enumerate(pages):
+        # Check if we've been running for 120s — if so, cool down
+        elapsed = time.time() - batch_start
+        if elapsed >= PACE_WINDOW:
+            logger.info(f"Pacing: {elapsed:.0f}s elapsed, pausing {PACE_PAUSE}s before page {i + 1}")
+            time.sleep(PACE_PAUSE)
+            batch_start = time.time()
+
+        page_b64 = base64.standard_b64encode(page_bytes).decode("utf-8")
 
         logger.info(f"Extracting page {i + 1}/{len(pages)}")
         result = _call_claude_extract(client, page_b64)
@@ -1333,17 +1362,17 @@ def extract_po_from_pdf(file_bytes: bytes) -> dict:
     if not all_pos:
         raise HTTPException(422, "No purchase orders could be extracted from the PDF")
 
-    # Clean up item_description: strip sub-descriptions that Claude may have appended.
-    # POs often have a sub-description / variant line below the HSN code (e.g. "FARD C DATES"
-    # under "AL BARAKAH FARD DATES STANDARD", or "W210" under "Cashew 210").
-    # Claude may combine them with newlines, " - ", or "desc:".
+    # Clean up item_description: join multi-line names and strip "desc:" suffixes.
+    # Claude may split pack sizes like "1*2" onto a second line — join with space
+    # so "Afghan Black Raisins Seedless\n1*2" becomes "Afghan Black Raisins Seedless 1*2".
+    # Also strip "desc:" or "Desc:" suffixes if Claude appended a sub-description.
     for po in all_pos:
         for article in po.get("articles", []):
             desc = article.get("item_description", "")
             if desc:
-                # Split on newlines — take only the first line
-                cleaned = desc.split("\n")[0].strip()
-                # Also strip "desc:" or "Desc:" suffixes if Claude formatted it that way
+                # Replace newlines with spaces to preserve pack sizes (e.g. "1*2")
+                cleaned = " ".join(desc.split())
+                # Strip "desc:" or "Desc:" suffixes if Claude formatted it that way
                 cleaned = re.split(r"\s*desc\s*:\s*", cleaned, maxsplit=1, flags=re.IGNORECASE)[0].strip()
                 if cleaned:
                     article["item_description"] = cleaned

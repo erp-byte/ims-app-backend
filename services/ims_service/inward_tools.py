@@ -1221,6 +1221,125 @@ def log_box_edits(payload: BoxEditLogRequest, db: Session) -> dict:
     return {"status": "logged", "entries": len(payload.changes)}
 
 
+# ---------- Box Lookup (used by interunit) ----------
+
+
+def get_box_by_number(company: Company, box_number: int, transaction_no: str, db: Session) -> dict:
+    """Look up a single box by box_number and transaction_no from the company boxes table."""
+    prefix = "cfpl" if company == "CFPL" else "cdpl"
+    box_table = f"{prefix}_boxes_v2"
+    art_table = f"{prefix}_articles_v2"
+    sku_table = f"{prefix}sku"
+
+    box_res = db.execute(
+        text(f"""
+            SELECT b.*, a.sku_id, a.item_description, a.item_category, a.sub_category,
+                   a.material_type, a.net_weight AS article_net_weight,
+                   a.total_weight AS article_total_weight, a.uom,
+                   a.manufacturing_date, a.expiry_date, a.lot_number AS article_lot_number,
+                   a.quantity_units, a.quality_grade,
+                   s.material_type AS sku_material_type
+            FROM {box_table} b
+            LEFT JOIN {art_table} a
+                ON b.transaction_no = a.transaction_no
+                AND b.article_description = a.item_description
+            LEFT JOIN {sku_table} s ON a.sku_id = s.id
+            WHERE b.box_number = :box_number AND b.transaction_no = :txno
+            LIMIT 1
+        """),
+        {"box_number": box_number, "txno": transaction_no},
+    ).fetchone()
+
+    if not box_res:
+        raise HTTPException(404, f"Box #{box_number} with transaction_no '{transaction_no}' not found in {company}")
+
+    box = dict(box_res._mapping)
+
+    return {
+        "success": True,
+        "box": {
+            "box_id": box.get("box_id"),
+            "transaction_no": box.get("transaction_no"),
+            "box_number": box.get("box_number"),
+            "article_description": box.get("article_description"),
+            "item_description": box.get("item_description") or box.get("article_description"),
+            "sku_id": box.get("sku_id"),
+            "item_category": box.get("item_category"),
+            "sub_category": box.get("sub_category"),
+            "material_type": box.get("material_type") or box.get("sku_material_type"),
+            "net_weight": float(box.get("net_weight") or 0),
+            "gross_weight": float(box.get("gross_weight") or 0),
+            "lot_number": box.get("lot_number") or box.get("article_lot_number"),
+            "batch_number": box.get("batch_number"),
+            "uom": box.get("uom"),
+            "manufacturing_date": str(box.get("manufacturing_date") or ""),
+            "expiry_date": str(box.get("expiry_date") or ""),
+            "quantity_units": box.get("quantity_units"),
+            "packaging_type": box.get("packaging_type"),
+            "quality_grade": box.get("quality_grade"),
+            "count": box.get("count"),
+        },
+    }
+
+
+def get_box_by_box_id(company: Company, box_id: str, transaction_no: str, db: Session) -> dict:
+    """Look up a single box by box_id and transaction_no — searches both cfpl_boxes and cdpl_boxes."""
+
+    for prefix in ("cfpl", "cdpl"):
+        box_table = f"{prefix}_boxes_v2"
+        art_table = f"{prefix}_articles_v2"
+        sku_table = f"{prefix}sku"
+
+        box_res = db.execute(
+            text(f"""
+                SELECT b.*, a.sku_id, a.item_description, a.item_category, a.sub_category,
+                       a.material_type, a.net_weight AS article_net_weight,
+                       a.total_weight AS article_total_weight, a.uom,
+                       a.manufacturing_date, a.expiry_date, a.lot_number AS article_lot_number,
+                       a.quantity_units, a.quality_grade,
+                       s.material_type AS sku_material_type
+                FROM {box_table} b
+                LEFT JOIN {art_table} a
+                    ON b.transaction_no = a.transaction_no
+                    AND b.article_description = a.item_description
+                LEFT JOIN {sku_table} s ON a.sku_id = s.id
+                WHERE b.box_id = :box_id AND b.transaction_no = :txno
+                LIMIT 1
+            """),
+            {"box_id": box_id, "txno": transaction_no},
+        ).fetchone()
+
+        if box_res:
+            box = dict(box_res._mapping)
+            return {
+                "success": True,
+                "box": {
+                    "box_id": box.get("box_id"),
+                    "transaction_no": box.get("transaction_no"),
+                    "box_number": box.get("box_number"),
+                    "article_description": box.get("article_description"),
+                    "item_description": box.get("item_description") or box.get("article_description"),
+                    "sku_id": box.get("sku_id"),
+                    "item_category": box.get("item_category"),
+                    "sub_category": box.get("sub_category"),
+                    "material_type": box.get("material_type") or box.get("sku_material_type"),
+                    "net_weight": float(box.get("net_weight") or 0),
+                    "gross_weight": float(box.get("gross_weight") or 0),
+                    "lot_number": box.get("lot_number") or box.get("article_lot_number"),
+                    "batch_number": box.get("batch_number"),
+                    "uom": box.get("uom"),
+                    "manufacturing_date": str(box.get("manufacturing_date") or ""),
+                    "expiry_date": str(box.get("expiry_date") or ""),
+                    "quantity_units": box.get("quantity_units"),
+                    "packaging_type": box.get("packaging_type"),
+                    "quality_grade": box.get("quality_grade"),
+                    "count": box.get("count"),
+                },
+            }
+
+    raise HTTPException(404, f"Box with box_id '{box_id}' and transaction_no '{transaction_no}' not found in cfpl_boxes or cdpl_boxes")
+
+
 # ---------- PO PDF Extraction ----------
 
 

@@ -1,205 +1,130 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from shared.database import get_db
-from services.ims_service.models import (
-    LoginRequest, CreateUserRequest, UpdateUserRequest,
-    UpdatePermissionsRequest, UpdateCompanyRolesRequest,
+from services.bulk_entry_service.models import (
+    Company,
+    BulkEntryPayload,
+    BulkEntryFullUpdate,
+    BulkEntryResponse,
+    BulkEntryDetailResponse,
+    BulkEntryListResponse,
+    BulkEntryDeleteResponse,
+    BoxUpsertRequest,
+    BoxResponse,
+    BoxListResponse,
+    BoxUpsertResponse,
+    TransactionResponse,
 )
-from services.ims_service.dependencies import verify_token
-from services.ims_service.tools import (
-    login,
-    create_user,
-    list_users,
-    update_user,
-    delete_user,
-    get_user_companies,
-    get_dashboard_info,
-    get_current_user,
-    check_permission,
-    get_user_permissions,
-    update_user_permissions,
-    get_user_company_roles,
-    update_user_company_roles,
+from services.bulk_entry_service.tools import (
+    create_bulk_entry,
+    list_bulk_entries,
+    get_bulk_entry,
+    update_bulk_entry,
+    delete_bulk_entry,
+    list_boxes,
+    lookup_box,
+    upsert_box,
 )
 
-router = APIRouter(prefix="/auth", tags=["ims-auth"])
+router = APIRouter(prefix="/bulk-entry", tags=["bulk-entry"])
 
 
-@router.post("/login")
-def login_endpoint(body: LoginRequest, db: Session = Depends(get_db)):
-    result = login(email=body.email, password=body.password, db=db)
-    if not result:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-        )
-    return result
+# ── Create ────────────────────────────────────
 
 
-@router.get("/users")
-def list_users_endpoint(db: Session = Depends(get_db)):
-    return list_users(db)
+@router.post("", response_model=BulkEntryResponse, status_code=201)
+def create_endpoint(payload: BulkEntryPayload, db: Session = Depends(get_db)):
+    """Create a bulk entry with transaction, articles, and auto-generated boxes."""
+    return create_bulk_entry(payload, db)
 
 
-@router.post("/users", status_code=201)
-def create_user_endpoint(body: CreateUserRequest, db: Session = Depends(get_db)):
-    result = create_user(
-        email=body.email,
-        password=body.password,
-        name=body.name,
-        is_developer=body.is_developer,
-        is_active=body.is_active,
+# ── List ──────────────────────────────────────
+
+
+@router.get("/{company}", response_model=BulkEntryListResponse)
+def list_endpoint(
+    company: Company,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=500),
+    status: Optional[str] = Query(None),
+    vendor: Optional[str] = Query(None),
+    source_location: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
+    db: Session = Depends(get_db),
+):
+    return list_bulk_entries(
+        company=company,
+        page=page,
+        per_page=per_page,
+        status=status,
+        vendor=vendor,
+        source_location=source_location,
+        search=search,
+        from_date=from_date,
+        to_date=to_date,
+        sort_by=sort_by,
+        sort_order=sort_order,
         db=db,
     )
-    if not result:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Email already registered",
-        )
-    return result
 
 
-@router.put("/users/{user_id}")
-def update_user_endpoint(
-    user_id: str,
-    body: UpdateUserRequest,
+# ── Box lookup (before /{company}/{transaction_no} to avoid path conflict) ──
+
+
+@router.get("/{company}/box/{box_id}", response_model=BoxResponse)
+def box_lookup_endpoint(company: Company, box_id: str, db: Session = Depends(get_db)):
+    return lookup_box(company, box_id, db)
+
+
+# ── Single entry detail ──────────────────────
+
+
+@router.get("/{company}/{transaction_no}", response_model=BulkEntryDetailResponse)
+def get_endpoint(company: Company, transaction_no: str, db: Session = Depends(get_db)):
+    return get_bulk_entry(company, transaction_no, db)
+
+
+# ── Update transaction ───────────────────────
+
+
+@router.put("/{company}/{transaction_no}", response_model=TransactionResponse)
+def update_endpoint(
+    company: Company,
+    transaction_no: str,
+    data: BulkEntryFullUpdate,
     db: Session = Depends(get_db),
 ):
-    updates = body.model_dump(exclude_none=True)
-    if not updates:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No fields to update",
-        )
-    result = update_user(user_id=user_id, updates=updates, db=db)
-    if result is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-    if result == "email_conflict":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Email already in use",
-        )
-    if result == "no_fields":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No fields to update",
-        )
-    return result
+    return update_bulk_entry(company, transaction_no, data, db)
 
 
-@router.delete("/users/{email}")
-def delete_user_endpoint(email: str, db: Session = Depends(get_db)):
-    if not delete_user(email=email, db=db):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-    return {"message": "User deleted successfully"}
+# ── Delete ───────────────────────────────────
 
 
-@router.get("/companies")
-def get_companies_endpoint(
-    user: dict = Depends(verify_token),
+@router.delete("/{company}/{transaction_no}", response_model=BulkEntryDeleteResponse)
+def delete_endpoint(company: Company, transaction_no: str, db: Session = Depends(get_db)):
+    return delete_bulk_entry(company, transaction_no, db)
+
+
+# ── Box endpoints ────────────────────────────
+
+
+@router.get("/{company}/{transaction_no}/boxes", response_model=BoxListResponse)
+def list_boxes_endpoint(company: Company, transaction_no: str, db: Session = Depends(get_db)):
+    return list_boxes(company, transaction_no, db)
+
+
+@router.put("/{company}/{transaction_no}/box", response_model=BoxUpsertResponse)
+def upsert_box_endpoint(
+    company: Company,
+    transaction_no: str,
+    data: BoxUpsertRequest,
     db: Session = Depends(get_db),
 ):
-    return get_user_companies(user["user_id"], db)
-
-
-@router.get("/company/{company_code}/dashboard-info")
-def get_dashboard_info_endpoint(
-    company_code: str,
-    user: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
-):
-    result = get_dashboard_info(user["user_id"], company_code, db)
-    if not result:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No access to this company",
-        )
-    return result
-
-
-@router.get("/me")
-def get_current_user_endpoint(
-    user: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
-):
-    result = get_current_user(user["user_id"], db)
-    if not result:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-    return result
-
-
-@router.post("/logout")
-def logout_endpoint(user: dict = Depends(verify_token)):
-    return {"message": "Logged out successfully"}
-
-
-@router.get("/check-permissions/{company_code}/{module_code}/{action}")
-def check_permission_endpoint(
-    company_code: str,
-    module_code: str,
-    action: str,
-    user: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
-):
-    return check_permission(user["user_id"], company_code, module_code, action, db)
-
-
-# ---------- Module Permissions ----------
-
-
-@router.get("/permissions/{company_code}/{user_id}")
-def get_permissions_endpoint(
-    company_code: str,
-    user_id: str,
-    user: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
-):
-    return get_user_permissions(user_id, company_code, db)
-
-
-@router.put("/permissions/{company_code}/{user_id}")
-def update_permissions_endpoint(
-    company_code: str,
-    user_id: str,
-    body: UpdatePermissionsRequest,
-    user: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
-):
-    modules = [
-        {"module_code": m.module_code, "permissions": m.permissions.model_dump()}
-        for m in body.modules
-    ]
-    return update_user_permissions(user_id, company_code, modules, db)
-
-
-# ---------- Company Role Assignment ----------
-
-
-@router.get("/users/{user_id}/companies")
-def get_user_companies_roles_endpoint(
-    user_id: str,
-    user: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
-):
-    return get_user_company_roles(user_id, db)
-
-
-@router.put("/users/{user_id}/companies")
-def update_user_companies_roles_endpoint(
-    user_id: str,
-    body: UpdateCompanyRolesRequest,
-    user: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
-):
-    companies = [{"company_code": c.company_code, "role": c.role} for c in body.companies]
-    return update_user_company_roles(user_id, companies, db)
+    return upsert_box(company, transaction_no, data.model_dump(exclude_none=True), db)

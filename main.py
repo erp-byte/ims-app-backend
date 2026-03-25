@@ -30,16 +30,20 @@ from services.competitor_service.server import router as competitor_router
 
 logger = get_logger("main")
 
-HEALTH_URL = "https://new-app-backend-and-ims.onrender.com/health"
+KEEP_ALIVE_URLS = [
+    "https://new-app-backend-and-ims.onrender.com/health",
+    "https://desktop-backend-vhf0.onrender.com/health",
+]
 
 
 def keep_alive_ping():
-    """Ping the health endpoint every 7 minutes to keep the Render server alive."""
-    try:
-        resp = httpx.get(HEALTH_URL, timeout=10)
-        logger.info("Keep-alive ping: %s %s", resp.status_code, HEALTH_URL)
-    except Exception as exc:
-        logger.warning("Keep-alive ping failed: %s", exc)
+    """Ping health endpoints every 7 minutes to keep Render services alive."""
+    for url in KEEP_ALIVE_URLS:
+        try:
+            resp = httpx.get(url, timeout=10)
+            logger.info("Keep-alive ping: %s %s", resp.status_code, url)
+        except Exception as exc:
+            logger.warning("Keep-alive ping failed (%s): %s", url, exc)
 
 
 def _run_startup_migrations():
@@ -70,6 +74,25 @@ def _run_startup_migrations():
             db.commit()
         except Exception:
             db.rollback()
+
+        # Add approval columns to cold_storage_stocks
+        try:
+            db.execute(text("""
+                ALTER TABLE cold_storage_stocks
+                ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'pending'
+            """))
+            db.execute(text("""
+                ALTER TABLE cold_storage_stocks
+                ADD COLUMN IF NOT EXISTS approved_by VARCHAR(100)
+            """))
+            db.execute(text("""
+                ALTER TABLE cold_storage_stocks
+                ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP
+            """))
+            db.commit()
+        except Exception:
+            db.rollback()
+
         logger.info("Startup migrations completed")
     except Exception as exc:
         db.rollback()
@@ -131,8 +154,8 @@ app.include_router(cold_storage_service_router)
 app.include_router(rtv_router)
 app.include_router(bulk_entry_router)
 app.include_router(qc_router)
-app.include_router(ipqc_router)
 app.include_router(ipqc_user_router)
+app.include_router(ipqc_router)
 app.include_router(competitor_router)
 
 

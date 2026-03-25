@@ -14,6 +14,7 @@ from shared.database import get_db
 from services.ims_service.inward_models import (
     Company,
     InwardPayloadFlexible,
+    InwardUpdatePayload,
     InwardListResponse,
     POExtractResponse,
     MultiPOExtractResponse,
@@ -415,7 +416,7 @@ def get_inward_endpoint(company: Company, transaction_no: str, db: Session = Dep
 def update_inward_endpoint(
     company: Company,
     transaction_no: str,
-    payload: InwardPayloadFlexible,
+    payload: InwardUpdatePayload,
     db: Session = Depends(get_db),
 ):
     return update_inward(company, transaction_no, payload, db)

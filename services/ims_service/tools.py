@@ -1,551 +1,767 @@
-from datetime import datetime, timedelta
+import time
+from typing import Optional
 
-import bcrypt
-from jose import jwt
+from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from shared.config_loader import settings
 from shared.logger import get_logger
+from services.bulk_entry_service.models import Company
 
-logger = get_logger("ims.tools")
-
-# Hardcoded IMS modules matching the frontend sidebar
-IMS_MODULES = [
-    ("dashboard",        "Dashboard"),
-    ("inward",           "Inward"),
-    ("transfer",         "Transfer"),
-    ("consumption",      "Consumption"),
-    ("inventory-ledger", "Inventory Ledger"),
-    ("reordering",       "Reordering"),
-    ("outward",          "Outward"),
-    ("reports",          "Reports"),
-    ("settings",         "Settings"),
-    ("developer",        "Developer"),
-]
+logger = get_logger("bulk_entry")
 
 
-def _create_access_token(user_id: str, email: str) -> str:
-    payload = {
-        "user_id": user_id,
-        "email": email,
-        "exp": datetime.utcnow() + timedelta(hours=settings.IMS_JWT_EXPIRATION_HOURS),
-        "iat": datetime.utcnow(),
-    }
-    return jwt.encode(payload, settings.IMS_JWT_SECRET, algorithm=settings.IMS_JWT_ALGORITHM)
-
-
-def _hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-
-def create_user(
-    email: str, password: str, name: str, is_developer: bool, is_active: bool, db: Session
-) -> dict | None:
-    existing = db.execute(
-        text("SELECT id FROM users WHERE email = :email"),
-        {"email": email},
-    ).mappings().first()
-
-    if existing:
-        return None  # email conflict
-
-    password_hash = _hash_password(password)
-
-    row = db.execute(
-        text("""
-            INSERT INTO users (email, name, password_hash, is_developer, is_active)
-            VALUES (:email, :name, :password_hash, :is_developer, :is_active)
-            RETURNING id, email, name, is_developer, is_active
-        """),
-        {
-            "email": email,
-            "name": name,
-            "password_hash": password_hash,
-            "is_developer": is_developer,
-            "is_active": is_active,
-        },
-    ).mappings().first()
-
-    logger.info(f"Created user: {row['id']} ({email})")
-
+def table_names(company: Company) -> dict:
+    prefix = "cfpl" if company == "CFPL" else "cdpl"
     return {
-        "id": str(row["id"]),
-        "email": row["email"],
-        "name": row["name"],
-        "is_developer": row["is_developer"],
-        "is_active": row["is_active"],
+        "tx": f"{prefix}_bulk_entry_transactions",
+        "art": f"{prefix}_bulk_entry_articles",
+        "box": f"{prefix}_bulk_entry_boxes",
     }
 
 
-def update_user(user_id: str, updates: dict, db: Session) -> dict | None:
-    existing = db.execute(
-        text("SELECT id FROM users WHERE id = :user_id"),
-        {"user_id": user_id},
-    ).mappings().first()
-
-    if not existing:
-        return None
-
-    if "password" in updates:
-        updates["password_hash"] = _hash_password(updates.pop("password"))
-
-    if "email" in updates:
-        conflict = db.execute(
-            text("SELECT id FROM users WHERE email = :email AND id != :user_id"),
-            {"email": updates["email"], "user_id": user_id},
-        ).mappings().first()
-        if conflict:
-            return "email_conflict"
-
-    if not updates:
-        return "no_fields"
-
-    set_clauses = ", ".join(f"{k} = :{k}" for k in updates)
-    updates["user_id"] = user_id
-
-    row = db.execute(
-        text(f"""
-            UPDATE users SET {set_clauses}
-            WHERE id = :user_id
-            RETURNING id, email, name, is_developer, is_active
-        """),
-        updates,
-    ).mappings().first()
-
-    logger.info(f"Updated user: {user_id}")
-
-    return {
-        "id": str(row["id"]),
-        "email": row["email"],
-        "name": row["name"],
-        "is_developer": row["is_developer"],
-        "is_active": row["is_active"],
-    }
+def _round_weights(data: dict) -> dict:
+    """Round net_weight and gross_weight to 3 decimal places."""
+    from decimal import Decimal, ROUND_HALF_UP
+    quantize_to = Decimal("0.001")
+    for key in ("net_weight", "gross_weight"):
+        val = data.get(key)
+        if val is None:
+            continue
+        if isinstance(val, Decimal):
+            data[key] = val.quantize(quantize_to, rounding=ROUND_HALF_UP)
+        elif isinstance(val, (int, float)):
+            data[key] = float(Decimal(str(val)).quantize(quantize_to, rounding=ROUND_HALF_UP))
+    return data
 
 
-def list_users(db: Session) -> list[dict]:
-    rows = db.execute(
-        text("SELECT id, email, name, is_developer, is_active FROM users ORDER BY name ASC")
-    ).mappings().all()
-
-    return [
-        {
-            "id": str(r["id"]),
-            "email": r["email"],
-            "name": r["name"],
-            "is_developer": r["is_developer"],
-            "is_active": r["is_active"],
-        }
-        for r in rows
-    ]
+def _clean_date_fields(data: dict) -> dict:
+    """Convert empty-string dates to None so Postgres doesn't choke."""
+    for key in ("entry_date", "system_grn_date", "manufacturing_date", "expiry_date"):
+        if key in data and data[key] == "":
+            data[key] = None
+    return data
 
 
-def delete_user(email: str, db: Session) -> bool:
-    row = db.execute(
-        text("DELETE FROM users WHERE email = :email RETURNING id"),
-        {"email": email},
-    ).mappings().first()
-
-    if not row:
-        return False
-
-    logger.info(f"Deleted user: {email}")
-    return True
+def _safe_str(val):
+    return str(val) if val is not None else None
 
 
-def _get_company_modules(user_id: str, company_code: str, is_developer: bool, role: str, db: Session) -> list[dict]:
-    """Fetch module permissions for a user in a company."""
-    rows = db.execute(
-        text("""
-            SELECT module_code, can_access, can_view, can_create,
-                   can_edit, can_delete, can_approve
-            FROM module_permissions
-            WHERE user_id = :user_id AND company_code = :company_code
-        """),
-        {"user_id": user_id, "company_code": company_code},
-    ).mappings().all()
-
-    perm_map = {r["module_code"]: r for r in rows}
-    is_admin = role in ("admin", "developer")
-
-    modules = []
-    for code, name in IMS_MODULES:
-        if is_developer or is_admin:
-            modules.append({
-                "module_code": code,
-                "module_name": name,
-                "permissions": {
-                    "access": True, "view": True, "create": True,
-                    "edit": True, "delete": True, "approve": True,
-                },
-            })
-        else:
-            mp = perm_map.get(code)
-            is_dashboard = code == "dashboard"
-            modules.append({
-                "module_code": code,
-                "module_name": name,
-                "permissions": {
-                    "access": True if is_dashboard else bool(mp and mp["can_access"]),
-                    "view": True if is_dashboard else bool(mp and mp["can_view"]),
-                    "create": bool(mp and mp["can_create"]),
-                    "edit": bool(mp and mp["can_edit"]),
-                    "delete": bool(mp and mp["can_delete"]),
-                    "approve": bool(mp and mp["can_approve"]),
-                },
-            })
-    return modules
+def _safe_float(val):
+    return float(val) if val is not None else None
 
 
-def login(email: str, password: str, db: Session) -> dict:
-    row = db.execute(
-        text("""
-            SELECT id, email, name, password_hash, is_developer, is_active
-            FROM users
-            WHERE email = :email AND is_active = true
-        """),
-        {"email": email},
-    ).mappings().first()
-
-    if not row:
-        logger.warning(f"Login failed — email not found: {email}")
-        return None
-
-    if not row["password_hash"] or not bcrypt.checkpw(
-        password.encode("utf-8"), row["password_hash"].encode("utf-8")
-    ):
-        logger.warning(f"Login failed — wrong password: {email}")
-        return None
-
-    user_id = str(row["id"])
-    is_developer = row["is_developer"]
-    company_rows = get_user_companies(user_id, db)
-
-    # Enrich each company with module permissions
-    companies = []
-    for comp in company_rows:
-        modules = _get_company_modules(user_id, comp["code"], is_developer, comp["role"], db)
-        companies.append({
-            "code": comp["code"],
-            "name": comp["name"],
-            "role": comp["role"],
-            "modules": modules,
-        })
-
-    access_token = _create_access_token(user_id, row["email"])
-
-    logger.info(f"Login successful: {user_id} ({email})")
-
-    return {
-        "id": user_id,
-        "email": row["email"],
-        "name": row["name"],
-        "is_developer": is_developer,
-        "companies": companies,
-        "access_token": access_token,
-        "token_type": "bearer",
-    }
+# ── Create (bulk entry with immediate box_id generation) ──────
 
 
-def get_user_companies(user_id: str, db: Session) -> list[dict]:
-    # Check if user is a developer
-    user_row = db.execute(
-        text("SELECT is_developer FROM users WHERE id = :uid AND is_active = true"),
-        {"uid": user_id},
-    ).mappings().first()
-
-    if user_row and user_row["is_developer"]:
-        # Developers get access to all active companies
-        rows = db.execute(
-            text("""
-                SELECT c.code, c.name, 'developer' AS role
-                FROM companies c
-                WHERE c.is_active = true
-                ORDER BY c.code ASC
-            """)
-        ).mappings().all()
-    else:
-        rows = db.execute(
-            text("""
-                SELECT c.code, c.name, ucr.role
-                FROM user_company_roles ucr
-                JOIN companies c ON ucr.company_code = c.code
-                WHERE ucr.user_id = :user_id AND c.is_active = true
-                ORDER BY
-                    CASE ucr.role
-                        WHEN 'developer' THEN 6
-                        WHEN 'admin'     THEN 5
-                        WHEN 'ops'       THEN 4
-                        WHEN 'approver'  THEN 3
-                        WHEN 'viewer'    THEN 2
-                        ELSE 1
-                    END DESC,
-                    c.code ASC
-            """),
-            {"user_id": user_id},
-        ).mappings().all()
-
-    return [{"code": r["code"], "name": r["name"], "role": r["role"]} for r in rows]
-
-
-def get_dashboard_info(user_id: str, company_code: str, db: Session) -> dict | None:
-    # Check if user is a developer
-    user_row = db.execute(
-        text("SELECT is_developer FROM users WHERE id = :uid AND is_active = true"),
-        {"uid": user_id},
-    ).mappings().first()
-    is_developer = user_row and user_row["is_developer"]
-
-    # Verify company access
-    company = db.execute(
-        text("""
-            SELECT c.code, c.name, ucr.role
-            FROM user_company_roles ucr
-            JOIN companies c ON ucr.company_code = c.code
-            WHERE ucr.user_id = :user_id
-              AND c.code = :company_code
-              AND c.is_active = true
-        """),
-        {"user_id": user_id, "company_code": company_code},
-    ).mappings().first()
-
-    # Developers can access any active company even without a role assignment
-    if not company and is_developer:
-        company = db.execute(
-            text("""
-                SELECT code, name, 'developer' AS role
-                FROM companies
-                WHERE code = :company_code AND is_active = true
-            """),
-            {"company_code": company_code},
-        ).mappings().first()
-
-    if not company:
-        return None
-
-    is_admin_role = company["role"] in ("admin", "developer")
-
-    # Build module list using hardcoded IMS_MODULES + module_permissions
-    module_list = _get_company_modules(user_id, company_code, is_developer, company["role"], db)
-
-    total_modules = len(module_list)
-    if is_developer or is_admin_role:
-        accessible_modules = total_modules
-    else:
-        accessible_modules = sum(1 for m in module_list if m["permissions"]["access"])
-
-    return {
-        "company": {
-            "code": company["code"],
-            "name": company["name"],
-            "role": company["role"],
-        },
-        "dashboard": {
-            "stats": {
-                "total_modules": total_modules,
-                "accessible_modules": accessible_modules,
-            },
-            "permissions": {
-                "modules": module_list,
-            },
-        },
-    }
-
-
-def get_current_user(user_id: str, db: Session) -> dict | None:
-    row = db.execute(
-        text("""
-            SELECT id, email, name, is_developer
-            FROM users
-            WHERE id = :user_id AND is_active = true
-        """),
-        {"user_id": user_id},
-    ).mappings().first()
-
-    if not row:
-        return None
-
-    companies = get_user_companies(user_id, db)
-
-    return {
-        "id": str(row["id"]),
-        "email": row["email"],
-        "name": row["name"],
-        "is_developer": row["is_developer"],
-        "companies": companies,
-    }
-
-
-def get_user_permissions(user_id: str, company_code: str, db: Session) -> dict:
-    """Get a user's module permissions for a specific company."""
-    rows = db.execute(
-        text("""
-            SELECT module_code, can_access, can_view, can_create,
-                   can_edit, can_delete, can_approve
-            FROM module_permissions
-            WHERE user_id = :user_id AND company_code = :company_code
-        """),
-        {"user_id": user_id, "company_code": company_code},
-    ).mappings().all()
-
-    perm_map = {r["module_code"]: r for r in rows}
-
-    return {
-        "user_id": user_id,
-        "company_code": company_code,
-        "modules": [
-            {
-                "module_code": code,
-                "module_name": name,
-                "permissions": {
-                    "access": bool(perm_map.get(code, {}).get("can_access")),
-                    "view": bool(perm_map.get(code, {}).get("can_view")),
-                    "create": bool(perm_map.get(code, {}).get("can_create")),
-                    "edit": bool(perm_map.get(code, {}).get("can_edit")),
-                    "delete": bool(perm_map.get(code, {}).get("can_delete")),
-                    "approve": bool(perm_map.get(code, {}).get("can_approve")),
-                },
-            }
-            for code, name in IMS_MODULES
-        ],
-    }
-
-
-def update_user_permissions(
-    user_id: str, company_code: str, modules: list[dict], db: Session
-) -> dict:
-    """Update a user's module permissions for a company."""
-    for mod in modules:
-        p = mod["permissions"]
-        db.execute(
-            text("""
-                INSERT INTO module_permissions
-                    (user_id, company_code, module_code, can_access, can_view, can_create, can_edit, can_delete, can_approve)
-                VALUES
-                    (:user_id, :company_code, :module_code, :can_access, :can_view, :can_create, :can_edit, :can_delete, :can_approve)
-                ON CONFLICT (user_id, company_code, module_code)
-                DO UPDATE SET
-                    can_access  = EXCLUDED.can_access,
-                    can_view    = EXCLUDED.can_view,
-                    can_create  = EXCLUDED.can_create,
-                    can_edit    = EXCLUDED.can_edit,
-                    can_delete  = EXCLUDED.can_delete,
-                    can_approve = EXCLUDED.can_approve
-            """),
-            {
-                "user_id": user_id,
-                "company_code": company_code,
-                "module_code": mod["module_code"],
-                "can_access": p["access"],
-                "can_view": p["view"],
-                "can_create": p["create"],
-                "can_edit": p["edit"],
-                "can_delete": p["delete"],
-                "can_approve": p["approve"],
-            },
-        )
-
-    logger.info(f"Updated permissions for user {user_id} in {company_code}: {len(modules)} modules")
-    return {"status": "updated", "user_id": user_id, "company_code": company_code, "modules_updated": len(modules)}
-
-
-def get_user_company_roles(user_id: str, db: Session) -> list[dict]:
-    """Get all active companies with the user's current role (None if unassigned)."""
-    rows = db.execute(
-        text("""
-            SELECT c.code AS company_code, c.name AS company_name, ucr.role
-            FROM companies c
-            LEFT JOIN user_company_roles ucr
-                ON c.code = ucr.company_code AND ucr.user_id = :uid
-            WHERE c.is_active = true
-            ORDER BY c.code
-        """),
-        {"uid": user_id},
-    ).mappings().all()
-
-    return [
-        {
-            "company_code": r["company_code"],
-            "company_name": r["company_name"],
-            "role": r["role"],
-        }
-        for r in rows
-    ]
-
-
-def update_user_company_roles(user_id: str, companies: list[dict], db: Session) -> dict:
-    """Replace all company role assignments for a user."""
-    # Clear existing roles
-    db.execute(
-        text("DELETE FROM user_company_roles WHERE user_id = :uid"),
-        {"uid": user_id},
+def create_bulk_entry(payload, db: Session) -> dict:
+    from services.bulk_entry_service.models import (
+        BulkEntryResponse,
+        ArticleBoxGroup,
+        GeneratedBoxInfo,
     )
 
-    # Insert new roles
-    for item in companies:
+    tables = table_names(payload.company)
+    t = payload.transaction
+    txno = t.transaction_no
+
+    if not txno:
+        raise HTTPException(400, "transaction.transaction_no is required")
+
+    for a in payload.articles:
+        if a.transaction_no != txno:
+            raise HTTPException(400, f"Article '{a.item_description}' has mismatched transaction_no")
+
+    # 1) Insert transaction
+    tx_data = _clean_date_fields(t.model_dump())
+    result = db.execute(
+        text(f"""
+            INSERT INTO {tables['tx']} (
+                transaction_no, entry_date, vehicle_number, transporter_name, lr_number,
+                vendor_supplier_name, customer_party_name, source_location, destination_location,
+                challan_number, invoice_number, po_number, grn_number, grn_quantity, system_grn_date,
+                purchased_by, service_invoice_number, dn_number, approval_authority,
+                total_amount, tax_amount, discount_amount, po_quantity, remark, currency,
+                warehouse, status
+            ) VALUES (
+                :transaction_no, :entry_date, :vehicle_number, :transporter_name, :lr_number,
+                :vendor_supplier_name, :customer_party_name, :source_location, :destination_location,
+                :challan_number, :invoice_number, :po_number, :grn_number, :grn_quantity, :system_grn_date,
+                :purchased_by, :service_invoice_number, :dn_number, :approval_authority,
+                :total_amount, :tax_amount, :discount_amount, :po_quantity, :remark, :currency,
+                :warehouse, 'pending'
+            )
+            ON CONFLICT (transaction_no) DO NOTHING
+        """),
+        tx_data,
+    )
+    if result.rowcount == 0:
+        raise HTTPException(409, f"transaction_no '{txno}' already exists")
+
+    # 2) Insert articles
+    _ARTICLE_COLUMNS = (
+        "transaction_no, sku_id, item_description, item_category, sub_category, "
+        "material_type, quality_grade, uom, po_quantity, units, quantity_units, "
+        "net_weight, total_weight, po_weight, lot_number, manufacturing_date, "
+        "expiry_date, unit_rate, total_amount, carton_weight, box_count"
+    )
+    _ARTICLE_PARAMS = (
+        ":transaction_no, :sku_id, :item_description, :item_category, :sub_category, "
+        ":material_type, :quality_grade, :uom, :po_quantity, :units, :quantity_units, "
+        ":net_weight, :total_weight, :po_weight, :lot_number, :manufacturing_date, "
+        ":expiry_date, :unit_rate, :total_amount, :carton_weight, :box_count"
+    )
+
+    if payload.articles:
+        articles_data = []
+        for a in payload.articles:
+            d = _round_weights(_clean_date_fields(a.model_dump()))
+            d.pop("box_net_weight", None)
+            d.pop("box_gross_weight", None)
+            articles_data.append(d)
         db.execute(
-            text("""
-                INSERT INTO user_company_roles (user_id, company_code, role)
-                VALUES (:user_id, :company_code, :role)
+            text(f"""
+                INSERT INTO {tables['art']} ({_ARTICLE_COLUMNS})
+                VALUES ({_ARTICLE_PARAMS})
+                ON CONFLICT (transaction_no, item_description) DO NOTHING
             """),
-            {
-                "user_id": user_id,
-                "company_code": item["company_code"],
-                "role": item["role"],
-            },
+            articles_data,
         )
 
-    logger.info(f"Updated company roles for user {user_id}: {len(companies)} companies")
-    return {"status": "updated", "user_id": user_id, "companies_assigned": len(companies)}
+    # 3) Generate boxes with immediate box_id
+    base = str(int(time.time() * 1000))[-8:]
+    global_counter = 0
+    all_box_groups = []
+
+    for article in payload.articles:
+        boxes_data = []
+        box_ids = []
+        box_infos = []
+
+        for box_num in range(1, article.box_count + 1):
+            global_counter += 1
+            box_id = f"{base}-{global_counter}"
+
+            boxes_data.append({
+                "transaction_no": txno,
+                "article_description": article.item_description,
+                "box_number": box_num,
+                "net_weight": article.box_net_weight,
+                "gross_weight": article.box_gross_weight,
+                "lot_number": article.lot_number,
+                "count": article.box_count,
+                "box_id": box_id,
+            })
+            box_ids.append(box_id)
+            box_infos.append(GeneratedBoxInfo(
+                box_number=box_num,
+                box_id=box_id,
+                article_description=article.item_description,
+                net_weight=_safe_float(article.box_net_weight),
+                gross_weight=_safe_float(article.box_gross_weight),
+                lot_number=article.lot_number,
+            ))
+
+        if boxes_data:
+            db.execute(
+                text(f"""
+                    INSERT INTO {tables['box']} (
+                        transaction_no, article_description, box_number,
+                        net_weight, gross_weight, lot_number, count, box_id
+                    ) VALUES (
+                        :transaction_no, :article_description, :box_number,
+                        :net_weight, :gross_weight, :lot_number, :count, :box_id
+                    )
+                    ON CONFLICT (transaction_no, article_description, box_number) DO NOTHING
+                """),
+                boxes_data,
+            )
+
+        all_box_groups.append(ArticleBoxGroup(
+            article_description=article.item_description,
+            box_ids=box_ids,
+            boxes=box_infos,
+        ))
+
+    db.commit()
+    logger.info("Created bulk entry [%s]: %s with %s boxes", payload.company, txno, global_counter)
+
+    return BulkEntryResponse(
+        status="ok",
+        transaction_no=txno,
+        company=payload.company,
+        articles_count=len(payload.articles),
+        total_boxes_created=global_counter,
+        articles_with_boxes=all_box_groups,
+    )
 
 
-def check_permission(
-    user_id: str, company_code: str, module_code: str, action: str, db: Session
+# ── List ──────────────────────────────────────
+
+
+def list_bulk_entries(
+    company: Company,
+    page: int,
+    per_page: int,
+    status: Optional[str],
+    vendor: Optional[str],
+    source_location: Optional[str],
+    search: Optional[str],
+    from_date: Optional[str],
+    to_date: Optional[str],
+    sort_by: str,
+    sort_order: str,
+    db: Session,
 ) -> dict:
-    # Developers always have full permissions
-    user_row = db.execute(
-        text("SELECT is_developer FROM users WHERE id = :uid AND is_active = true"),
-        {"uid": user_id},
-    ).mappings().first()
-    if user_row and user_row["is_developer"]:
-        return {
-            "has_permission": True,
-            "user_id": user_id,
-            "company": company_code,
-            "module": module_code,
-            "action": action,
-        }
+    tables = table_names(company)
+    conditions = []
+    params: dict = {}
 
-    row = db.execute(
-        text("""
-            SELECT
-                CASE :action
-                    WHEN 'access'  THEN mp.can_access
-                    WHEN 'view'    THEN mp.can_view
-                    WHEN 'create'  THEN mp.can_create
-                    WHEN 'edit'    THEN mp.can_edit
-                    WHEN 'delete'  THEN mp.can_delete
-                    WHEN 'approve' THEN mp.can_approve
-                    ELSE false
-                END AS has_permission
-            FROM module_permissions mp
-            WHERE mp.user_id = :user_id
-              AND mp.company_code = :company_code
-              AND mp.module_code = :module_code
-        """),
-        {
-            "user_id": user_id,
-            "company_code": company_code,
-            "module_code": module_code,
-            "action": action,
-        },
+    if status:
+        conditions.append("status = :status")
+        params["status"] = status
+
+    if vendor:
+        conditions.append("vendor_supplier_name ILIKE :vendor")
+        params["vendor"] = f"%{vendor}%"
+
+    if source_location:
+        conditions.append("source_location ILIKE :source_location")
+        params["source_location"] = f"%{source_location}%"
+
+    if search:
+        conditions.append(
+            "(transaction_no ILIKE :search "
+            "OR vendor_supplier_name ILIKE :search "
+            "OR customer_party_name ILIKE :search "
+            "OR source_location ILIKE :search "
+            "OR destination_location ILIKE :search "
+            "OR invoice_number ILIKE :search "
+            "OR po_number ILIKE :search "
+            "OR challan_number ILIKE :search "
+            "OR remark ILIKE :search "
+            "OR warehouse ILIKE :search)"
+        )
+        params["search"] = f"%{search}%"
+
+    if from_date:
+        conditions.append("entry_date >= :from_date")
+        params["from_date"] = from_date
+
+    if to_date:
+        conditions.append("entry_date <= :to_date")
+        params["to_date"] = to_date
+
+    where = " AND ".join(conditions) if conditions else "1=1"
+
+    allowed_sort = {
+        "transaction_no", "entry_date", "vendor_supplier_name",
+        "source_location", "status", "created_at", "total_amount",
+    }
+    if sort_by not in allowed_sort:
+        sort_by = "created_at"
+    if sort_order.lower() not in ("asc", "desc"):
+        sort_order = "desc"
+
+    count_row = db.execute(
+        text(f"SELECT COUNT(*) AS cnt FROM {tables['tx']} WHERE {where}"),
+        params,
     ).mappings().first()
+    total = count_row["cnt"]
+
+    offset = (page - 1) * per_page
+    params["limit"] = per_page
+    params["offset"] = offset
+
+    rows = db.execute(
+        text(
+            f"SELECT * FROM {tables['tx']} "
+            f"WHERE {where} "
+            f"ORDER BY {sort_by} {sort_order} "
+            f"LIMIT :limit OFFSET :offset"
+        ),
+        params,
+    ).fetchall()
+
+    total_pages = (total + per_page - 1) // per_page if per_page > 0 else 0
 
     return {
-        "has_permission": bool(row["has_permission"]) if row else False,
-        "user_id": user_id,
-        "company": company_code,
-        "module": module_code,
-        "action": action,
+        "records": [_map_tx_row(r) for r in rows],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+    }
+
+
+# ── Get single entry (transaction + articles + boxes) ─────────
+
+
+def get_bulk_entry(company: Company, transaction_no: str, db: Session) -> dict:
+    tables = table_names(company)
+
+    tx = db.execute(
+        text(f"SELECT * FROM {tables['tx']} WHERE transaction_no = :txno"),
+        {"txno": transaction_no},
+    ).fetchone()
+    if not tx:
+        raise HTTPException(404, f"transaction_no '{transaction_no}' not found for {company}")
+
+    articles = db.execute(
+        text(f"SELECT * FROM {tables['art']} WHERE transaction_no = :txno ORDER BY id"),
+        {"txno": transaction_no},
+    ).fetchall()
+
+    boxes = db.execute(
+        text(f"SELECT * FROM {tables['box']} WHERE transaction_no = :txno ORDER BY article_description, box_number"),
+        {"txno": transaction_no},
+    ).fetchall()
+
+    return {
+        "transaction": _map_tx_row(tx),
+        "articles": [_map_art_row(a) for a in articles],
+        "boxes": [_map_box_row(b) for b in boxes],
+    }
+
+
+# ── Update transaction ────────────────────────
+
+
+def update_bulk_entry(company: Company, transaction_no: str, payload, db: Session) -> dict:
+    tables = table_names(company)
+
+    EDITABLE = {
+        "vehicle_number", "transporter_name", "lr_number",
+        "vendor_supplier_name", "customer_party_name",
+        "source_location", "destination_location",
+        "challan_number", "invoice_number", "po_number",
+        "grn_number", "grn_quantity", "system_grn_date",
+        "purchased_by", "service_invoice_number", "dn_number",
+        "approval_authority", "total_amount", "tax_amount",
+        "discount_amount", "po_quantity", "remark", "currency", "warehouse",
+    }
+
+    # ── Fetch current transaction state ──
+    existing_tx = db.execute(
+        text(f"SELECT * FROM {tables['tx']} WHERE transaction_no = :txno"),
+        {"txno": transaction_no},
+    ).fetchone()
+    if not existing_tx:
+        raise HTTPException(404, f"Transaction not found for {company}")
+
+    has_changes = False
+
+    # ── 1) Transaction: state-compare, only update changed fields ──
+    if payload.transaction:
+        tx_data = payload.transaction.model_dump(exclude_none=True)
+        old_tx = dict(existing_tx._mapping)
+        tx_changes = {}
+        for field, new_val in tx_data.items():
+            if field not in EDITABLE:
+                continue
+            old_val = old_tx.get(field)
+            if old_val is not None and new_val is not None:
+                try:
+                    if float(old_val) == float(new_val):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            if str(old_val) != str(new_val):
+                tx_changes[field] = new_val
+
+        if tx_changes:
+            set_clauses = ", ".join(f"{k} = :{k}" for k in tx_changes)
+            set_clauses += ", updated_at = NOW()"
+            tx_changes["txno"] = transaction_no
+            db.execute(
+                text(
+                    f"UPDATE {tables['tx']} SET {set_clauses} "
+                    f"WHERE transaction_no = :txno"
+                ),
+                tx_changes,
+            )
+            has_changes = True
+
+    # ── 2) Articles: upsert by (transaction_no, item_description) ──
+    if payload.articles:
+        existing_arts = db.execute(
+            text(f"SELECT * FROM {tables['art']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).fetchall()
+        existing_art_map = {r.item_description: dict(r._mapping) for r in existing_arts}
+
+        _ARTICLE_COLUMNS = (
+            "transaction_no, sku_id, item_description, item_category, sub_category, "
+            "material_type, quality_grade, uom, po_quantity, units, quantity_units, "
+            "net_weight, total_weight, po_weight, lot_number, manufacturing_date, "
+            "expiry_date, unit_rate, total_amount, carton_weight, box_count"
+        )
+        _ARTICLE_PARAMS = (
+            ":transaction_no, :sku_id, :item_description, :item_category, :sub_category, "
+            ":material_type, :quality_grade, :uom, :po_quantity, :units, :quantity_units, "
+            ":net_weight, :total_weight, :po_weight, :lot_number, :manufacturing_date, "
+            ":expiry_date, :unit_rate, :total_amount, :carton_weight, :box_count"
+        )
+
+        for article in payload.articles:
+            art_data = _round_weights(_clean_date_fields(article.model_dump()))
+            art_data.pop("box_net_weight", None)
+            art_data.pop("box_gross_weight", None)
+            art_key = art_data["item_description"]
+
+            if art_key in existing_art_map:
+                old_art = existing_art_map[art_key]
+                art_changes = {}
+                for field, new_val in art_data.items():
+                    if field in ("transaction_no", "item_description"):
+                        continue
+                    if new_val is None:
+                        continue
+                    old_val = old_art.get(field)
+                    if old_val is not None and new_val is not None:
+                        try:
+                            if float(old_val) == float(new_val):
+                                continue
+                        except (TypeError, ValueError):
+                            pass
+                    if str(old_val) != str(new_val):
+                        art_changes[field] = new_val
+
+                if art_changes:
+                    set_parts = [f"{k} = :{k}" for k in art_changes]
+                    set_parts.append("updated_at = NOW()")
+                    art_changes["txno"] = transaction_no
+                    art_changes["item_desc"] = art_key
+                    db.execute(
+                        text(
+                            f"UPDATE {tables['art']} SET {', '.join(set_parts)} "
+                            f"WHERE transaction_no = :txno AND item_description = :item_desc"
+                        ),
+                        art_changes,
+                    )
+                    has_changes = True
+            else:
+                db.execute(
+                    text(f"INSERT INTO {tables['art']} ({_ARTICLE_COLUMNS}) VALUES ({_ARTICLE_PARAMS})"),
+                    [art_data],
+                )
+                has_changes = True
+
+    # ── 3) Boxes: upsert by (transaction_no, article_description, box_number) ──
+    if payload.boxes:
+        existing_boxes = db.execute(
+            text(f"SELECT * FROM {tables['box']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).fetchall()
+        existing_box_map = {
+            (r.article_description, r.box_number): dict(r._mapping) for r in existing_boxes
+        }
+
+        for box in payload.boxes:
+            box_data = _round_weights(box.model_dump(exclude_none=True))
+            art_desc = box_data["article_description"]
+            box_num = box_data["box_number"]
+            box_key = (art_desc, box_num)
+
+            if box_key in existing_box_map:
+                old_box = existing_box_map[box_key]
+                box_changes = {}
+                for field, new_val in box_data.items():
+                    if field in ("article_description", "box_number"):
+                        continue
+                    old_val = old_box.get(field)
+                    if old_val is not None and new_val is not None:
+                        try:
+                            if float(old_val) == float(new_val):
+                                continue
+                        except (TypeError, ValueError):
+                            pass
+                    if str(old_val) != str(new_val):
+                        box_changes[field] = new_val
+
+                if box_changes:
+                    set_parts = [f"{k} = :{k}" for k in box_changes]
+                    set_parts.append("updated_at = NOW()")
+                    box_changes["txno"] = transaction_no
+                    box_changes["art_desc"] = art_desc
+                    box_changes["bn"] = box_num
+                    db.execute(
+                        text(
+                            f"UPDATE {tables['box']} SET {', '.join(set_parts)} "
+                            f"WHERE transaction_no = :txno AND article_description = :art_desc AND box_number = :bn"
+                        ),
+                        box_changes,
+                    )
+                    has_changes = True
+            else:
+                base = str(int(time.time() * 1000))[-8:]
+                box_id = f"{base}-{box_num}"
+                db.execute(
+                    text(
+                        f"INSERT INTO {tables['box']} "
+                        f"(transaction_no, article_description, box_number, box_id, "
+                        f"net_weight, gross_weight, lot_number, status) "
+                        f"VALUES (:txno, :art, :bn, :box_id, :net_weight, :gross_weight, :lot_number, :status)"
+                    ),
+                    {
+                        "txno": transaction_no,
+                        "art": art_desc,
+                        "bn": box_num,
+                        "box_id": box_id,
+                        "net_weight": box_data.get("net_weight"),
+                        "gross_weight": box_data.get("gross_weight"),
+                        "lot_number": box_data.get("lot_number"),
+                        "status": box_data.get("status", "available"),
+                    },
+                )
+                has_changes = True
+
+    if has_changes:
+        db.commit()
+
+    # Re-fetch the updated transaction row
+    updated_tx = db.execute(
+        text(f"SELECT * FROM {tables['tx']} WHERE transaction_no = :txno"),
+        {"txno": transaction_no},
+    ).fetchone()
+
+    logger.info("Updated bulk entry [%s]: %s", company, transaction_no)
+    return _map_tx_row(updated_tx)
+
+
+# ── Delete ────────────────────────────────────
+
+
+def delete_bulk_entry(company: Company, transaction_no: str, db: Session) -> dict:
+    tables = table_names(company)
+
+    row = db.execute(
+        text(f"DELETE FROM {tables['tx']} WHERE transaction_no = :txno RETURNING transaction_no"),
+        {"txno": transaction_no},
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(404, f"Transaction not found for {company}")
+
+    db.commit()
+    logger.info("Deleted bulk entry [%s]: %s", company, transaction_no)
+    return {"success": True, "message": "Entry deleted", "transaction_no": transaction_no}
+
+
+# ── Box endpoints ─────────────────────────────
+
+
+def list_boxes(company: Company, transaction_no: str, db: Session) -> dict:
+    tables = table_names(company)
+
+    tx = db.execute(
+        text(f"SELECT transaction_no FROM {tables['tx']} WHERE transaction_no = :txno"),
+        {"txno": transaction_no},
+    ).fetchone()
+    if not tx:
+        raise HTTPException(404, f"Transaction not found for {company}")
+
+    rows = db.execute(
+        text(f"SELECT * FROM {tables['box']} WHERE transaction_no = :txno ORDER BY article_description, box_number"),
+        {"txno": transaction_no},
+    ).fetchall()
+
+    return {"boxes": [_map_box_row(r) for r in rows], "total": len(rows)}
+
+
+def lookup_box(company: Company, box_id: str, db: Session) -> dict:
+    tables = table_names(company)
+
+    row = db.execute(
+        text(f"SELECT * FROM {tables['box']} WHERE box_id = :box_id"),
+        {"box_id": box_id},
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, f"Box not found for {company}")
+    return _map_box_row(row)
+
+
+def upsert_box(company: Company, transaction_no: str, data: dict, db: Session) -> dict:
+    tables = table_names(company)
+
+    tx = db.execute(
+        text(f"SELECT transaction_no FROM {tables['tx']} WHERE transaction_no = :txno"),
+        {"txno": transaction_no},
+    ).fetchone()
+    if not tx:
+        raise HTTPException(404, f"Transaction not found for {company}")
+
+    article_desc = data["article_description"]
+    box_number = data["box_number"]
+
+    existing = db.execute(
+        text(
+            f"SELECT id, box_id FROM {tables['box']} "
+            f"WHERE transaction_no = :txno AND article_description = :art AND box_number = :bn"
+        ),
+        {"txno": transaction_no, "art": article_desc, "bn": box_number},
+    ).fetchone()
+
+    net_weight = data.get("net_weight")
+    gross_weight = data.get("gross_weight")
+    lot_number = data.get("lot_number")
+    new_status = data.get("status", "available")
+
+    if existing and existing.box_id:
+        box_id = existing.box_id
+        status = "updated"
+        db.execute(
+            text(
+                f"UPDATE {tables['box']} SET "
+                f"net_weight = COALESCE(:net_weight, net_weight), "
+                f"gross_weight = COALESCE(:gross_weight, gross_weight), "
+                f"lot_number = COALESCE(:lot_number, lot_number), "
+                f"status = :status, updated_at = NOW() "
+                f"WHERE id = :id"
+            ),
+            {
+                "net_weight": net_weight,
+                "gross_weight": gross_weight,
+                "lot_number": lot_number,
+                "status": new_status,
+                "id": existing.id,
+            },
+        )
+    else:
+        base = str(int(time.time() * 1000))[-8:]
+        box_id = f"{base}-{box_number}"
+
+        if existing:
+            status = "updated"
+            db.execute(
+                text(
+                    f"UPDATE {tables['box']} SET box_id = :box_id, "
+                    f"net_weight = COALESCE(:net_weight, net_weight), "
+                    f"gross_weight = COALESCE(:gross_weight, gross_weight), "
+                    f"lot_number = COALESCE(:lot_number, lot_number), "
+                    f"status = :status, updated_at = NOW() WHERE id = :id"
+                ),
+                {
+                    "box_id": box_id,
+                    "net_weight": net_weight,
+                    "gross_weight": gross_weight,
+                    "lot_number": lot_number,
+                    "status": new_status,
+                    "id": existing.id,
+                },
+            )
+        else:
+            status = "inserted"
+            db.execute(
+                text(
+                    f"INSERT INTO {tables['box']} "
+                    f"(transaction_no, article_description, box_number, box_id, "
+                    f"net_weight, gross_weight, lot_number, status) "
+                    f"VALUES (:txno, :art, :bn, :box_id, :net_weight, :gross_weight, :lot_number, :status)"
+                ),
+                {
+                    "txno": transaction_no,
+                    "art": article_desc,
+                    "bn": box_number,
+                    "box_id": box_id,
+                    "net_weight": net_weight,
+                    "gross_weight": gross_weight,
+                    "lot_number": lot_number,
+                    "status": new_status,
+                },
+            )
+
+    db.commit()
+    logger.info("Box upsert [%s] (%s) txno=%s art=%s box=%s id=%s", company, status, transaction_no, article_desc, box_number, box_id)
+    return {
+        "status": status,
+        "box_id": box_id,
+        "transaction_no": transaction_no,
+        "article_description": article_desc,
+        "box_number": box_number,
+    }
+
+
+# ── Row mappers ───────────────────────────────
+
+
+def _map_tx_row(row) -> dict:
+    return {
+        "transaction_no": row.transaction_no,
+        "entry_date": _safe_str(row.entry_date),
+        "vehicle_number": row.vehicle_number,
+        "transporter_name": row.transporter_name,
+        "lr_number": row.lr_number,
+        "vendor_supplier_name": row.vendor_supplier_name,
+        "customer_party_name": row.customer_party_name,
+        "source_location": row.source_location,
+        "destination_location": row.destination_location,
+        "challan_number": row.challan_number,
+        "invoice_number": row.invoice_number,
+        "po_number": row.po_number,
+        "grn_number": row.grn_number,
+        "grn_quantity": _safe_float(row.grn_quantity),
+        "system_grn_date": _safe_str(row.system_grn_date),
+        "purchased_by": row.purchased_by,
+        "service_invoice_number": row.service_invoice_number,
+        "dn_number": row.dn_number,
+        "approval_authority": row.approval_authority,
+        "total_amount": _safe_float(row.total_amount),
+        "tax_amount": _safe_float(row.tax_amount),
+        "discount_amount": _safe_float(row.discount_amount),
+        "po_quantity": _safe_float(row.po_quantity),
+        "remark": row.remark,
+        "currency": row.currency,
+        "warehouse": row.warehouse,
+        "status": row.status,
+        "approved_by": row.approved_by,
+        "approved_at": _safe_str(row.approved_at),
+        "created_at": _safe_str(row.created_at),
+        "updated_at": _safe_str(row.updated_at),
+    }
+
+
+def _map_art_row(row) -> dict:
+    return {
+        "id": row.id,
+        "transaction_no": row.transaction_no,
+        "sku_id": row.sku_id,
+        "item_description": row.item_description,
+        "item_category": row.item_category,
+        "sub_category": row.sub_category,
+        "material_type": row.material_type,
+        "quality_grade": row.quality_grade,
+        "uom": row.uom,
+        "units": row.units,
+        "po_quantity": _safe_float(row.po_quantity),
+        "quantity_units": _safe_float(row.quantity_units),
+        "net_weight": _safe_float(row.net_weight),
+        "total_weight": _safe_float(row.total_weight),
+        "po_weight": _safe_float(row.po_weight),
+        "lot_number": row.lot_number,
+        "manufacturing_date": _safe_str(row.manufacturing_date),
+        "expiry_date": _safe_str(row.expiry_date),
+        "unit_rate": _safe_float(row.unit_rate),
+        "total_amount": _safe_float(row.total_amount),
+        "carton_weight": _safe_float(row.carton_weight),
+        "box_count": row.box_count,
+        "created_at": _safe_str(row.created_at),
+        "updated_at": _safe_str(row.updated_at),
+    }
+
+
+def _map_box_row(row) -> dict:
+    return {
+        "id": row.id,
+        "transaction_no": row.transaction_no,
+        "article_description": row.article_description,
+        "box_number": row.box_number,
+        "box_id": row.box_id,
+        "net_weight": _safe_float(row.net_weight),
+        "gross_weight": _safe_float(row.gross_weight),
+        "lot_number": row.lot_number,
+        "count": row.count,
+        "status": row.status,
+        "created_at": _safe_str(row.created_at),
+        "updated_at": _safe_str(row.updated_at),
     }

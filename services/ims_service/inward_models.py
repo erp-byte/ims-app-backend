@@ -73,6 +73,43 @@ class BoxIn(BaseModel):
     count: Optional[NonNegativeInt] = None
 
 
+class TransactionUpdateIn(BaseModel):
+    """Transaction fields for update — every field is optional except transaction_no."""
+    transaction_no: str
+    entry_date: Optional[str] = None
+    vehicle_number: Optional[str] = None
+    transporter_name: Optional[str] = None
+    lr_number: Optional[str] = None
+    vendor_supplier_name: Optional[str] = None
+    customer_party_name: Optional[str] = None
+    source_location: Optional[str] = None
+    destination_location: Optional[str] = None
+    challan_number: Optional[str] = None
+    invoice_number: Optional[str] = None
+    po_number: Optional[str] = None
+    grn_number: Optional[str] = None
+    grn_quantity: Optional[Decimal18_3] = None
+    system_grn_date: Optional[str] = None
+    purchased_by: Optional[str] = None
+    service_invoice_number: Optional[str] = None
+    dn_number: Optional[str] = None
+    approval_authority: Optional[str] = None
+    total_amount: Optional[Decimal18_2] = None
+    tax_amount: Optional[Decimal18_2] = None
+    discount_amount: Optional[Decimal18_2] = None
+    po_quantity: Optional[Decimal18_3] = None
+    remark: Optional[str] = None
+    currency: Optional[str] = None
+
+
+class InwardUpdatePayload(BaseModel):
+    """Update payload — only provided fields are changed, nothing is deleted."""
+    company: Company
+    transaction: TransactionUpdateIn
+    articles: Optional[List[ArticleIn]] = None
+    boxes: Optional[List[BoxIn]] = None
+
+
 class InwardPayloadFlexible(BaseModel):
     """Flexible payload to handle both frontend and backend formats."""
 

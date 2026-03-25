@@ -300,20 +300,28 @@ def generate_box_ids(boxes: List[dict]) -> List[dict]:
 
 
 
+def _round_weights(data: dict) -> dict:
+    """Round net_weight and gross_weight to 3 decimal places."""
+    from decimal import Decimal, ROUND_HALF_UP
+    quantize_to = Decimal("0.001")
+    for key in ("net_weight", "gross_weight"):
+        val = data.get(key)
+        if val is None:
+            continue
+        if isinstance(val, Decimal):
+            data[key] = val.quantize(quantize_to, rounding=ROUND_HALF_UP)
+        elif isinstance(val, (int, float)):
+            data[key] = float(Decimal(str(val)).quantize(quantize_to, rounding=ROUND_HALF_UP))
+    return data
+
+
 def clean_date_fields(data: dict) -> dict:
-
     """Convert empty strings to None for date fields."""
-
     date_fields = ["system_grn_date", "manufacturing_date", "expiry_date"]
-
     cleaned = data.copy()
-
     for field in date_fields:
-
         if field in cleaned and cleaned[field] == "":
-
             cleaned[field] = None
-
     return cleaned
 
 
@@ -2014,7 +2022,7 @@ def update_inward(
         existing_art_map = {r.item_description: dict(r._mapping) for r in existing_arts}
 
         for article in payload.articles:
-            art_data = clean_date_fields(article.model_dump())
+            art_data = _round_weights(clean_date_fields(article.model_dump()))
             art_key = art_data["item_description"]
 
             if art_key in existing_art_map:
@@ -2072,7 +2080,7 @@ def update_inward(
         }
 
         for box in payload.boxes:
-            box_data = box.model_dump()
+            box_data = _round_weights(box.model_dump())
             box_key = (box_data["article_description"], box_data["box_number"])
 
             if box_key in existing_box_map:

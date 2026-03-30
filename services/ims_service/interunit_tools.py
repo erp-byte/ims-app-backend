@@ -17,7 +17,7 @@ from services.ims_service.interunit_models import (
 logger = get_logger("ims.interunit")
 
 
-# ── Helpers ──
+# -- Helpers --
 
 
 def _generate_request_no() -> str:
@@ -83,7 +83,7 @@ def _fetch_lines(db: Session, request_id: int) -> list:
     return [_map_line_row(r) for r in rows]
 
 
-# ── Warehouse dropdown ──
+# -- Warehouse dropdown --
 
 
 def get_warehouse_sites(active_only: bool, db: Session) -> list:
@@ -102,7 +102,7 @@ def get_warehouse_sites(active_only: bool, db: Session) -> list:
     ]
 
 
-# ── Create request ──
+# -- Create request --
 
 
 def create_request(data: RequestCreate, created_by: str, db: Session) -> dict:
@@ -205,7 +205,7 @@ def create_request(data: RequestCreate, created_by: str, db: Session) -> dict:
     return result
 
 
-# ── List requests ──
+# -- List requests --
 
 
 def list_requests(
@@ -303,7 +303,7 @@ def list_requests(
     }
 
 
-# ── Get single request ──
+# -- Get single request --
 
 
 def get_request(request_id: int, db: Session) -> dict:
@@ -326,7 +326,7 @@ def get_request(request_id: int, db: Session) -> dict:
     return result
 
 
-# ── Update request (Accept / Reject) ──
+# -- Update request (Accept / Reject) --
 
 
 def update_request(request_id: int, data: RequestUpdate, db: Session) -> dict:
@@ -369,7 +369,7 @@ def update_request(request_id: int, data: RequestUpdate, db: Session) -> dict:
     return _map_header_row(row)
 
 
-# ── Delete request ──
+# -- Delete request --
 
 
 def delete_request(request_id: int, db: Session) -> dict:
@@ -393,9 +393,9 @@ def delete_request(request_id: int, db: Session) -> dict:
     return {"success": True, "message": "Request deleted successfully"}
 
 
-# ══════════════════════════════════════════════
-#  Phase B – Transfer helpers
-# ══════════════════════════════════════════════
+# ----------------------------------------------
+#  Phase B   Transfer helpers
+# ----------------------------------------------
 
 
 def _generate_challan_no() -> str:
@@ -505,7 +505,7 @@ def _fetch_boxes(db: Session, header_id: int) -> list:
     return result
 
 
-# ── Create transfer ──
+# -- Create transfer --
 
 
 def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
@@ -644,7 +644,7 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
             boxes.append(box_row)
 
     # Line weights are already set correctly from frontend per-box values.
-    # Each line represents one box entry — no need to sum box weights back into lines.
+    # Each line represents one box entry   no need to sum box weights back into lines.
 
     # Determine status based on box count vs expected qty
     if boxes:
@@ -690,7 +690,7 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
     return result
 
 
-# ── List transfers ──
+# -- List transfers --
 
 
 def list_transfers(
@@ -796,7 +796,7 @@ def list_transfers(
     }
 
 
-# ── Bulk entry box lookup ──
+# -- Bulk entry box lookup --
 
 
 def get_bulk_entry_box(company: str, box_id: str, transaction_no: str, db: Session) -> dict:
@@ -848,7 +848,7 @@ def get_bulk_entry_box(company: str, box_id: str, transaction_no: str, db: Sessi
     raise HTTPException(404, f"Box with box_id '{box_id}' and transaction_no '{transaction_no}' not found in bulk entry boxes")
 
 
-# ── Get single transfer ──
+# -- Get single transfer --
 
 
 def get_transfer(transfer_id: int, db: Session) -> dict:
@@ -880,7 +880,7 @@ def get_transfer(transfer_id: int, db: Session) -> dict:
     return result
 
 
-# ── Update transfer ──
+# -- Update transfer --
 
 
 def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict:
@@ -893,7 +893,7 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
     if not existing:
         raise HTTPException(404, "Transfer not found")
 
-    # No status restriction — authorized users can edit transfers in any status
+    # No status restriction   authorized users can edit transfers in any status
 
     stock_trf_date = _convert_date(data.header.stock_trf_date)
 
@@ -1038,7 +1038,7 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
             boxes.append(box_row)
 
     # Line weights are already set correctly from frontend per-box values.
-    # Each line represents one box entry — no need to sum box weights back into lines.
+    # Each line represents one box entry   no need to sum box weights back into lines.
 
     # Determine status based on box count vs expected qty
     if boxes:
@@ -1074,7 +1074,7 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
     return result
 
 
-# ── Delete transfer ──
+# -- Delete transfer --
 
 
 def delete_transfer(transfer_id: int, db: Session) -> dict:
@@ -1086,7 +1086,7 @@ def delete_transfer(transfer_id: int, db: Session) -> dict:
     if not existing:
         raise HTTPException(404, "Transfer not found")
 
-    # No status restriction — authorized users can delete transfers in any status
+    # No status restriction   authorized users can delete transfers in any status
 
     # Delete associated transfer-in records first (cascade)
     transfer_in_headers = db.execute(
@@ -1094,19 +1094,11 @@ def delete_transfer(transfer_id: int, db: Session) -> dict:
         {"tid": transfer_id},
     ).fetchall()
 
-    # Check if cold storage table exists
-    cs_table_exists = db.execute(
-        text("SELECT to_regclass('public.interunit_transfer_in_cold_storage')")
-    ).scalar()
-
     for ti in transfer_in_headers:
-        # Delete cold storage details first (FK to header)
-        if cs_table_exists:
-            db.execute(
-                text("DELETE FROM interunit_transfer_in_cold_storage WHERE header_id = :hid"),
-                {"hid": ti.id},
-            )
-        # Delete cold_stocks entries by box_id + transaction_no, and by inward_no (challan_no)
+        # Restore cold stock snapshots (cold-to-warehouse: rows subtracted during finalize)
+        _restore_cold_stock_snapshots(ti.id, transfer_id, db)
+
+        # Delete cold_stocks entries inserted during warehouse-to-cold transfer-in
         in_boxes = db.execute(
             text("SELECT box_id, transaction_no FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
             {"hid": ti.id},
@@ -1133,12 +1125,16 @@ def delete_transfer(transfer_id: int, db: Session) -> dict:
             {"hid": ti.id},
         )
 
+    # If no transfer-in existed, still try restoring snapshots by transfer_out_id
+    if not transfer_in_headers:
+        _restore_cold_stock_snapshots(None, transfer_id, db)
+
     db.execute(
         text("DELETE FROM interunit_transfer_in_header WHERE transfer_out_id = :tid"),
         {"tid": transfer_id},
     )
 
-    # Delete transfer-out in FK order: boxes → lines → header
+    # Delete transfer-out in FK order: boxes ? lines ? header
     db.execute(
         text("DELETE FROM interunit_transfer_boxes WHERE header_id = :tid"),
         {"tid": transfer_id},
@@ -1165,9 +1161,9 @@ def delete_transfer(transfer_id: int, db: Session) -> dict:
     }
 
 
-# ══════════════════════════════════════════════
-#  Phase C – Transfer IN helpers
-# ══════════════════════════════════════════════
+# ----------------------------------------------
+#  Phase C   Transfer IN helpers
+# ----------------------------------------------
 
 
 def _map_transfer_in_header(row) -> dict:
@@ -1222,13 +1218,13 @@ def _fetch_transfer_in_boxes(db: Session, header_id: int) -> list:
     return [_map_transfer_in_box(r) for r in rows]
 
 
-# ── Create transfer IN (GRN) ──
+# -- Create transfer IN (GRN) --
 
 
 def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
     # Verify Transfer OUT exists
     transfer_out = db.execute(
-        text("SELECT id, challan_no FROM interunit_transfers_header WHERE id = :id"),
+        text("SELECT id, challan_no, to_site FROM interunit_transfers_header WHERE id = :id"),
         {"id": data.transfer_out_id},
     ).fetchone()
 
@@ -1285,111 +1281,10 @@ def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
 
     header_id = header.id
 
-    # Insert cold storage per-item details if provided
-    cold_stocks_table_map = {"cfpl": "cfpl_cold_stocks", "cdpl": "cdpl_cold_stocks"}
-
+    # Insert cold storage items directly into cfpl/cdpl_cold_stocks
     if data.cold_storage_items:
-        # Ensure the record-keeping table exists
-        db.execute(text("""
-            CREATE TABLE IF NOT EXISTS interunit_transfer_in_cold_storage (
-                id SERIAL PRIMARY KEY,
-                header_id INTEGER REFERENCES interunit_transfer_in_header(id),
-                item_description VARCHAR(255),
-                inward_dt VARCHAR(20),
-                unit VARCHAR(50),
-                vakkal VARCHAR(100),
-                lot_no VARCHAR(100),
-                item_mark VARCHAR(100),
-                no_of_cartons NUMERIC(12,3),
-                weight_kg NUMERIC(12,3),
-                group_name VARCHAR(100),
-                storage_location VARCHAR(255),
-                exporter VARCHAR(255),
-                rate NUMERIC(12,3),
-                value NUMERIC(12,3),
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-        for cs_item in data.cold_storage_items:
-            db.execute(
-                text("""
-                    INSERT INTO interunit_transfer_in_cold_storage
-                        (header_id, item_description, inward_dt, unit, vakkal,
-                         lot_no, item_mark, no_of_cartons, weight_kg,
-                         group_name, item_subgroup, storage_location, exporter, rate, value, spl_remarks)
-                    VALUES
-                        (:header_id, :item_description, :inward_dt, :unit, :vakkal,
-                         :lot_no, :item_mark, :no_of_cartons, :weight_kg,
-                         :group_name, :item_subgroup, :storage_location, :exporter, :rate, :value, :spl_remarks)
-                """),
-                {
-                    "header_id": header_id,
-                    "item_description": cs_item.item_description,
-                    "inward_dt": cs_item.inward_dt,
-                    "unit": cs_item.unit,
-                    "vakkal": cs_item.vakkal,
-                    "lot_no": cs_item.lot_no,
-                    "item_mark": cs_item.item_mark,
-                    "no_of_cartons": cs_item.no_of_cartons,
-                    "weight_kg": cs_item.weight_kg,
-                    "group_name": cs_item.group_name,
-                    "item_subgroup": cs_item.item_subgroup,
-                    "storage_location": cs_item.storage_location,
-                    "exporter": cs_item.exporter,
-                    "rate": cs_item.rate,
-                    "value": cs_item.value,
-                    "spl_remarks": cs_item.spl_remarks,
-                },
-            )
-
-            # Also insert per-box rows into cfpl/cdpl_cold_stocks table
-            cold_company = (cs_item.cold_company or "").strip().lower()
-            cold_table = cold_stocks_table_map.get(cold_company)
-            if cold_table and cs_item.box_details:
-                num_boxes = len(cs_item.box_details)
-                rate_per_box = (cs_item.rate / num_boxes) if (cs_item.rate and num_boxes > 0) else cs_item.rate
-                value_per_box = (cs_item.value / num_boxes) if (cs_item.value and num_boxes > 0) else cs_item.value
-
-                for box_detail in cs_item.box_details:
-                    db.execute(
-                        text(f"""
-                            INSERT INTO {cold_table}
-                                (inward_dt, unit, inward_no, item_description, item_mark,
-                                 vakkal, lot_no, no_of_cartons, weight_kg,
-                                 total_inventory_kgs, group_name, item_subgroup, storage_location,
-                                 exporter, last_purchase_rate, value,
-                                 box_id, transaction_no, spl_remarks)
-                            VALUES
-                                (:inward_dt, :unit, :inward_no, :item_description, :item_mark,
-                                 :vakkal, :lot_no, 1, :weight_kg,
-                                 :weight_kg, :group_name, :item_subgroup, :storage_location,
-                                 :exporter, :last_purchase_rate, :value,
-                                 :box_id, :transaction_no, :spl_remarks)
-                        """),
-                        {
-                            "inward_dt": cs_item.inward_dt,
-                            "unit": cs_item.unit,
-                            "inward_no": transfer_out.challan_no,
-                            "item_description": cs_item.item_description,
-                            "item_mark": cs_item.item_mark,
-                            "vakkal": cs_item.vakkal,
-                            "lot_no": cs_item.lot_no,
-                            "weight_kg": box_detail.weight_kg,
-                            "group_name": cs_item.group_name,
-                            "item_subgroup": cs_item.item_subgroup,
-                            "storage_location": cs_item.storage_location,
-                            "exporter": cs_item.exporter,
-                            "last_purchase_rate": rate_per_box,
-                            "value": value_per_box,
-                            "box_id": box_detail.box_id,
-                            "transaction_no": box_detail.transaction_no,
-                            "spl_remarks": cs_item.spl_remarks,
-                        },
-                    )
-                logger.info(
-                    "COLD_STOCKS_INSERT: table=%s, item=%s, boxes=%d",
-                    cold_table, cs_item.item_description, len(cs_item.box_details),
-                )
+        to_site_val = transfer_out.to_site if hasattr(transfer_out, 'to_site') else None
+        _insert_cold_storage_items(header_id, data.cold_storage_items, transfer_out.challan_no, db, to_site=to_site_val)
 
     # Insert scanned boxes
     boxes = []
@@ -1441,71 +1336,144 @@ def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
     return result
 
 
-# ── Cold storage helper (shared by create_transfer_in & finalize) ──
+# -- Cold storage helper (shared by create_transfer_in & finalize) --
 
 
-def _insert_cold_storage_items(header_id: int, cold_storage_items, challan_no: str, db: Session):
-    """Insert cold storage per-item + per-box rows. Reusable helper."""
-    cold_stocks_table_map = {"cfpl": "cfpl_cold_stocks", "cdpl": "cdpl_cold_stocks"}
+def _restore_cold_stock_snapshots(transfer_in_id: Optional[int], transfer_out_id: Optional[int], db: Session):
+    """Restore cold stock rows from snapshots (saved during finalize_transfer_in).
+    Used when deleting transfer-in or transfer-out records."""
+    logger.info(
+        "COLD_STOCK_RESTORE: Called with transfer_in_id=%s, transfer_out_id=%s",
+        transfer_in_id, transfer_out_id,
+    )
 
-    db.execute(text("""
-        CREATE TABLE IF NOT EXISTS interunit_transfer_in_cold_storage (
-            id SERIAL PRIMARY KEY,
-            header_id INTEGER REFERENCES interunit_transfer_in_header(id),
-            item_description VARCHAR(255),
-            inward_dt VARCHAR(20),
-            unit VARCHAR(50),
-            vakkal VARCHAR(100),
-            lot_no VARCHAR(100),
-            item_mark VARCHAR(100),
-            no_of_cartons NUMERIC(12,3),
-            weight_kg NUMERIC(12,3),
-            group_name VARCHAR(100),
-            item_subgroup VARCHAR(100),
-            storage_location VARCHAR(255),
-            exporter VARCHAR(255),
-            rate NUMERIC(12,3),
-            value NUMERIC(12,3),
-            spl_remarks TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
+    snapshot_table_exists = db.execute(
+        text("SELECT to_regclass('public.cold_stock_snapshots')")
+    ).scalar()
+    if not snapshot_table_exists:
+        logger.info("COLD_STOCK_RESTORE: Snapshot table does not exist, skipping")
+        return
+
+    # Find snapshots by transfer_in_header_id or transfer_out_id
+    clauses = []
+    params: dict = {}
+    if transfer_in_id:
+        clauses.append("transfer_in_header_id = :ti_id")
+        params["ti_id"] = transfer_in_id
+    if transfer_out_id:
+        clauses.append("transfer_out_id = :to_id")
+        params["to_id"] = transfer_out_id
+    if not clauses:
+        return
+
+    where = " OR ".join(clauses)
+    snapshots = db.execute(
+        text(f"SELECT * FROM cold_stock_snapshots WHERE {where}"),
+        params,
+    ).fetchall()
+
+    logger.info("COLD_STOCK_RESTORE: Found %d snapshot(s) matching query", len(snapshots))
+
+    if not snapshots:
+        return
+
+    for snap in snapshots:
+        cold_table = snap.source_table
+        logger.info(
+            "COLD_STOCK_RESTORE: Processing snapshot   table=%s, box_id=%s, item=%s",
+            cold_table, snap.box_id, snap.item_description,
         )
-    """))
 
-    for cs_item in cold_storage_items:
+        # Verify table exists
+        tbl_exists = db.execute(
+            text("SELECT to_regclass(:t)"), {"t": f"public.{cold_table}"}
+        ).scalar()
+        if not tbl_exists:
+            logger.warning("COLD_STOCK_RESTORE: Table %s does not exist, skipping", cold_table)
+            continue
+
+        # Check if already exists (avoid duplicates)   handle NULL transaction_no
+        if snap.transaction_no:
+            exists = db.execute(
+                text(f"SELECT id FROM {cold_table} WHERE box_id = :bid AND transaction_no = :txno"),
+                {"bid": snap.box_id, "txno": snap.transaction_no},
+            ).fetchone()
+        else:
+            exists = db.execute(
+                text(f"SELECT id FROM {cold_table} WHERE box_id = :bid"),
+                {"bid": snap.box_id},
+            ).fetchone()
+
+        if exists:
+            logger.info("COLD_STOCK_RESTORE: Already exists in %s, skipping box_id=%s", cold_table, snap.box_id)
+            continue
+
+        # Re-insert the full original cold stock row from snapshot
         db.execute(
-            text("""
-                INSERT INTO interunit_transfer_in_cold_storage
-                    (header_id, item_description, inward_dt, unit, vakkal,
-                     lot_no, item_mark, no_of_cartons, weight_kg,
-                     group_name, item_subgroup, storage_location, exporter, rate, value, spl_remarks)
+            text(f"""
+                INSERT INTO {cold_table}
+                    (inward_dt, unit, inward_no, item_description, item_mark, vakkal,
+                     lot_no, no_of_cartons, weight_kg, total_inventory_kgs,
+                     group_name, item_subgroup, storage_location,
+                     exporter, last_purchase_rate, value,
+                     box_id, transaction_no, spl_remarks)
                 VALUES
-                    (:header_id, :item_description, :inward_dt, :unit, :vakkal,
-                     :lot_no, :item_mark, :no_of_cartons, :weight_kg,
-                     :group_name, :item_subgroup, :storage_location, :exporter, :rate, :value, :spl_remarks)
+                    (:inward_dt, :unit, :inward_no, :item_description, :item_mark, :vakkal,
+                     :lot_no, :no_of_cartons, :weight_kg, :total_inventory_kgs,
+                     :group_name, :item_subgroup, :storage_location,
+                     :exporter, :last_purchase_rate, :value,
+                     :box_id, :transaction_no, :spl_remarks)
             """),
             {
-                "header_id": header_id,
-                "item_description": cs_item.item_description,
-                "inward_dt": cs_item.inward_dt,
-                "unit": cs_item.unit,
-                "vakkal": cs_item.vakkal,
-                "lot_no": cs_item.lot_no,
-                "item_mark": cs_item.item_mark,
-                "no_of_cartons": cs_item.no_of_cartons,
-                "weight_kg": cs_item.weight_kg,
-                "group_name": cs_item.group_name,
-                "item_subgroup": cs_item.item_subgroup,
-                "storage_location": cs_item.storage_location,
-                "exporter": cs_item.exporter,
-                "rate": cs_item.rate,
-                "value": cs_item.value,
-                "spl_remarks": cs_item.spl_remarks,
+                "inward_dt": snap.inward_dt,
+                "unit": snap.unit,
+                "inward_no": snap.inward_no,
+                "item_description": snap.item_description,
+                "item_mark": snap.item_mark,
+                "vakkal": snap.vakkal,
+                "lot_no": snap.lot_no,
+                "no_of_cartons": snap.no_of_cartons,
+                "weight_kg": snap.weight_kg,
+                "total_inventory_kgs": snap.total_inventory_kgs,
+                "group_name": snap.group_name,
+                "item_subgroup": snap.item_subgroup,
+                "storage_location": snap.storage_location,
+                "exporter": snap.exporter,
+                "last_purchase_rate": snap.last_purchase_rate,
+                "value": snap.value,
+                "box_id": snap.box_id,
+                "transaction_no": snap.transaction_no,
+                "spl_remarks": snap.spl_remarks,
             },
         )
+        logger.info(
+            "COLD_STOCK_RESTORE: Restored to %s   box_id=%s, transaction_no=%s, item=%s",
+            cold_table, snap.box_id, snap.transaction_no, snap.item_description,
+        )
 
+    # Clean up snapshots after restoration
+    db.execute(
+        text(f"DELETE FROM cold_stock_snapshots WHERE {where}"),
+        params,
+    )
+    logger.info("COLD_STOCK_RESTORE: Cleaned up %d snapshot(s)", len(snapshots))
+
+
+def _insert_cold_storage_items(header_id: int, cold_storage_items, challan_no: str, db: Session, to_site: str = None):
+    """Insert cold storage items directly into cfpl/cdpl_cold_stocks tables.
+    to_site used as fallback for unit/storage_location."""
+    cold_stocks_table_map = {"cfpl": "cfpl_cold_stocks", "cdpl": "cdpl_cold_stocks"}
+
+    for cs_item in cold_storage_items:
         cold_company = (cs_item.cold_company or "").strip().lower()
         cold_table = cold_stocks_table_map.get(cold_company)
-        if cold_table and cs_item.box_details:
+
+        if not cold_table:
+            logger.warning("COLD_STOCKS_INSERT: Unknown cold_company=%s, skipping item=%s", cs_item.cold_company, cs_item.item_description)
+            continue
+
+        if cs_item.box_details:
+            # Per-box insert: one row per box in cold stocks
             num_boxes = len(cs_item.box_details)
             rate_per_box = (cs_item.rate / num_boxes) if (cs_item.rate and num_boxes > 0) else cs_item.rate
             value_per_box = (cs_item.value / num_boxes) if (cs_item.value and num_boxes > 0) else cs_item.value
@@ -1528,7 +1496,7 @@ def _insert_cold_storage_items(header_id: int, cold_storage_items, challan_no: s
                     """),
                     {
                         "inward_dt": cs_item.inward_dt,
-                        "unit": cs_item.unit,
+                        "unit": cs_item.storage_location or to_site,
                         "inward_no": challan_no,
                         "item_description": cs_item.item_description,
                         "item_mark": cs_item.item_mark,
@@ -1537,7 +1505,7 @@ def _insert_cold_storage_items(header_id: int, cold_storage_items, challan_no: s
                         "weight_kg": box_detail.weight_kg,
                         "group_name": cs_item.group_name,
                         "item_subgroup": cs_item.item_subgroup,
-                        "storage_location": cs_item.storage_location,
+                        "storage_location": cs_item.storage_location or to_site,
                         "exporter": cs_item.exporter,
                         "last_purchase_rate": rate_per_box,
                         "value": value_per_box,
@@ -1547,12 +1515,51 @@ def _insert_cold_storage_items(header_id: int, cold_storage_items, challan_no: s
                     },
                 )
             logger.info(
-                "COLD_STOCKS_INSERT: table=%s, item=%s, boxes=%d",
+                "COLD_STOCKS_INSERT: table=%s, item=%s, boxes=%d, storage=%s",
                 cold_table, cs_item.item_description, len(cs_item.box_details),
+                cs_item.storage_location or to_site,
+            )
+        else:
+            # No box details   insert a single summary row
+            db.execute(
+                text(f"""
+                    INSERT INTO {cold_table}
+                        (inward_dt, unit, inward_no, item_description, item_mark,
+                         vakkal, lot_no, no_of_cartons, weight_kg,
+                         total_inventory_kgs, group_name, item_subgroup, storage_location,
+                         exporter, last_purchase_rate, value, spl_remarks)
+                    VALUES
+                        (:inward_dt, :unit, :inward_no, :item_description, :item_mark,
+                         :vakkal, :lot_no, :no_of_cartons, :weight_kg,
+                         :weight_kg, :group_name, :item_subgroup, :storage_location,
+                         :exporter, :last_purchase_rate, :value, :spl_remarks)
+                """),
+                {
+                    "inward_dt": cs_item.inward_dt,
+                    "unit": cs_item.storage_location or to_site,
+                    "inward_no": challan_no,
+                    "item_description": cs_item.item_description,
+                    "item_mark": cs_item.item_mark,
+                    "vakkal": cs_item.vakkal,
+                    "lot_no": cs_item.lot_no,
+                    "no_of_cartons": cs_item.no_of_cartons,
+                    "weight_kg": cs_item.weight_kg,
+                    "group_name": cs_item.group_name,
+                    "item_subgroup": cs_item.item_subgroup,
+                    "storage_location": cs_item.storage_location or to_site,
+                    "exporter": cs_item.exporter,
+                    "last_purchase_rate": cs_item.rate,
+                    "value": cs_item.value,
+                    "spl_remarks": cs_item.spl_remarks,
+                },
+            )
+            logger.info(
+                "COLD_STOCKS_INSERT: table=%s, item=%s (no box details), storage=%s",
+                cold_table, cs_item.item_description, cs_item.storage_location or to_site,
             )
 
 
-# ── Pending Transfer IN (Phase C - real-time acknowledge) ──
+# -- Pending Transfer IN (Phase C - real-time acknowledge) --
 
 
 def create_pending_transfer_in(data: PendingTransferInCreate, db: Session) -> dict:
@@ -1646,7 +1653,7 @@ def acknowledge_pending_box(header_id: int, data: PendingBoxAcknowledge, db: Ses
 
     issue_json = json.dumps(data.issue) if data.issue else None
 
-    # Atomic upsert — safe against concurrent clients acknowledging the same box
+    # Atomic upsert   safe against concurrent clients acknowledging the same box
     # First ensure a unique constraint exists (idempotent)
     try:
         db.execute(text("""
@@ -1831,7 +1838,139 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
 
     # Process cold storage items if provided
     if data.cold_storage_items:
-        _insert_cold_storage_items(header_id, data.cold_storage_items, header.transfer_out_no, db)
+        # Fetch to_site from transfer-out header for storage_location autofill
+        tout = db.execute(
+            text("SELECT to_site FROM interunit_transfers_header WHERE id = :id"),
+            {"id": header.transfer_out_id},
+        ).fetchone()
+        to_site = tout.to_site if tout else None
+        _insert_cold_storage_items(header_id, data.cold_storage_items, header.transfer_out_no, db, to_site=to_site)
+
+    # -- Subtract from cold stocks when transfer is FROM Cold Storage --
+    transfer_out = db.execute(
+        text("SELECT from_site, to_site FROM interunit_transfers_header WHERE id = :toid"),
+        {"toid": header.transfer_out_id},
+    ).fetchone()
+
+    cold_storage_names = ["cold storage", "rishi cold", "savla d-39 cold", "savla d-514 cold"]
+    from_site_lower = (transfer_out.from_site or "").strip().lower() if transfer_out else ""
+
+    if from_site_lower in cold_storage_names:
+        # Ensure snapshot table exists for restoration on delete
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS cold_stock_snapshots (
+                id SERIAL PRIMARY KEY,
+                transfer_out_id INTEGER,
+                transfer_in_header_id INTEGER,
+                source_table VARCHAR(50),
+                original_id INTEGER,
+                inward_dt VARCHAR(50), unit VARCHAR(50), inward_no VARCHAR(100),
+                item_description VARCHAR(500), item_mark VARCHAR(255), vakkal VARCHAR(255),
+                lot_no VARCHAR(100), no_of_cartons NUMERIC(12,3), weight_kg NUMERIC(12,3),
+                total_inventory_kgs NUMERIC(12,3), group_name VARCHAR(100),
+                item_subgroup VARCHAR(100), storage_location VARCHAR(255),
+                exporter VARCHAR(255), last_purchase_rate NUMERIC(12,3),
+                value NUMERIC(12,3), box_id VARCHAR(255), transaction_no VARCHAR(255),
+                spl_remarks TEXT, created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+
+        # Get all boxes from the transfer-out that have box_id (cold stock refs)
+        out_boxes = db.execute(
+            text("""
+                SELECT box_id, transaction_no, article, net_weight
+                FROM interunit_transfer_boxes
+                WHERE header_id = :toid
+                  AND box_id IS NOT NULL AND box_id != ''
+            """),
+            {"toid": header.transfer_out_id},
+        ).fetchall()
+
+        logger.info(
+            "COLD_STOCK_SUBTRACT: from_site=%s, transfer_out_id=%s, out_boxes_count=%d, box_ids=%s",
+            transfer_out.from_site, header.transfer_out_id, len(out_boxes),
+            [b.box_id for b in out_boxes],
+        )
+
+        if out_boxes:
+            cold_tables = ["cfpl_cold_stocks", "cdpl_cold_stocks"]
+            for box in out_boxes:
+                for cold_table in cold_tables:
+                    # Try matching by box_id + transaction_no first, then box_id only
+                    if box.transaction_no:
+                        original = db.execute(
+                            text(f"SELECT * FROM {cold_table} WHERE box_id = :box_id AND transaction_no = :txn_no LIMIT 1"),
+                            {"box_id": box.box_id, "txn_no": box.transaction_no},
+                        ).fetchone()
+                    else:
+                        original = None
+
+                    # Fallback: match by box_id only
+                    if not original:
+                        original = db.execute(
+                            text(f"SELECT * FROM {cold_table} WHERE box_id = :box_id LIMIT 1"),
+                            {"box_id": box.box_id},
+                        ).fetchone()
+
+                    if not original:
+                        logger.info("COLD_STOCK_SUBTRACT: No match in %s for box_id=%s", cold_table, box.box_id)
+                        continue
+
+                    # Save snapshot of the full row before deleting
+                    db.execute(
+                        text("""
+                            INSERT INTO cold_stock_snapshots
+                                (transfer_out_id, transfer_in_header_id, source_table, original_id,
+                                 inward_dt, unit, inward_no, item_description, item_mark, vakkal,
+                                 lot_no, no_of_cartons, weight_kg, total_inventory_kgs,
+                                 group_name, item_subgroup, storage_location,
+                                 exporter, last_purchase_rate, value,
+                                 box_id, transaction_no, spl_remarks)
+                            VALUES
+                                (:transfer_out_id, :transfer_in_header_id, :source_table, :original_id,
+                                 :inward_dt, :unit, :inward_no, :item_description, :item_mark, :vakkal,
+                                 :lot_no, :no_of_cartons, :weight_kg, :total_inventory_kgs,
+                                 :group_name, :item_subgroup, :storage_location,
+                                 :exporter, :last_purchase_rate, :value,
+                                 :box_id, :transaction_no, :spl_remarks)
+                        """),
+                        {
+                            "transfer_out_id": header.transfer_out_id,
+                            "transfer_in_header_id": header_id,
+                            "source_table": cold_table,
+                            "original_id": original.id,
+                            "inward_dt": getattr(original, "inward_dt", None),
+                            "unit": getattr(original, "unit", None),
+                            "inward_no": getattr(original, "inward_no", None),
+                            "item_description": getattr(original, "item_description", None),
+                            "item_mark": getattr(original, "item_mark", None),
+                            "vakkal": getattr(original, "vakkal", None),
+                            "lot_no": getattr(original, "lot_no", None),
+                            "no_of_cartons": getattr(original, "no_of_cartons", None),
+                            "weight_kg": getattr(original, "weight_kg", None),
+                            "total_inventory_kgs": getattr(original, "total_inventory_kgs", None),
+                            "group_name": getattr(original, "group_name", None),
+                            "item_subgroup": getattr(original, "item_subgroup", None),
+                            "storage_location": getattr(original, "storage_location", None),
+                            "exporter": getattr(original, "exporter", None),
+                            "last_purchase_rate": getattr(original, "last_purchase_rate", None),
+                            "value": getattr(original, "value", None),
+                            "box_id": box.box_id,
+                            "transaction_no": getattr(original, "transaction_no", None),
+                            "spl_remarks": getattr(original, "spl_remarks", None),
+                        },
+                    )
+
+                    # Delete the cold stock row by its primary id
+                    db.execute(
+                        text(f"DELETE FROM {cold_table} WHERE id = :orig_id"),
+                        {"orig_id": original.id},
+                    )
+                    logger.info(
+                        "COLD_STOCK_SUBTRACT: Snapshot saved & deleted from %s   box_id=%s, article=%s",
+                        cold_table, box.box_id, box.article,
+                    )
+                    break  # Found in this table, move to next box
 
     # Update Transfer OUT status to 'Received'
     db.execute(
@@ -1868,7 +2007,7 @@ def get_pending_by_transfer_out(transfer_out_id: int, db: Session) -> dict:
     return {"exists": True, "header": header}
 
 
-# ── List transfer INs ──
+# -- List transfer INs --
 
 
 def list_transfer_ins(
@@ -1943,7 +2082,7 @@ def list_transfer_ins(
     }
 
 
-# ── Get single transfer IN ──
+# -- Get single transfer IN --
 
 
 def get_transfer_in(transfer_in_id: int, db: Session) -> dict:
@@ -1970,7 +2109,7 @@ def get_transfer_in(transfer_in_id: int, db: Session) -> dict:
     return result
 
 
-# ── Delete transfer IN ──
+# -- Delete transfer IN --
 
 TRANSFER_IN_DELETE_ALLOWED_EMAILS = {"yash@candorfoods.in"}
 
@@ -1994,17 +2133,7 @@ def delete_transfer_in(transfer_in_id: int, user_email: str, db: Session) -> dic
     grn_number = header.grn_number
     transfer_out_id = header.transfer_out_id
 
-    # Delete from interunit_transfer_in_cold_storage
-    cold_table_exists = db.execute(
-        text("SELECT to_regclass('public.interunit_transfer_in_cold_storage')")
-    ).scalar()
-    if cold_table_exists:
-        db.execute(
-            text("DELETE FROM interunit_transfer_in_cold_storage WHERE header_id = :hid"),
-            {"hid": transfer_in_id},
-        )
-
-    # Fetch boxes to find cold_stocks entries to delete
+    # Fetch boxes from transfer-in
     in_boxes = db.execute(
         text("""
             SELECT box_id, transaction_no, article
@@ -2014,32 +2143,53 @@ def delete_transfer_in(transfer_in_id: int, user_email: str, db: Session) -> dic
         {"hid": transfer_in_id},
     ).fetchall()
 
-    # Delete matching rows from cfpl/cdpl_cold_stocks (inserted during transfer-in)
-    # We match by box_id + transaction_no to be precise
-    cold_stocks_tables = ["cfpl_cold_stocks", "cdpl_cold_stocks"]
-    for cs_table in cold_stocks_tables:
-        table_exists = db.execute(
-            text("SELECT to_regclass(:tbl)"),
-            {"tbl": f"public.{cs_table}"},
-        ).scalar()
-        if not table_exists:
-            continue
-        for box_row in in_boxes:
-            if box_row.box_id and box_row.transaction_no:
-                db.execute(
-                    text(f"""
-                        DELETE FROM {cs_table}
-                        WHERE box_id = :box_id AND transaction_no = :txno
-                    """),
-                    {"box_id": box_row.box_id, "txno": box_row.transaction_no},
-                )
-        # Also delete by inward_no (challan_no) to catch entries without box_id/transaction_no
+    # Determine transfer direction
+    transfer_out_row = None
+    if transfer_out_id:
+        transfer_out_row = db.execute(
+            text("SELECT from_site, to_site FROM interunit_transfers_header WHERE id = :toid"),
+            {"toid": transfer_out_id},
+        ).fetchone()
+
+    cold_storage_names = ["cold storage", "rishi cold", "savla d-39 cold", "savla d-514 cold"]
+    from_site_lower = (transfer_out_row.from_site or "").strip().lower() if transfer_out_row else ""
+    to_site_lower = (transfer_out_row.to_site or "").strip().lower() if transfer_out_row else ""
+    is_from_cold = from_site_lower in cold_storage_names
+    is_to_cold = to_site_lower in cold_storage_names
+
+    logger.info(
+        "DELETE_TRANSFER_IN: from_site=%s, to_site=%s, is_from_cold=%s, is_to_cold=%s",
+        from_site_lower, to_site_lower, is_from_cold, is_to_cold,
+    )
+
+    if is_to_cold:
+        # Warehouse ? Cold Storage: delete the cold stock rows that were inserted during transfer-in
         challan_no = getattr(header, "transfer_out_no", None)
-        if challan_no:
-            db.execute(
-                text(f"DELETE FROM {cs_table} WHERE inward_no = :challan"),
-                {"challan": challan_no},
-            )
+        cold_stocks_tables = ["cfpl_cold_stocks", "cdpl_cold_stocks"]
+        for cs_table in cold_stocks_tables:
+            table_exists = db.execute(
+                text("SELECT to_regclass(:tbl)"),
+                {"tbl": f"public.{cs_table}"},
+            ).scalar()
+            if not table_exists:
+                continue
+
+            if challan_no:
+                db.execute(
+                    text(f"DELETE FROM {cs_table} WHERE inward_no = :challan"),
+                    {"challan": challan_no},
+                )
+
+            for box_row in in_boxes:
+                if box_row.box_id and box_row.transaction_no:
+                    db.execute(
+                        text(f"DELETE FROM {cs_table} WHERE box_id = :box_id AND transaction_no = :txno"),
+                        {"box_id": box_row.box_id, "txno": box_row.transaction_no},
+                    )
+
+    if is_from_cold:
+        # Cold Storage ? Warehouse: restore the cold stock rows from snapshots
+        _restore_cold_stock_snapshots(transfer_in_id, transfer_out_id, db)
 
     # Delete from interunit_transfer_in_boxes
     db.execute(
@@ -2071,9 +2221,9 @@ def delete_transfer_in(transfer_in_id: int, user_email: str, db: Session) -> dic
     }
 
 
-# ══════════════════════════════════════════════
+# ----------------------------------------------
 #  Categorial Inventory Lookup (for Transfer & Request article section)
-# ══════════════════════════════════════════════
+# ----------------------------------------------
 
 _CATEGORIAL_TABLE = "public.categorial_inv"
 
@@ -2084,7 +2234,7 @@ def categorial_global_search(
     offset: int,
     db: Session,
 ) -> CategorialSearchResponse:
-    """Global search on categorial_inv.particulars — bypasses hierarchy."""
+    """Global search on categorial_inv.particulars   bypasses hierarchy."""
     search_term = search.strip() if search else None
 
     where_clauses = ["1=1"]
@@ -2168,7 +2318,7 @@ def categorial_dropdown(
     sub_category = sub_category.strip() if sub_category else None
     search = search.strip() if search else None
 
-    # 1) All material types — sorted by priority: rm → fg → pm (only RM, PM, FG)
+    # 1) All material types   sorted by priority: rm ? fg ? pm (only RM, PM, FG)
     material_types = db.execute(
         text(f"""
             SELECT mt FROM (

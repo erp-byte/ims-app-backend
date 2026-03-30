@@ -35,17 +35,22 @@ def get_storage_locations(
     company: str = Query(..., description="Company code: cfpl or cdpl"),
     db: Session = Depends(get_db),
 ):
-    """Return distinct storage_location values from company-specific cold stocks table."""
-    table = _get_cold_table(company)
-    rows = db.execute(
-        text(f"""
-            SELECT DISTINCT storage_location
-            FROM {table}
-            WHERE storage_location IS NOT NULL AND storage_location != ''
-            ORDER BY storage_location
-        """)
-    ).fetchall()
-    return [r.storage_location for r in rows]
+    """Return distinct storage_location values from both cfpl and cdpl cold stocks tables."""
+    locations = set()
+    for table in ["cfpl_cold_stocks", "cdpl_cold_stocks"]:
+        tbl_exists = db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{table}"}).scalar()
+        if not tbl_exists:
+            continue
+        rows = db.execute(
+            text(f"""
+                SELECT DISTINCT storage_location
+                FROM {table}
+                WHERE storage_location IS NOT NULL AND storage_location != ''
+            """)
+        ).fetchall()
+        for r in rows:
+            locations.add(r.storage_location)
+    return sorted(locations)
 
 
 @router.get("/stocks/download-summary")
@@ -415,21 +420,28 @@ def search_cold_storage_stocks(
 
     rows = db.execute(
         text(f"""
-            SELECT MIN(id) AS id, inward_dt, unit, inward_no, item_description, item_mark,
-                   vakkal, lot_no,
+            SELECT MIN(id) AS id,
+                   MIN(inward_dt) AS inward_dt,
+                   MIN(unit) AS unit,
+                   COALESCE(inward_no, '') AS inward_no,
+                   item_description,
+                   COALESCE(item_mark, '') AS item_mark,
+                   MAX(vakkal) AS vakkal,
+                   COALESCE(lot_no, '') AS lot_no,
                    SUM(no_of_cartons) AS no_of_cartons,
                    MIN(weight_kg) AS weight_kg,
                    SUM(COALESCE(no_of_cartons, 0) * COALESCE(weight_kg, 0)) AS total_inventory_kgs,
-                   group_name, storage_location,
-                   exporter, MIN(last_purchase_rate) AS last_purchase_rate,
+                   MAX(group_name) AS group_name,
+                   COALESCE(storage_location, '') AS storage_location,
+                   MAX(exporter) AS exporter,
+                   MIN(last_purchase_rate) AS last_purchase_rate,
                    SUM(value) AS value,
                    MIN(box_id) AS box_id,
                    MIN(transaction_no) AS transaction_no
             FROM {table}
             WHERE {where_sql}
-            GROUP BY inward_dt, unit, inward_no, item_description, item_mark,
-                     vakkal, lot_no, group_name, storage_location, exporter
-            ORDER BY inward_dt ASC, MIN(id) ASC
+            GROUP BY item_description, COALESCE(lot_no, ''), COALESCE(inward_no, ''), COALESCE(item_mark, ''), COALESCE(storage_location, '')
+            ORDER BY MIN(inward_dt) ASC, MIN(id) ASC
             LIMIT :limit
         """),
         params,
@@ -597,8 +609,8 @@ def inner_cold_transfer(payload: InnerTransferPayload, db: Session = Depends(get
                 errors.append(f"Line {idx + 1}: stock_record_id is required")
                 continue
 
-            # Fetch the original record
-            row = db.execute(
+            # Fetch the reference record to get item details
+            ref_row = db.execute(
                 text(f"""
                     SELECT id, inward_dt, unit, inward_no, item_description, item_mark,
                            vakkal, lot_no, no_of_cartons, weight_kg,
@@ -611,12 +623,35 @@ def inner_cold_transfer(payload: InnerTransferPayload, db: Session = Depends(get
                 {"record_id": line.stock_record_id},
             ).fetchone()
 
-            if not row:
+            if not ref_row:
                 errors.append(f"Line {idx + 1}: Record ID {line.stock_record_id} not found")
                 continue
 
-            current_cartons = float(row.no_of_cartons) if row.no_of_cartons else 0
+            # Fetch ALL rows matching this item/lot group (since stock search groups by item+lot)
+            all_rows = db.execute(
+                text(f"""
+                    SELECT id, no_of_cartons, weight_kg, value
+                    FROM {cold_table}
+                    WHERE item_description = :desc
+                      AND COALESCE(lot_no, '') = COALESCE(:lot_no, '')
+                      AND COALESCE(inward_no, '') = COALESCE(:inward_no, '')
+                    ORDER BY id ASC
+                """),
+                {
+                    "desc": ref_row.item_description,
+                    "lot_no": ref_row.lot_no,
+                    "inward_no": ref_row.inward_no,
+                },
+            ).fetchall()
+
+            current_cartons = sum(float(r.no_of_cartons or 0) for r in all_rows)
             transfer_qty = line.quantity
+
+            logger.info(
+                "Inner transfer line %d: found %d matching rows, total_cartons=%.1f, transfer_qty=%d, row_cartons=%s",
+                idx + 1, len(all_rows), current_cartons, transfer_qty,
+                [float(r.no_of_cartons or 0) for r in all_rows[:5]],
+            )
 
             if transfer_qty <= 0:
                 errors.append(f"Line {idx + 1}: Quantity must be greater than 0")
@@ -628,101 +663,112 @@ def inner_cold_transfer(payload: InnerTransferPayload, db: Session = Depends(get
                 )
                 continue
 
-            # Calculate weight per carton for proportional split
-            weight_per_carton = (float(row.weight_kg) / current_cartons) if (row.weight_kg and current_cartons > 0) else 0
-            # total_inv = weight_kg (i.e. no_of_cartons * weight_per_carton), so per carton it equals weight_per_carton
+            # Use reference row for weight/value per carton
+            ref_cartons = float(ref_row.no_of_cartons) if ref_row.no_of_cartons else 1
+            weight_per_carton = (float(ref_row.weight_kg) / ref_cartons) if (ref_row.weight_kg and ref_cartons > 0) else 0
             total_inv_per_carton = weight_per_carton
-            value_per_carton = (float(row.value) / current_cartons) if (row.value and current_cartons > 0) else 0
+            value_per_carton = (float(ref_row.value) / ref_cartons) if (ref_row.value and ref_cartons > 0) else 0
 
             transferred_weight = round(weight_per_carton * transfer_qty, 3)
+            row = ref_row
 
             new_location = line.new_storage_location if line.new_storage_location else None
 
             if transfer_qty == current_cartons:
-                # Transferring ALL boxes — update lot_no and optionally storage_location
-                if new_location:
-                    db.execute(
-                        text(f"""
-                            UPDATE {cold_table}
-                            SET lot_no = :new_lot_no, storage_location = :new_location
-                            WHERE id = :record_id
-                        """),
-                        {"new_lot_no": line.new_lot_number, "new_location": new_location, "record_id": line.stock_record_id},
-                    )
-                else:
-                    db.execute(
-                        text(f"""
-                            UPDATE {cold_table}
-                            SET lot_no = :new_lot_no
-                            WHERE id = :record_id
-                        """),
-                        {"new_lot_no": line.new_lot_number, "record_id": line.stock_record_id},
-                    )
+                # Transferring ALL boxes — update lot_no (and optionally location) on all matching rows
+                row_ids = [r.id for r in all_rows]
+                for rid in row_ids:
+                    if new_location:
+                        db.execute(
+                            text(f"UPDATE {cold_table} SET lot_no = :new_lot_no, storage_location = :new_location WHERE id = :rid"),
+                            {"new_lot_no": line.new_lot_number, "new_location": new_location, "rid": rid},
+                        )
+                    else:
+                        db.execute(
+                            text(f"UPDATE {cold_table} SET lot_no = :new_lot_no WHERE id = :rid"),
+                            {"new_lot_no": line.new_lot_number, "rid": rid},
+                        )
             else:
-                # PARTIAL transfer — reduce original, create new record with new lot
-                remaining_cartons = current_cartons - transfer_qty
-                remaining_weight = round(weight_per_carton * remaining_cartons, 3)
-                remaining_total_inv = round(total_inv_per_carton * remaining_cartons, 3)
-                remaining_value = round(value_per_carton * remaining_cartons, 2)
+                # PARTIAL transfer across multiple rows — update first N rows to new lot
+                # Each row typically has no_of_cartons=1, so we update transfer_qty rows
+                rows_to_transfer = []
+                remaining_qty = transfer_qty
+                for r in all_rows:
+                    if remaining_qty <= 0:
+                        break
+                    r_cartons = float(r.no_of_cartons or 0)
+                    if r_cartons <= remaining_qty:
+                        # Transfer this entire row
+                        rows_to_transfer.append((r.id, r_cartons))
+                        remaining_qty -= r_cartons
+                    else:
+                        # Partial row — need to split
+                        rows_to_transfer.append((r.id, remaining_qty))
+                        remaining_qty = 0
 
-                transferred_total_inv = round(total_inv_per_carton * transfer_qty, 3)
-                transferred_value = round(value_per_carton * transfer_qty, 2)
+                for rid, qty in rows_to_transfer:
+                    r_row = next((r for r in all_rows if r.id == rid), None)
+                    if not r_row:
+                        continue
+                    r_cartons = float(r_row.no_of_cartons or 0)
 
-                # Update original record: reduce cartons and weights
-                db.execute(
-                    text(f"""
-                        UPDATE {cold_table}
-                        SET no_of_cartons = :remaining_cartons,
-                            weight_kg = :remaining_weight,
-                            total_inventory_kgs = :remaining_total_inv,
-                            value = :remaining_value
-                        WHERE id = :record_id
-                    """),
-                    {
-                        "remaining_cartons": remaining_cartons,
-                        "remaining_weight": remaining_weight,
-                        "remaining_total_inv": remaining_total_inv,
-                        "remaining_value": remaining_value,
-                        "record_id": line.stock_record_id,
-                    },
-                )
+                    if qty >= r_cartons:
+                        # Transfer entire row — just update lot_no
+                        if new_location:
+                            db.execute(
+                                text(f"UPDATE {cold_table} SET lot_no = :new_lot, storage_location = :new_loc WHERE id = :rid"),
+                                {"new_lot": line.new_lot_number, "new_loc": new_location, "rid": rid},
+                            )
+                        else:
+                            db.execute(
+                                text(f"UPDATE {cold_table} SET lot_no = :new_lot WHERE id = :rid"),
+                                {"new_lot": line.new_lot_number, "rid": rid},
+                            )
+                    else:
+                        # Split this row: reduce original, insert new
+                        r_weight = float(r_row.weight_kg or 0)
+                        r_value = float(r_row.value or 0)
+                        wt_per = r_weight / r_cartons if r_cartons > 0 else 0
+                        val_per = r_value / r_cartons if r_cartons > 0 else 0
 
-                # Insert new record with new lot number and transferred quantities
-                db.execute(
-                    text(f"""
-                        INSERT INTO {cold_table}
-                            (inward_dt, unit, inward_no, item_description, item_mark,
-                             vakkal, lot_no, no_of_cartons, weight_kg,
-                             total_inventory_kgs, group_name, storage_location,
-                             exporter, last_purchase_rate, value,
-                             box_id, transaction_no)
-                        VALUES
-                            (:inward_dt, :unit, :inward_no, :item_description, :item_mark,
-                             :vakkal, :new_lot_no, :no_of_cartons, :weight_kg,
-                             :total_inventory_kgs, :group_name, :storage_location,
-                             :exporter, :last_purchase_rate, :value,
-                             :box_id, :transaction_no)
-                    """),
-                    {
-                        "inward_dt": row.inward_dt,
-                        "unit": row.unit,
-                        "inward_no": row.inward_no,
-                        "item_description": row.item_description,
-                        "item_mark": row.item_mark,
-                        "vakkal": row.vakkal,
-                        "new_lot_no": line.new_lot_number,
-                        "no_of_cartons": transfer_qty,
-                        "weight_kg": transferred_weight,
-                        "total_inventory_kgs": transferred_total_inv,
-                        "group_name": row.group_name,
-                        "storage_location": new_location if new_location else row.storage_location,
-                        "exporter": row.exporter,
-                        "last_purchase_rate": float(row.last_purchase_rate) if row.last_purchase_rate else None,
-                        "value": transferred_value,
-                        "box_id": row.box_id,
-                        "transaction_no": row.transaction_no,
-                    },
-                )
+                        rem = r_cartons - qty
+                        db.execute(
+                            text(f"""
+                                UPDATE {cold_table}
+                                SET no_of_cartons = :rem, weight_kg = :rem_wt,
+                                    total_inventory_kgs = :rem_wt, value = :rem_val
+                                WHERE id = :rid
+                            """),
+                            {"rem": rem, "rem_wt": round(wt_per * rem, 3), "rem_val": round(val_per * rem, 2), "rid": rid},
+                        )
+                        db.execute(
+                            text(f"""
+                                INSERT INTO {cold_table}
+                                    (inward_dt, unit, inward_no, item_description, item_mark,
+                                     vakkal, lot_no, no_of_cartons, weight_kg,
+                                     total_inventory_kgs, group_name, storage_location,
+                                     exporter, last_purchase_rate, value,
+                                     box_id, transaction_no)
+                                VALUES
+                                    (:inward_dt, :unit, :inward_no, :item_description, :item_mark,
+                                     :vakkal, :new_lot, :qty, :wt,
+                                     :wt, :group_name, :storage_location,
+                                     :exporter, :rate, :val,
+                                     :box_id, :txn)
+                            """),
+                            {
+                                "inward_dt": row.inward_dt, "unit": row.unit, "inward_no": row.inward_no,
+                                "item_description": row.item_description, "item_mark": row.item_mark,
+                                "vakkal": row.vakkal, "new_lot": line.new_lot_number,
+                                "qty": qty, "wt": round(wt_per * qty, 3),
+                                "group_name": row.group_name,
+                                "storage_location": new_location or row.storage_location,
+                                "exporter": row.exporter,
+                                "rate": float(row.last_purchase_rate) if row.last_purchase_rate else None,
+                                "val": round(val_per * qty, 2),
+                                "box_id": None, "txn": None,
+                            },
+                        )
 
             # Save transfer record in inner_cold_transfer table
             db.execute(

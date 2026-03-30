@@ -26,6 +26,10 @@ from services.qc_service.server import router as qc_router
 from services.qc_service.ipqc.server import router as ipqc_router
 from services.qc_service.ipqc.user_server import router as ipqc_user_router
 from services.competitor_service.server import router as competitor_router
+from services.cold_storage_service.dashboard_server import router as dashboard_router
+from services.ims_service.inward_dashboard_server import router as inward_dashboard_router
+from services.ims_service.transfer_dashboard_server import router as transfer_dashboard_router
+from services.ims_service.jobwork_dashboard_server import router as jobwork_dashboard_router
 
 
 logger = get_logger("main")
@@ -88,6 +92,62 @@ def _run_startup_migrations():
             db.execute(text("""
                 ALTER TABLE cold_storage_stocks
                 ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP
+            """))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Jobwork tables
+        try:
+            db.execute(text("""
+                CREATE TABLE IF NOT EXISTS jobwork_orders (
+                    id SERIAL PRIMARY KEY,
+                    jwo_id VARCHAR(50) UNIQUE NOT NULL,
+                    company VARCHAR(20) NOT NULL,
+                    dispatch_date DATE NOT NULL,
+                    vendor_name VARCHAR(200) NOT NULL,
+                    item_name VARCHAR(200) NOT NULL,
+                    item_description TEXT,
+                    process_type VARCHAR(50) NOT NULL,
+                    qty_dispatched FLOAT NOT NULL DEFAULT 0,
+                    uom VARCHAR(20) DEFAULT 'Kgs',
+                    jwo_status VARCHAR(30) NOT NULL DEFAULT 'Open',
+                    expected_loss_pct FLOAT DEFAULT 0,
+                    overdue_threshold_days INTEGER DEFAULT 30,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            db.execute(text("""
+                CREATE TABLE IF NOT EXISTS jobwork_inward_receipts (
+                    id SERIAL PRIMARY KEY,
+                    jwo_order_id INTEGER NOT NULL REFERENCES jobwork_orders(id),
+                    ir_number VARCHAR(50) UNIQUE NOT NULL,
+                    ir_date DATE NOT NULL,
+                    receipt_type VARCHAR(20) NOT NULL DEFAULT 'Partial',
+                    fg_qty_received FLOAT DEFAULT 0,
+                    waste_qty_received FLOAT DEFAULT 0,
+                    rejection_qty FLOAT DEFAULT 0,
+                    actual_loss_pct FLOAT DEFAULT 0,
+                    loss_status VARCHAR(30) DEFAULT 'Pending',
+                    remarks TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            db.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_jwo_company ON jobwork_orders(company)
+            """))
+            db.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_jwo_dispatch_date ON jobwork_orders(dispatch_date)
+            """))
+            db.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_jwo_vendor ON jobwork_orders(vendor_name)
+            """))
+            db.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_jwo_status ON jobwork_orders(jwo_status)
+            """))
+            db.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_jir_jwo_id ON jobwork_inward_receipts(jwo_order_id)
             """))
             db.commit()
         except Exception:
@@ -157,6 +217,10 @@ app.include_router(qc_router)
 app.include_router(ipqc_user_router)
 app.include_router(ipqc_router)
 app.include_router(competitor_router)
+app.include_router(dashboard_router)
+app.include_router(inward_dashboard_router)
+app.include_router(transfer_dashboard_router)
+app.include_router(jobwork_dashboard_router)
 
 
 if __name__ == "__main__":

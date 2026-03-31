@@ -2222,10 +2222,10 @@ def delete_transfer_in(transfer_in_id: int, user_email: str, db: Session) -> dic
 
 
 # ----------------------------------------------
-#  Categorial Inventory Lookup (for Transfer & Request article section)
+#  All SKU Lookup (for Transfer & Request article section)
 # ----------------------------------------------
 
-_CATEGORIAL_TABLE = "public.categorial_inv"
+_CATEGORIAL_TABLE = "public.all_sku"
 
 
 def categorial_global_search(
@@ -2234,7 +2234,7 @@ def categorial_global_search(
     offset: int,
     db: Session,
 ) -> CategorialSearchResponse:
-    """Global search on categorial_inv.particulars   bypasses hierarchy."""
+    """Global search on all_sku.particulars   bypasses hierarchy."""
     search_term = search.strip() if search else None
 
     where_clauses = ["1=1"]
@@ -2247,7 +2247,7 @@ def categorial_global_search(
     where_sql = " AND ".join(where_clauses)
 
     total = db.execute(
-        text(f"SELECT COUNT(*) FROM (SELECT DISTINCT UPPER(particulars), UPPER(\"fg/rm/pm\") FROM {_CATEGORIAL_TABLE} WHERE {where_sql}) t"),
+        text(f"SELECT COUNT(*) FROM (SELECT DISTINCT UPPER(particulars), UPPER(item_type) FROM {_CATEGORIAL_TABLE} WHERE {where_sql}) t"),
         params,
     ).scalar_one()
 
@@ -2256,15 +2256,15 @@ def categorial_global_search(
         text(f"""
             SELECT desc_upper, mt, grp, sc, uom
             FROM (
-                SELECT DISTINCT ON (UPPER(particulars), UPPER("fg/rm/pm"))
+                SELECT DISTINCT ON (UPPER(particulars), UPPER(item_type))
                        UPPER(particulars) AS desc_upper,
-                       UPPER("fg/rm/pm") AS mt,
-                       UPPER("group") AS grp,
+                       UPPER(item_type) AS mt,
+                       UPPER(item_group) AS grp,
                        UPPER(sub_group) AS sc,
                        uom
                 FROM {_CATEGORIAL_TABLE}
                 WHERE {where_sql}
-                ORDER BY UPPER(particulars) ASC, UPPER("fg/rm/pm") ASC
+                ORDER BY UPPER(particulars) ASC, UPPER(item_type) ASC
             ) sub
             ORDER BY
                 CASE LOWER(sub.mt)
@@ -2312,7 +2312,7 @@ def categorial_dropdown(
     offset: int,
     db: Session,
 ) -> CategorialDropdownResponse:
-    """Cascading dropdown on categorial_inv: fg/rm/pm -> group -> sub_group -> particulars."""
+    """Cascading dropdown on all_sku: item_type -> item_group -> sub_group -> particulars."""
     material_type = material_type.strip() if material_type else None
     item_category = item_category.strip() if item_category else None
     sub_category = sub_category.strip() if sub_category else None
@@ -2322,9 +2322,9 @@ def categorial_dropdown(
     material_types = db.execute(
         text(f"""
             SELECT mt FROM (
-                SELECT DISTINCT UPPER("fg/rm/pm") AS mt FROM {_CATEGORIAL_TABLE}
-                WHERE "fg/rm/pm" IS NOT NULL
-                  AND UPPER("fg/rm/pm") IN ('RM', 'PM', 'FG')
+                SELECT DISTINCT UPPER(item_type) AS mt FROM {_CATEGORIAL_TABLE}
+                WHERE item_type IS NOT NULL
+                  AND UPPER(item_type) IN ('RM', 'PM', 'FG')
             ) sub
             ORDER BY
                 CASE LOWER(sub.mt)
@@ -2341,8 +2341,8 @@ def categorial_dropdown(
     if material_type:
         item_categories = db.execute(
             text(f"""
-                SELECT DISTINCT UPPER("group") AS grp FROM {_CATEGORIAL_TABLE}
-                WHERE UPPER("fg/rm/pm") = UPPER(:mt) AND "group" IS NOT NULL
+                SELECT DISTINCT UPPER(item_group) AS grp FROM {_CATEGORIAL_TABLE}
+                WHERE UPPER(item_type) = UPPER(:mt) AND item_group IS NOT NULL
                 ORDER BY grp ASC
             """),
             {"mt": material_type},
@@ -2354,8 +2354,8 @@ def categorial_dropdown(
         sub_categories = db.execute(
             text(f"""
                 SELECT DISTINCT UPPER(sub_group) AS sc FROM {_CATEGORIAL_TABLE}
-                WHERE UPPER("fg/rm/pm") = UPPER(:mt)
-                  AND UPPER("group") = UPPER(:ic)
+                WHERE UPPER(item_type) = UPPER(:mt)
+                  AND UPPER(item_group) = UPPER(:ic)
                   AND sub_group IS NOT NULL
                 ORDER BY sc ASC
             """),
@@ -2369,8 +2369,8 @@ def categorial_dropdown(
 
     if material_type and item_category and sub_category:
         where = [
-            'UPPER("fg/rm/pm") = UPPER(:mt)',
-            'UPPER("group") = UPPER(:ic)',
+            'UPPER(item_type) = UPPER(:mt)',
+            'UPPER(item_group) = UPPER(:ic)',
             "UPPER(sub_group) = UPPER(:sc)",
         ]
         params: dict = {"mt": material_type, "ic": item_category, "sc": sub_category}

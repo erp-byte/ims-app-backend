@@ -316,7 +316,7 @@ def delete_transfer_in_endpoint(
     return delete_transfer_in(transfer_in_id, user_email, db)
 
 
-# ── Categorial Inventory lookup endpoints ──
+# ── All SKU lookup endpoints ──
 
 
 @router.get("/categorial-search", response_model=CategorialSearchResponse)
@@ -326,7 +326,7 @@ def categorial_search_endpoint(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    """Global search on categorial_inv.particulars for transfer/request article lookup."""
+    """Global search on all_sku.particulars for transfer/request article lookup."""
     return categorial_global_search(search, limit, offset, db)
 
 
@@ -340,7 +340,7 @@ def categorial_dropdown_endpoint(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    """Cascading dropdown on categorial_inv for transfer/request article lookup."""
+    """Cascading dropdown on all_sku for transfer/request article lookup."""
     return categorial_dropdown(
         material_type, item_category, sub_category,
         search, limit, offset, db,

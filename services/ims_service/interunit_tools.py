@@ -1167,7 +1167,7 @@ def delete_transfer(transfer_id: int, db: Session) -> dict:
 
 
 def _map_transfer_in_header(row) -> dict:
-    return {
+    result = {
         "id": row.id,
         "transfer_out_id": row.transfer_out_id,
         "transfer_out_no": row.transfer_out_no or "",
@@ -1182,6 +1182,10 @@ def _map_transfer_in_header(row) -> dict:
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
+    # Include from_warehouse if available (from JOIN with transfers header)
+    if hasattr(row, "from_warehouse") and row.from_warehouse:
+        result["from_warehouse"] = row.from_warehouse
+    return result
 
 
 def _map_transfer_in_box(row) -> dict:
@@ -2056,11 +2060,13 @@ def list_transfer_ins(
                 h.grn_date, h.receiving_warehouse, h.received_by, h.received_at,
                 h.box_condition, h.condition_remarks, h.status,
                 h.created_at, h.updated_at,
-                COUNT(b.id) AS total_boxes_scanned
+                COUNT(b.id) AS total_boxes_scanned,
+                t.from_site AS from_warehouse
             FROM interunit_transfer_in_header h
             LEFT JOIN interunit_transfer_in_boxes b ON h.id = b.header_id
+            LEFT JOIN interunit_transfers_header t ON h.transfer_out_id = t.id
             WHERE {where}
-            GROUP BY h.id
+            GROUP BY h.id, t.from_site
             ORDER BY h.{sort_by} {direction}
             LIMIT :limit OFFSET :offset
         """),
@@ -2088,12 +2094,14 @@ def list_transfer_ins(
 def get_transfer_in(transfer_in_id: int, db: Session) -> dict:
     row = db.execute(
         text("""
-            SELECT id, transfer_out_id, transfer_out_no, grn_number,
-                   grn_date, receiving_warehouse, received_by, received_at,
-                   box_condition, condition_remarks, status,
-                   created_at, updated_at
-            FROM interunit_transfer_in_header
-            WHERE id = :tid
+            SELECT h.id, h.transfer_out_id, h.transfer_out_no, h.grn_number,
+                   h.grn_date, h.receiving_warehouse, h.received_by, h.received_at,
+                   h.box_condition, h.condition_remarks, h.status,
+                   h.created_at, h.updated_at,
+                   t.from_site AS from_warehouse
+            FROM interunit_transfer_in_header h
+            LEFT JOIN interunit_transfers_header t ON h.transfer_out_id = t.id
+            WHERE h.id = :tid
         """),
         {"tid": transfer_in_id},
     ).fetchone()

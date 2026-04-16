@@ -50,3 +50,13 @@ def auto_punch_out_and_revoke():
         logger.error(f"Auto punch-out failed: {e}")
     finally:
         db.close()
+
+
+def job_work_weekly_digest():
+    """Run every Monday at 9 AM IST — send weekly jobwork summary digest."""
+    logger.info("Running weekly jobwork digest...")
+    try:
+        from shared.email_notifier import send_job_work_weekly_digest
+        send_job_work_weekly_digest()
+    except Exception as e:
+        logger.error(f"Weekly jobwork digest failed: {e}")

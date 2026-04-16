@@ -13,6 +13,18 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from shared.database import get_db
+from shared.email_notifier import (
+    notify_job_work_material_out_created,
+    notify_job_work_material_out_updated,
+    notify_job_work_material_out_deleted,
+    notify_job_work_material_in_created,
+    notify_job_work_material_in_deleted,
+    notify_job_work_status_changed,
+    notify_job_work_excess_loss,
+)
+from shared.logger import get_logger
+
+_jw_logger = get_logger("jobwork.notify")
 
 router = APIRouter(prefix="/job-work", tags=["Job Work"])
 
@@ -544,6 +556,12 @@ def submit_material_out(
     _deduct_cold_storage_stock(db, header_id, line_items)
 
     db.commit()
+
+    try:
+        notify_job_work_material_out_created(payload, header_id, created_by)
+    except Exception as e:
+        _jw_logger.error(f"Failed to queue material-out notification: {e}")
+
     return {"status": "success", "id": header_id, "challan_no": header.get("challan_no") or payload.get("challan_no", "")}
 
 
@@ -665,6 +683,12 @@ def update_material_out(
     _deduct_cold_storage_stock(db, record_id, line_items)
 
     db.commit()
+
+    try:
+        notify_job_work_material_out_updated(payload, record_id, created_by)
+    except Exception as e:
+        _jw_logger.error(f"Failed to queue material-out update notification: {e}")
+
     return {"status": "success", "id": record_id, "challan_no": header.get("challan_no") or payload.get("challan_no", "")}
 
 
@@ -707,10 +731,11 @@ def list_job_work_records(
         SELECT h.id, h.challan_no, h.job_work_date, h.from_warehouse, h.to_party,
                h.party_address, h.status, h.type, h.vehicle_no, h.driver_name,
                h.authorized_person, h.remarks, h.created_by, h.created_at,
-               (SELECT COUNT(*) FROM jb_materialout_lines l WHERE l.header_id = h.id) as items_count,
-               (SELECT string_agg(l2.item_description, ', ') FROM jb_materialout_lines l2 WHERE l2.header_id = h.id) as item_descriptions,
+               (SELECT COUNT(DISTINCT item_description) FROM jb_materialout_lines l WHERE l.header_id = h.id) as items_count,
+               (SELECT string_agg(DISTINCT l2.item_description, ', ') FROM jb_materialout_lines l2 WHERE l2.header_id = h.id) as item_descriptions,
                (SELECT COALESCE(SUM(l3.quantity_boxes), 0) FROM jb_materialout_lines l3 WHERE l3.header_id = h.id) as total_qty,
-               (SELECT COALESCE(SUM(l4.quantity_kgs), 0) FROM jb_materialout_lines l4 WHERE l4.header_id = h.id) as total_weight
+               (SELECT COALESCE(SUM(l4.quantity_kgs), 0) FROM jb_materialout_lines l4 WHERE l4.header_id = h.id) as total_weight,
+               (SELECT COALESCE(SUM(CAST(l5.net_weight AS NUMERIC)), 0) FROM jb_materialout_lines l5 WHERE l5.header_id = h.id) as total_net_weight
         FROM jb_materialout_header h
         {where_sql}
         ORDER BY h.created_at DESC
@@ -738,6 +763,7 @@ def list_job_work_records(
             "item_descriptions": r[15] or "",
             "total_qty": int(r[16] or 0),
             "total_weight": float(r[17] or 0),
+            "total_net_weight": float(r[18] or 0),
         })
 
     return {"records": records, "total": total, "total_pages": total_pages, "page": page}
@@ -782,15 +808,64 @@ def search_material_out(
 
     header_id = row[0]
     lines = db.execute(text("""
-        SELECT sl_no, item_description, quantity_kgs, quantity_boxes, net_weight
+        SELECT sl_no, item_description, quantity_kgs, quantity_boxes, net_weight,
+               box_id, item_mark, lot_number
         FROM jb_materialout_lines
         WHERE header_id = :header_id
         ORDER BY sl_no
     """), {"header_id": header_id}).fetchall()
 
+    # ── Consolidate cold storage lines (box_id populated) ──
+    # Cold storage dispatch creates one row per box. For Material In,
+    # consolidate them by item_description + item_mark + lot_number
+    # so the user sees a single line with total kgs/boxes.
+    consolidated_lines = []
+    cold_groups = {}  # key -> { description, total_kgs, total_boxes, item_mark, lot_number }
+    for l in lines:
+        sl_no, item_desc, qty_kgs, qty_boxes, net_wt, box_id, item_mark, lot_number = (
+            l[0], l[1] or "", float(l[2] or 0), int(l[3] or 0), l[4], l[5] or "", l[6] or "", l[7] or ""
+        )
+        if box_id:
+            # Cold storage line — group by description + mark + lot
+            key = f"{item_desc}||{item_mark}||{lot_number}"
+            if key not in cold_groups:
+                cold_groups[key] = {
+                    "item_description": item_desc,
+                    "total_kgs": 0.0,
+                    "total_net_weight": 0.0,
+                    "total_boxes": 0,
+                    "item_mark": item_mark,
+                    "lot_number": lot_number,
+                }
+            cold_groups[key]["total_kgs"] += qty_kgs
+            cold_groups[key]["total_net_weight"] += float(net_wt or 0)
+            cold_groups[key]["total_boxes"] += max(qty_boxes, 1)
+        else:
+            # Non-cold line — keep as-is
+            consolidated_lines.append({
+                "sl_no": sl_no,
+                "item_description": item_desc,
+                "quantity_kgs": qty_kgs,
+                "quantity_boxes": qty_boxes,
+                "net_weight": str(net_wt or "0"),
+            })
+
+    # Append consolidated cold groups with sequential sl_no
+    next_sl = max((c["sl_no"] for c in consolidated_lines), default=0) + 1
+    for key, grp in cold_groups.items():
+        consolidated_lines.append({
+            "sl_no": next_sl,
+            "item_description": grp["item_description"],
+            "quantity_kgs": round(grp["total_kgs"], 3),
+            "quantity_boxes": grp["total_boxes"],
+            "net_weight": str(round(grp["total_net_weight"], 3)),
+        })
+        next_sl += 1
+
     # Get cumulative received from inward_receipt + inward_lines tables
+    # Match by item_description (more reliable than sl_no for consolidated lines)
     prev_lines = db.execute(text("""
-        SELECT il.sl_no,
+        SELECT il.item_description,
                COALESCE(SUM(il.finished_goods_kgs), 0),
                COALESCE(SUM(il.finished_goods_boxes), 0),
                COALESCE(SUM(il.waste_kgs), 0),
@@ -798,12 +873,12 @@ def search_material_out(
         FROM jb_work_inward_lines il
         JOIN jb_work_inward_receipt ir ON ir.id = il.inward_receipt_id
         WHERE ir.header_id = :header_id
-        GROUP BY il.sl_no
+        GROUP BY il.item_description
     """), {"header_id": header_id}).fetchall()
 
     cumulative = {}
     for pl in prev_lines:
-        cumulative[pl[0]] = {
+        cumulative[pl[0] or ""] = {
             "fg_kgs": float(pl[1]), "fg_boxes": int(pl[2]),
             "waste_kgs": float(pl[3]), "rejection_kgs": float(pl[4]),
         }
@@ -857,15 +932,15 @@ def search_material_out(
                 "waste_with_partial": bool(lc_row[3]), "single_shot": bool(lc_row[4]),
             }
     line_items = []
-    for l in lines:
-        sl_no = l[0]
-        prev = cumulative.get(sl_no, {"fg_kgs": 0, "fg_boxes": 0, "waste_kgs": 0, "rejection_kgs": 0})
+    for l in consolidated_lines:
+        desc = l["item_description"]
+        prev = cumulative.get(desc, {"fg_kgs": 0, "fg_boxes": 0, "waste_kgs": 0, "rejection_kgs": 0})
         line_items.append({
-            "sl_no": sl_no,
-            "item_description": l[1] or "",
-            "quantity_kgs": float(l[2] or 0),
-            "quantity_boxes": int(l[3] or 0),
-            "net_weight": str(l[4] or "0"),
+            "sl_no": l["sl_no"],
+            "item_description": desc,
+            "quantity_kgs": l["quantity_kgs"],
+            "quantity_boxes": l["quantity_boxes"],
+            "net_weight": l["net_weight"],
             "prev_fg_kgs": round(prev["fg_kgs"], 3),
             "prev_fg_boxes": prev["fg_boxes"],
             "prev_waste_kgs": round(prev["waste_kgs"], 3),
@@ -1240,8 +1315,22 @@ def submit_material_in(
                 "spl_remarks": box.get("spl_remarks", ""),
             })
 
-    # Update JWO status based on receipt_type and cumulative totals
+    # Detect status change and notify
+    old_status = None
+    challan_no_for_notify = ""
+    vendor_for_notify = ""
+    item_for_notify = ""
+    new_status = None
     if header_id:
+        hdr_row = db.execute(text(
+            "SELECT status, challan_no, to_party, sub_category FROM jb_materialout_header WHERE id = :id"
+        ), {"id": header_id}).fetchone()
+        if hdr_row:
+            old_status = hdr_row[0]
+            challan_no_for_notify = hdr_row[1] or ""
+            vendor_for_notify = hdr_row[2] or ""
+            item_for_notify = hdr_row[3] or ""
+
         if receipt_type == "final":
             new_status = "fully_received"
         else:
@@ -1252,6 +1341,42 @@ def submit_material_in(
         """), {"id": header_id, "status": new_status})
 
     db.commit()
+
+    # Send Material In Created notification
+    try:
+        notify_job_work_material_in_created(payload, ir_number, inward_receipt_id, created_by)
+    except Exception as e:
+        _jw_logger.error(f"Failed to queue material-in notification: {e}")
+
+    # Send Status Changed notification (if status actually changed)
+    if header_id and old_status and new_status and old_status != new_status:
+        try:
+            notify_job_work_status_changed(
+                challan_no_for_notify, header_id, vendor_for_notify,
+                old_status, new_status, created_by,
+            )
+        except Exception as e:
+            _jw_logger.error(f"Failed to queue status-change notification: {e}")
+
+    # Detect excess loss from submitted items
+    for it in items:
+        loss_pct = 0
+        sent = float(it.get("sent_kgs", 0) or 0)
+        fg = float(it.get("finished_goods_kgs", 0) or 0)
+        waste = float(it.get("waste_kgs", 0) or 0)
+        rejection = float(it.get("rejection_kgs", 0) or 0)
+        if sent > 0:
+            accounted = fg + waste + rejection
+            loss_pct = ((sent - accounted) / sent) * 100
+        if loss_pct > 10:
+            try:
+                notify_job_work_excess_loss(
+                    challan_no_for_notify, header_id or 0, vendor_for_notify,
+                    it.get("description", ""), loss_pct, ir_number, created_by,
+                )
+            except Exception as e:
+                _jw_logger.error(f"Failed to queue excess-loss notification: {e}")
+
     return {
         "status": "success",
         "ir_number": ir_number,
@@ -1447,6 +1572,12 @@ def delete_material_in(
         ), {"id": header_id, "status": new_status})
 
     db.commit()
+
+    try:
+        notify_job_work_material_in_deleted(row[1], ir_id, str(header_id or ""), user_email)
+    except Exception as e:
+        _jw_logger.error(f"Failed to queue material-in delete notification: {e}")
+
     return {"status": "success", "message": f"Inward receipt {row[1]} deleted."}
 
 
@@ -1498,6 +1629,11 @@ def delete_job_work_record(
     db.execute(text("DELETE FROM jb_materialout_lines WHERE header_id = :id"), {"id": record_id})
     db.execute(text("DELETE FROM jb_materialout_header WHERE id = :id"), {"id": record_id})
     db.commit()
+
+    try:
+        notify_job_work_material_out_deleted(row[1], record_id, user_email)
+    except Exception as e:
+        _jw_logger.error(f"Failed to queue material-out delete notification: {e}")
 
     return {"status": "success", "message": f"Record {row[1]} deleted successfully"}
 

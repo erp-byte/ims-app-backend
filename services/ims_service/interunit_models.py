@@ -424,6 +424,7 @@ class TransferInHeaderResponse(BaseModel):
     grn_number: str
     grn_date: Optional[datetime] = None
     receiving_warehouse: str
+    from_warehouse: Optional[str] = None
     received_by: str
     received_at: Optional[datetime] = None
     box_condition: Optional[str] = None

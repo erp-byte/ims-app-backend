@@ -294,9 +294,12 @@ _EDITABLE = {
 }
 
 
-def update_ipqc(ipqc_no: str, data: dict, username: str, password: str, db: Session) -> dict:
-    _require_admin(username, password, db)
+def update_ipqc(ipqc_no: str, data: dict, user: dict, db: Session) -> dict:
     updates = {k: v for k, v in data.items() if v is not None and k in _EDITABLE}
+
+    # Only admins can change the date
+    if "check_date" in updates and not user["is_admin"]:
+        del updates["check_date"]
 
     # If articles provided, sync flat fields from first article
     if "articles" in updates and isinstance(updates["articles"], list) and updates["articles"]:
@@ -357,8 +360,9 @@ def update_ipqc(ipqc_no: str, data: dict, username: str, password: str, db: Sess
 # ── Delete ───────────────────────────────────
 
 
-def delete_ipqc(ipqc_no: str, username: str, password: str, db: Session) -> dict:
-    _require_admin(username, password, db)
+def delete_ipqc(ipqc_no: str, user: dict, db: Session) -> dict:
+    if not user["is_admin"]:
+        raise HTTPException(403, "Admin access required")
     row = db.execute(
         text("DELETE FROM ipqc_records WHERE ipqc_no = :ipqc_no RETURNING ipqc_no"),
         {"ipqc_no": ipqc_no},
@@ -375,8 +379,7 @@ def delete_ipqc(ipqc_no: str, username: str, password: str, db: Session) -> dict
 # ── Approve ──────────────────────────────────
 
 
-def approve_ipqc(ipqc_no: str, username: str, password: str, db: Session) -> dict:
-    user = _verify_ipqc_user(username, password, db)
+def approve_ipqc(ipqc_no: str, user: dict, db: Session) -> dict:
 
     row = db.execute(
         text(

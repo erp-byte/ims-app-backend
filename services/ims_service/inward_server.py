@@ -34,6 +34,7 @@ from services.ims_service.inward_models import (
 )
 from services.ims_service.inward_tools import (
     list_inward_records,
+    list_distinct_warehouses,
     export_inward_records,
     create_inward,
     create_inward_bulk_sticker,
@@ -127,6 +128,7 @@ def list_inward_records_query(
     limit: int = Query(1000, ge=1, le=1000),
     status: Optional[str] = Query(None, description="Filter by status (pending, approved)"),
     grn_status: Optional[str] = Query(None, description="Filter by GRN status (completed, pending)"),
+    warehouse: Optional[str] = Query(None, description="Filter by warehouse name (exact match, case-insensitive)"),
     search: Optional[str] = Query(None, description="Search across all transaction fields"),
     from_date: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)"),
@@ -134,7 +136,7 @@ def list_inward_records_query(
     sort_order: Optional[str] = Query("desc", description="Sort order (asc, desc)"),
     db: Session = Depends(get_db),
 ):
-    """List inward records with company as query parameter (backward compat)."""
+    """List inward + bulk entry records with company as query parameter (backward compat)."""
     if skip > 0 or limit != 1000:
         page = (skip // limit) + 1 if limit > 0 else 1
         per_page = min(limit, 100)
@@ -151,7 +153,17 @@ def list_inward_records_query(
         db=db,
         status=status,
         grn_status=grn_status,
+        warehouse=warehouse,
     )
+
+
+@router.get("/warehouses")
+def list_warehouses_endpoint(
+    company: Company = Query(..., description="Company code"),
+    db: Session = Depends(get_db),
+):
+    """Distinct warehouse values across inward and bulk entry transactions (dropdown source)."""
+    return {"warehouses": list_distinct_warehouses(company, db)}
 
 
 @router.get("/vendors")
@@ -212,6 +224,7 @@ def export_inward_endpoint(
     company: Company = Query(..., description="Company code"),
     status: Optional[str] = Query(None),
     grn_status: Optional[str] = Query(None),
+    warehouse: Optional[str] = Query(None, description="Filter by warehouse name (exact match, case-insensitive)"),
     search: Optional[str] = Query(None),
     from_date: Optional[str] = Query(None),
     to_date: Optional[str] = Query(None),
@@ -219,7 +232,7 @@ def export_inward_endpoint(
     sort_order: Optional[str] = Query("desc"),
     db: Session = Depends(get_db),
 ):
-    """Export all filtered inward records as an Excel (.xlsx) file."""
+    """Export all filtered inward + bulk entry records as an Excel (.xlsx) file."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from sqlalchemy import text as sa_text
@@ -234,6 +247,7 @@ def export_inward_endpoint(
         db=db,
         status=status,
         grn_status=grn_status,
+        warehouse=warehouse,
     )
 
     # Build edit-log lookup: { (box_id, field_name) } for highlighting
@@ -264,7 +278,8 @@ def export_inward_endpoint(
 
     # Headers from all 3 tables
     headers = [
-        # Transaction
+        # Origin + Transaction
+        "Source", "Warehouse",
         "Transaction No", "Entry Date", "Status", "Vehicle Number", "Transporter",
         "LR Number", "Vendor / Supplier", "Customer / Party", "Source Location",
         "Destination", "Challan Number", "Invoice Number", "PO Number",
@@ -339,6 +354,7 @@ def list_inward_records_path(
     per_page: int = Query(20, ge=1, le=1000),
     status: Optional[str] = Query(None, description="Filter by status (pending, approved)"),
     grn_status: Optional[str] = Query(None, description="Filter by GRN status (completed, pending)"),
+    warehouse: Optional[str] = Query(None, description="Filter by warehouse name (exact match, case-insensitive)"),
     search: Optional[str] = Query(None, description="Search across all transaction fields"),
     from_date: Optional[str] = Query(None, description="Filter from date (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, description="Filter to date (YYYY-MM-DD)"),
@@ -346,7 +362,7 @@ def list_inward_records_path(
     sort_order: Optional[str] = Query("desc", description="Sort order (asc, desc)"),
     db: Session = Depends(get_db),
 ):
-    """List inward records with comprehensive search and date filtering."""
+    """List inward + bulk entry records with comprehensive search and date filtering."""
     return list_inward_records(
         company=company,
         page=page,
@@ -359,6 +375,7 @@ def list_inward_records_path(
         db=db,
         status=status,
         grn_status=grn_status,
+        warehouse=warehouse,
     )
 
 

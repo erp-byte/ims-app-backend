@@ -4,6 +4,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
+from services.qc_service.ipqc.jwt_utils import create_ipqc_token
 
 logger = get_logger("qc.ipqc.users")
 
@@ -81,6 +82,14 @@ def login_user(data, db: Session) -> dict:
     if not _verify_password(data.password, row.password_hash):
         raise HTTPException(401, "Invalid username or password")
 
+    user = {
+        "id": row.id,
+        "username": row.username,
+        "display_name": row.display_name,
+        "is_admin": row.is_admin,
+    }
+    token = create_ipqc_token(user)
+
     logger.info("IPQC user logged in: %s", data.username)
     return {
         "success": True,
@@ -88,6 +97,7 @@ def login_user(data, db: Session) -> dict:
         "username": row.username,
         "display_name": row.display_name,
         "is_admin": row.is_admin,
+        "token": token,
     }
 
 

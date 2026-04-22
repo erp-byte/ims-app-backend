@@ -42,6 +42,7 @@ class UserLoginResponse(BaseModel):
     username: str
     display_name: str
     is_admin: bool
+    token: str
 
 
 class UserMessageResponse(BaseModel):

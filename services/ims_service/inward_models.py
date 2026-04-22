@@ -181,6 +181,8 @@ class InwardListItem(BaseModel):
     vendor_supplier_name: Optional[str] = None
     customer_party_name: Optional[str] = None
     total_amount: Optional[float] = None
+    warehouse: Optional[str] = None
+    source: str = "inward"
     item_descriptions: List[str]
     quantities_and_uoms: List[str]
     has_edits: bool = False
@@ -249,6 +251,8 @@ class SKULookupResponse(BaseModel):
     material_type: Optional[str] = None
     item_category: Optional[str] = None
     sub_category: Optional[str] = None
+    sale_group: Optional[str] = None
+    uom: Optional[str] = None
 
 
 # ---------- Approval models ----------
@@ -424,6 +428,9 @@ class SKUDropdownOptions(BaseModel):
     sub_categories: List[str] = []
     item_descriptions: List[str] = []
     item_ids: List[int] = []
+    # Parallel arrays aligned by index with item_descriptions / item_ids.
+    item_sale_groups: List[Optional[str]] = []
+    item_uoms: List[Optional[str]] = []
 
 
 class SKUDropdownMeta(BaseModel):
@@ -451,6 +458,8 @@ class SKUGlobalSearchItem(BaseModel):
     material_type: Optional[str] = None
     group: Optional[str] = None
     sub_group: Optional[str] = None
+    sale_group: Optional[str] = None
+    uom: Optional[str] = None
 
 
 class SKUGlobalSearchResponse(BaseModel):
@@ -468,4 +477,6 @@ class SKUIdResponse(BaseModel):
     sub_group: Optional[str] = None
     item_category: Optional[str] = None
     sub_category: Optional[str] = None
+    sale_group: Optional[str] = None
+    uom: Optional[str] = None
     company: str

@@ -489,7 +489,10 @@ def pick_boxes(
 
     rows = db.execute(
         text(f"""
-            SELECT id, box_id, transaction_no, weight_kg
+            SELECT id, box_id, transaction_no, weight_kg, item_mark,
+                   inward_dt, unit, inward_no, item_description,
+                   vakkal, lot_no, no_of_cartons, total_inventory_kgs,
+                   group_name, storage_location, exporter, last_purchase_rate, value
             FROM {table}
             WHERE item_description = :item_description
               AND CAST(lot_no AS TEXT) = :lot_no
@@ -512,6 +515,20 @@ def pick_boxes(
                 "box_id": r.box_id,
                 "transaction_no": r.transaction_no,
                 "weight_kg": float(r.weight_kg) if r.weight_kg else 0,
+                "item_mark": r.item_mark or "",
+                "inward_dt": str(r.inward_dt) if r.inward_dt else "",
+                "unit": r.unit or "",
+                "inward_no": r.inward_no or "",
+                "item_description": r.item_description or "",
+                "vakkal": r.vakkal or "",
+                "lot_no": str(r.lot_no) if r.lot_no else "",
+                "no_of_cartons": int(r.no_of_cartons) if r.no_of_cartons else 0,
+                "total_inventory_kgs": float(r.total_inventory_kgs) if r.total_inventory_kgs else 0,
+                "group_name": r.group_name or "",
+                "storage_location": r.storage_location or "",
+                "exporter": r.exporter or "",
+                "last_purchase_rate": float(r.last_purchase_rate) if r.last_purchase_rate else 0,
+                "value": float(r.value) if r.value else 0,
             }
             for r in rows
         ]

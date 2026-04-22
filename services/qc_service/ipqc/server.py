@@ -4,11 +4,10 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from shared.database import get_db
+from services.qc_service.ipqc.jwt_utils import get_current_ipqc_user
 from services.qc_service.ipqc.models import (
     IPQCCreateRequest,
     IPQCUpdateRequest,
-    IPQCApprovalRequest,
-    IPQCAdminActionRequest,
     IPQCResponse,
     IPQCListResponse,
     IPQCDeleteResponse,
@@ -108,12 +107,11 @@ def get_endpoint(ipqc_no: str, db: Session = Depends(get_db)):
 def update_endpoint(
     ipqc_no: str,
     data: IPQCUpdateRequest,
-    username: str = Query(..., description="Admin email"),
-    password: str = Query(..., description="Admin password"),
+    user: dict = Depends(get_current_ipqc_user),
     db: Session = Depends(get_db),
 ):
-    """Update an IPQC record. Admin only."""
-    return update_ipqc(ipqc_no, data.model_dump(exclude_none=True), username, password, db)
+    """Update an IPQC record. Any authenticated user; only admins can change the date."""
+    return update_ipqc(ipqc_no, data.model_dump(exclude_none=True), user, db)
 
 
 # ── Delete ────────────────────────────────────
@@ -122,12 +120,11 @@ def update_endpoint(
 @router.delete("/{ipqc_no}", response_model=IPQCDeleteResponse)
 def delete_endpoint(
     ipqc_no: str,
-    username: str = Query(..., description="Admin email"),
-    password: str = Query(..., description="Admin password"),
+    user: dict = Depends(get_current_ipqc_user),
     db: Session = Depends(get_db),
 ):
     """Delete an IPQC record. Admin only."""
-    return delete_ipqc(ipqc_no, username, password, db)
+    return delete_ipqc(ipqc_no, user, db)
 
 
 # ── Approve ───────────────────────────────────
@@ -136,7 +133,7 @@ def delete_endpoint(
 @router.post("/{ipqc_no}/approve", response_model=IPQCResponse)
 def approve_endpoint(
     ipqc_no: str,
-    data: IPQCApprovalRequest,
+    user: dict = Depends(get_current_ipqc_user),
     db: Session = Depends(get_db),
 ):
-    return approve_ipqc(ipqc_no, data.username, data.password, db)
+    return approve_ipqc(ipqc_no, user, db)

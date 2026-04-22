@@ -498,9 +498,134 @@ def validate_and_normalize_dates(
 
 
 
+# Inward v2 and bulk entry tables have similar schemas but some columns differ
+# in type between them (notably date-ish columns stored as VARCHAR on the bulk
+# entry side vs DATE on inward). The UNION projections below cast such columns
+# to a common type so PostgreSQL accepts the union.
+_TX_UNION_PROJ = (
+    "transaction_no::text AS transaction_no, "
+    "NULLIF(entry_date::text, '')::date AS entry_date, "
+    "vehicle_number::text AS vehicle_number, "
+    "transporter_name::text AS transporter_name, "
+    "lr_number::text AS lr_number, "
+    "vendor_supplier_name::text AS vendor_supplier_name, "
+    "customer_party_name::text AS customer_party_name, "
+    "source_location::text AS source_location, "
+    "destination_location::text AS destination_location, "
+    "challan_number::text AS challan_number, "
+    "invoice_number::text AS invoice_number, "
+    "po_number::text AS po_number, "
+    "grn_number::text AS grn_number, "
+    "grn_quantity::numeric AS grn_quantity, "
+    "NULLIF(system_grn_date::text, '')::date AS system_grn_date, "
+    "purchased_by::text AS purchased_by, "
+    "service_invoice_number::text AS service_invoice_number, "
+    "dn_number::text AS dn_number, "
+    "approval_authority::text AS approval_authority, "
+    "total_amount::numeric AS total_amount, "
+    "tax_amount::numeric AS tax_amount, "
+    "discount_amount::numeric AS discount_amount, "
+    "po_quantity::numeric AS po_quantity, "
+    "remark::text AS remark, "
+    "currency::text AS currency, "
+    "warehouse::text AS warehouse, "
+    "status::text AS status"
+)
+
+_ART_UNION_PROJ = (
+    "transaction_no::text AS transaction_no, "
+    "sku_id::bigint AS sku_id, "
+    "item_description::text AS item_description, "
+    "item_category::text AS item_category, "
+    "sub_category::text AS sub_category, "
+    "material_type::text AS material_type, "
+    "quality_grade::text AS quality_grade, "
+    "uom::text AS uom, "
+    "po_quantity::numeric AS po_quantity, "
+    "units::text AS units, "
+    "quantity_units::numeric AS quantity_units, "
+    "net_weight::numeric AS net_weight, "
+    "total_weight::numeric AS total_weight, "
+    "po_weight::numeric AS po_weight, "
+    "lot_number::text AS lot_number, "
+    "NULLIF(manufacturing_date::text, '')::date AS manufacturing_date, "
+    "NULLIF(expiry_date::text, '')::date AS expiry_date, "
+    "unit_rate::numeric AS unit_rate, "
+    "total_amount::numeric AS total_amount, "
+    "carton_weight::numeric AS carton_weight"
+)
+
+_BOX_UNION_PROJ = (
+    "transaction_no::text AS transaction_no, "
+    "article_description::text AS article_description, "
+    "box_number::integer AS box_number, "
+    "box_id::text AS box_id, "
+    "net_weight::numeric AS net_weight, "
+    "gross_weight::numeric AS gross_weight, "
+    "lot_number::text AS lot_number, "
+    "count::integer AS count"
+)
+
+
+def union_source_ctes(company: Company) -> str:
+    """Return CTE SQL that unifies inward v2 and bulk entry tables under common aliases.
+
+    Produces `all_tx`, `all_art`, `all_box` with identical column shapes and a
+    `_source` discriminator (`'inward'` or `'bulk_entry'`). Downstream queries must
+    join on `(transaction_no, _source)` to avoid cross-mixing records.
+
+    Columns are explicitly cast so the UNION works even when the two families
+    store dates as VARCHAR vs DATE (or numerics with differing precisions).
+    """
+    prefix = "cfpl" if company == "CFPL" else "cdpl"
+    return f"""
+        all_tx AS (
+            SELECT {_TX_UNION_PROJ}, 'inward'::text AS _source
+            FROM {prefix}_transactions_v2
+            UNION ALL
+            SELECT {_TX_UNION_PROJ}, 'bulk_entry'::text AS _source
+            FROM {prefix}_bulk_entry_transactions
+        ),
+        all_art AS (
+            SELECT {_ART_UNION_PROJ}, 'inward'::text AS _source
+            FROM {prefix}_articles_v2
+            UNION ALL
+            SELECT {_ART_UNION_PROJ}, 'bulk_entry'::text AS _source
+            FROM {prefix}_bulk_entry_articles
+        ),
+        all_box AS (
+            SELECT {_BOX_UNION_PROJ}, 'inward'::text AS _source
+            FROM {prefix}_boxes_v2
+            UNION ALL
+            SELECT {_BOX_UNION_PROJ}, 'bulk_entry'::text AS _source
+            FROM {prefix}_bulk_entry_boxes
+        )
+    """
+
+
+def list_distinct_warehouses(company: Company, db: Session) -> list[str]:
+    """Return distinct non-empty warehouse values across inward + bulk entry transactions."""
+    prefix = "cfpl" if company == "CFPL" else "cdpl"
+    rows = db.execute(
+        text(f"""
+            SELECT DISTINCT TRIM(warehouse) AS warehouse
+            FROM (
+                SELECT warehouse FROM {prefix}_transactions_v2
+                UNION ALL
+                SELECT warehouse FROM {prefix}_bulk_entry_transactions
+            ) w
+            WHERE warehouse IS NOT NULL AND TRIM(warehouse) <> ''
+            ORDER BY warehouse
+        """)
+    ).fetchall()
+    return [r.warehouse for r in rows]
+
+
 def build_search_conditions(
 
-    tables: dict, search: Optional[str], from_date: Optional[str], to_date: Optional[str]
+    tables: dict, search: Optional[str], from_date: Optional[str], to_date: Optional[str],
+
+    warehouse: Optional[str] = None,
 
 ) -> tuple[str, dict]:
 
@@ -509,6 +634,12 @@ def build_search_conditions(
     where_clauses = ["1=1"]
 
     params: dict = {}
+
+    if warehouse and warehouse.strip():
+
+        where_clauses.append("TRIM(LOWER(COALESCE(t.warehouse, ''))) = TRIM(LOWER(:warehouse))")
+
+        params["warehouse"] = warehouse.strip()
 
 
 
@@ -676,6 +807,8 @@ def list_inward_records(
 
     grn_status: Optional[str] = None,
 
+    warehouse: Optional[str] = None,
+
 ) -> InwardListResponse:
 
     tables = table_names(company)
@@ -684,7 +817,11 @@ def list_inward_records(
 
     normalized_from, normalized_to = validate_and_normalize_dates(from_date, to_date)
 
-    where_sql, params = build_search_conditions(tables, search, normalized_from, normalized_to)
+    where_sql, params = build_search_conditions(
+
+        tables, search, normalized_from, normalized_to, warehouse=warehouse
+
+    )
 
 
 
@@ -740,19 +877,33 @@ def list_inward_records(
 
 
 
+    union_ctes = union_source_ctes(company)
+
+
+
     total = db.execute(
 
         text(f"""
 
-            SELECT COUNT(DISTINCT t.transaction_no)
+            WITH {union_ctes}
 
-            FROM {tables['tx']} t
+            SELECT COUNT(*) FROM (
 
-            LEFT JOIN {tables['art']} a ON t.transaction_no = a.transaction_no
+                SELECT DISTINCT t.transaction_no, t._source
 
-            LEFT JOIN {tables['box']} b ON t.transaction_no = b.transaction_no
+                FROM all_tx t
 
-            WHERE {where_sql}
+                LEFT JOIN all_art a
+
+                    ON t.transaction_no = a.transaction_no AND t._source = a._source
+
+                LEFT JOIN all_box b
+
+                    ON t.transaction_no = b.transaction_no AND t._source = b._source
+
+                WHERE {where_sql}
+
+            ) x
 
         """),
 
@@ -772,15 +923,21 @@ def list_inward_records(
 
         text(f"""
 
-            WITH filtered_transactions AS (
+            WITH {union_ctes},
 
-                SELECT DISTINCT t.transaction_no
+            filtered_transactions AS (
 
-                FROM {tables['tx']} t
+                SELECT DISTINCT t.transaction_no, t._source
 
-                LEFT JOIN {tables['art']} a ON t.transaction_no = a.transaction_no
+                FROM all_tx t
 
-                LEFT JOIN {tables['box']} b ON t.transaction_no = b.transaction_no
+                LEFT JOIN all_art a
+
+                    ON t.transaction_no = a.transaction_no AND t._source = a._source
+
+                LEFT JOIN all_box b
+
+                    ON t.transaction_no = b.transaction_no AND t._source = b._source
 
                 WHERE {where_sql}
 
@@ -791,6 +948,8 @@ def list_inward_records(
                 SELECT
 
                     t.transaction_no,
+
+                    t._source,
 
                     t.entry_date,
 
@@ -807,6 +966,8 @@ def list_inward_records(
                     t.customer_party_name,
 
                     t.total_amount,
+
+                    t.warehouse,
 
                     STRING_AGG(DISTINCT a.item_description, ', ' ORDER BY a.item_description) AS article_descriptions,
 
@@ -846,21 +1007,29 @@ def list_inward_records(
 
                     STRING_AGG(DISTINCT b.article_description, ', ' ORDER BY b.article_description) AS box_descriptions
 
-                FROM {tables['tx']} t
+                FROM all_tx t
 
-                INNER JOIN filtered_transactions ft ON t.transaction_no = ft.transaction_no
+                INNER JOIN filtered_transactions ft
 
-                LEFT JOIN {tables['art']} a ON t.transaction_no = a.transaction_no
+                    ON t.transaction_no = ft.transaction_no AND t._source = ft._source
 
-                LEFT JOIN {tables['box']} b ON t.transaction_no = b.transaction_no
+                LEFT JOIN all_art a
 
-                GROUP BY t.transaction_no, t.entry_date, t.system_grn_date, t.status, t.invoice_number, t.po_number, t.vendor_supplier_name, t.customer_party_name, t.total_amount
+                    ON t.transaction_no = a.transaction_no AND t._source = a._source
+
+                LEFT JOIN all_box b
+
+                    ON t.transaction_no = b.transaction_no AND t._source = b._source
+
+                GROUP BY t.transaction_no, t._source, t.entry_date, t.system_grn_date, t.status, t.invoice_number, t.po_number, t.vendor_supplier_name, t.customer_party_name, t.total_amount, t.warehouse
 
             )
 
             SELECT
 
                 td.transaction_no,
+
+                td._source AS source,
 
                 COALESCE(td.entry_date, td.system_grn_date) AS entry_date,
 
@@ -876,6 +1045,8 @@ def list_inward_records(
 
                 td.total_amount,
 
+                td.warehouse,
+
                 COALESCE(td.article_descriptions, td.box_descriptions) AS item_descriptions_text,
 
                 CASE
@@ -888,11 +1059,17 @@ def list_inward_records(
 
                 END AS quantities_and_uoms_text,
 
-                EXISTS (
+                CASE
 
-                    SELECT 1 FROM box_edit_logs el WHERE el.transaction_no = td.transaction_no
+                    WHEN td._source = 'inward' THEN EXISTS (
 
-                ) AS has_edits
+                        SELECT 1 FROM box_edit_logs el WHERE el.transaction_no = td.transaction_no
+
+                    )
+
+                    ELSE FALSE
+
+                END AS has_edits
 
             FROM transaction_data td
 
@@ -948,6 +1125,10 @@ def list_inward_records(
 
                 total_amount=float(record.total_amount) if record.total_amount is not None else None,
 
+                warehouse=record.warehouse,
+
+                source=record.source or "inward",
+
                 item_descriptions=item_descriptions,
 
                 quantities_and_uoms=quantities_and_uoms,
@@ -986,6 +1167,8 @@ def export_inward_records(
 
     grn_status: Optional[str] = None,
 
+    warehouse: Optional[str] = None,
+
 ) -> list[dict]:
 
     """Return all filtered inward records (all 3 tables) without pagination for Excel export."""
@@ -996,7 +1179,11 @@ def export_inward_records(
 
     normalized_from, normalized_to = validate_and_normalize_dates(from_date, to_date)
 
-    where_sql, params = build_search_conditions(tables, search, normalized_from, normalized_to)
+    where_sql, params = build_search_conditions(
+
+        tables, search, normalized_from, normalized_to, warehouse=warehouse
+
+    )
 
 
 
@@ -1054,25 +1241,39 @@ def export_inward_records(
 
 
 
+    union_ctes = union_source_ctes(company)
+
+
+
     records = db.execute(
 
         text(f"""
 
-            WITH filtered_transactions AS (
+            WITH {union_ctes},
 
-                SELECT DISTINCT t.transaction_no
+            filtered_transactions AS (
 
-                FROM {tables['tx']} t
+                SELECT DISTINCT t.transaction_no, t._source
 
-                LEFT JOIN {tables['art']} a ON t.transaction_no = a.transaction_no
+                FROM all_tx t
 
-                LEFT JOIN {tables['box']} b ON t.transaction_no = b.transaction_no
+                LEFT JOIN all_art a
+
+                    ON t.transaction_no = a.transaction_no AND t._source = a._source
+
+                LEFT JOIN all_box b
+
+                    ON t.transaction_no = b.transaction_no AND t._source = b._source
 
                 WHERE {where_sql}
 
             )
 
             SELECT
+
+                -- Source discriminator
+
+                t._source AS source,
 
                 -- Transaction fields
 
@@ -1127,6 +1328,8 @@ def export_inward_records(
                 t.remark,
 
                 t.currency,
+
+                t.warehouse,
 
                 -- Article fields
 
@@ -1184,13 +1387,19 @@ def export_inward_records(
 
                 b.count AS box_count
 
-            FROM {tables['tx']} t
+            FROM all_tx t
 
-            INNER JOIN filtered_transactions ft ON t.transaction_no = ft.transaction_no
+            INNER JOIN filtered_transactions ft
 
-            LEFT JOIN {tables['art']} a ON t.transaction_no = a.transaction_no
+                ON t.transaction_no = ft.transaction_no AND t._source = ft._source
 
-            LEFT JOIN {tables['box']} b ON t.transaction_no = b.transaction_no
+            LEFT JOIN all_art a
+
+                ON t.transaction_no = a.transaction_no AND t._source = a._source
+
+            LEFT JOIN all_box b
+
+                ON t.transaction_no = b.transaction_no AND t._source = b._source
 
             ORDER BY {order_clause}, a.item_description, b.box_number
 
@@ -1209,6 +1418,10 @@ def export_inward_records(
         rows.append({
 
             # Transaction
+
+            "Source": "Bulk Entry" if getattr(r, "source", "inward") == "bulk_entry" else "Inward",
+
+            "Warehouse": r.warehouse or "",
 
             "Transaction No": r.transaction_no or "",
 
@@ -3464,21 +3677,23 @@ def _extract_po_from_pdf_inner(file_bytes: bytes) -> dict:
 
 def lookup_sku(item_description: str, company: Company, db: Session) -> dict | None:
 
-    """Lookup SKU by item_description and return sku_id, material_type, item_category, sub_category."""
+    """Lookup SKU by item_description from `all_sku` (company-agnostic).
 
-    tables = table_names(company)
+    Returns sku_id, material_type, item_category, sub_category, sale_group, uom.
 
-
+    """
 
     row = db.execute(
 
-        text(f"""
+        text("""
 
-            SELECT id, item_description, material_type, item_category, sub_category
+            SELECT sku_id, particulars, item_type, item_group, sub_group,
 
-            FROM {tables['sku']}
+                   sale_group, uom
 
-            WHERE item_description ILIKE :desc
+            FROM all_sku
+
+            WHERE particulars ILIKE :desc
 
             LIMIT 1
 
@@ -3498,15 +3713,19 @@ def lookup_sku(item_description: str, company: Company, db: Session) -> dict | N
 
     return {
 
-        "sku_id": row["id"],
+        "sku_id": row["sku_id"],
 
-        "item_description": row["item_description"],
+        "item_description": row["particulars"],
 
-        "material_type": row["material_type"],
+        "material_type": row["item_type"],
 
-        "item_category": row["item_category"],
+        "item_category": row["item_group"],
 
-        "sub_category": row["sub_category"],
+        "sub_category": row["sub_group"],
+
+        "sale_group": row["sale_group"],
+
+        "uom": str(row["uom"]) if row["uom"] is not None else None,
 
     }
 
@@ -3664,11 +3883,15 @@ def sku_dropdown(
 
 ) -> SKUDropdownResponse:
 
-    """Cascading SKU dropdown: material_type -> item_category -> sub_category -> item_description."""
+    """Cascading SKU dropdown against `all_sku`.
 
-    tbl = table_names(company)["sku"]
+    Column mapping: item_type → material_type, item_group → item_category,
 
+    sub_group → sub_category, particulars → item_description, sku_id → id.
 
+    `company` is accepted for API-compat but ignored — `all_sku` is shared.
+
+    """
 
     material_type = material_type.strip() if material_type else None
 
@@ -3686,13 +3909,13 @@ def sku_dropdown(
 
     material_types = db.execute(
 
-        text(f"""
+        text("""
 
-            SELECT DISTINCT material_type FROM {tbl}
+            SELECT DISTINCT item_type FROM all_sku
 
-            WHERE material_type IS NOT NULL
+            WHERE item_type IS NOT NULL
 
-            ORDER BY material_type ASC
+            ORDER BY item_type ASC
 
         """)
 
@@ -3708,13 +3931,13 @@ def sku_dropdown(
 
         item_categories = db.execute(
 
-            text(f"""
+            text("""
 
-                SELECT DISTINCT item_category FROM {tbl}
+                SELECT DISTINCT item_group FROM all_sku
 
-                WHERE UPPER(material_type) = UPPER(:mt) AND item_category IS NOT NULL
+                WHERE UPPER(item_type) = UPPER(:mt) AND item_group IS NOT NULL
 
-                ORDER BY item_category ASC
+                ORDER BY item_group ASC
 
             """),
 
@@ -3732,17 +3955,17 @@ def sku_dropdown(
 
         sub_categories = db.execute(
 
-            text(f"""
+            text("""
 
-                SELECT DISTINCT sub_category FROM {tbl}
+                SELECT DISTINCT sub_group FROM all_sku
 
-                WHERE UPPER(material_type) = UPPER(:mt)
+                WHERE UPPER(item_type) = UPPER(:mt)
 
-                  AND UPPER(item_category) = UPPER(:ic)
+                  AND UPPER(item_group) = UPPER(:ic)
 
-                  AND sub_category IS NOT NULL
+                  AND sub_group IS NOT NULL
 
-                ORDER BY sub_category ASC
+                ORDER BY sub_group ASC
 
             """),
 
@@ -3752,11 +3975,15 @@ def sku_dropdown(
 
 
 
-    # 4) Item descriptions + IDs (filtered by full hierarchy)
+    # 4) Item descriptions + IDs + sale_group + uom (filtered by full hierarchy)
 
     item_descs: list[str] = []
 
     item_ids: list[int] = []
+
+    item_sale_groups: list[Optional[str]] = []
+
+    item_uoms: list[Optional[str]] = []
 
     total_item_descriptions = 0
 
@@ -3766,11 +3993,11 @@ def sku_dropdown(
 
         where = [
 
-            "UPPER(material_type) = UPPER(:mt)",
+            "UPPER(item_type) = UPPER(:mt)",
 
-            "UPPER(item_category) = UPPER(:ic)",
+            "UPPER(item_group) = UPPER(:ic)",
 
-            "UPPER(sub_category) = UPPER(:sc)",
+            "UPPER(sub_group) = UPPER(:sc)",
 
         ]
 
@@ -3780,7 +4007,7 @@ def sku_dropdown(
 
         if search:
 
-            where.append("LOWER(item_description) LIKE :search")
+            where.append("LOWER(particulars) LIKE :search")
 
             params["search"] = f"%{search.lower()}%"
 
@@ -3792,7 +4019,7 @@ def sku_dropdown(
 
         total_item_descriptions = db.execute(
 
-            text(f"SELECT COUNT(DISTINCT item_description) FROM {tbl} WHERE {where_sql}"),
+            text(f"SELECT COUNT(DISTINCT particulars) FROM all_sku WHERE {where_sql}"),
 
             params,
 
@@ -3804,11 +4031,13 @@ def sku_dropdown(
 
             text(f"""
 
-                SELECT DISTINCT id, item_description FROM {tbl}
+                SELECT DISTINCT sku_id, particulars, sale_group, uom
 
-                WHERE {where_sql} AND item_description IS NOT NULL
+                FROM all_sku
 
-                ORDER BY item_description ASC
+                WHERE {where_sql} AND particulars IS NOT NULL
+
+                ORDER BY particulars ASC
 
                 LIMIT :limit OFFSET :offset
 
@@ -3820,9 +4049,13 @@ def sku_dropdown(
 
 
 
-        item_ids = [r[0] for r in rows]
+        item_ids = [r.sku_id for r in rows]
 
-        item_descs = [r[1] for r in rows]
+        item_descs = [r.particulars for r in rows]
+
+        item_sale_groups = [r.sale_group for r in rows]
+
+        item_uoms = [str(r.uom) if r.uom is not None else None for r in rows]
 
 
 
@@ -3834,11 +4067,11 @@ def sku_dropdown(
 
         row = db.execute(
 
-            text(f"""
+            text("""
 
-                SELECT material_type, item_category, sub_category FROM {tbl}
+                SELECT item_type, item_group, sub_group FROM all_sku
 
-                WHERE item_description = :desc
+                WHERE particulars = :desc
 
                 LIMIT 1
 
@@ -3888,6 +4121,10 @@ def sku_dropdown(
 
             item_ids=item_ids,
 
+            item_sale_groups=item_sale_groups,
+
+            item_uoms=item_uoms,
+
         ),
 
         meta=SKUDropdownMeta(
@@ -3930,9 +4167,11 @@ def sku_global_search(
 
 ) -> SKUGlobalSearchResponse:
 
-    """Global item description search — bypasses hierarchy."""
+    """Global item description search against the unified `all_sku` table.
 
-    tbl = table_names(company)["sku"]
+    `company` is kept for API-compat but ignored — `all_sku` is company-agnostic.
+
+    """
 
     search_term = search.strip() if search else None
 
@@ -3946,7 +4185,7 @@ def sku_global_search(
 
     if search_term:
 
-        where_clauses.append("LOWER(item_description) LIKE :search")
+        where_clauses.append("LOWER(particulars) LIKE :search")
 
         params["search"] = f"%{search_term.lower()}%"
 
@@ -3958,7 +4197,7 @@ def sku_global_search(
 
     total_items = db.execute(
 
-        text(f"SELECT COUNT(DISTINCT item_description) FROM {tbl} WHERE {where_sql}"),
+        text(f"SELECT COUNT(DISTINCT particulars) FROM all_sku WHERE {where_sql}"),
 
         params,
 
@@ -3970,13 +4209,17 @@ def sku_global_search(
 
         text(f"""
 
-            SELECT DISTINCT id, item_description, material_type, item_category, sub_category
+            SELECT DISTINCT
 
-            FROM {tbl}
+                sku_id, particulars, item_type, item_group, sub_group,
+
+                sale_group, uom
+
+            FROM all_sku
 
             WHERE {where_sql}
 
-            ORDER BY item_description ASC
+            ORDER BY particulars ASC
 
             LIMIT :limit OFFSET :offset
 
@@ -3992,15 +4235,19 @@ def sku_global_search(
 
         SKUGlobalSearchItem(
 
-            id=r[0],
+            id=r.sku_id,
 
-            item_description=r[1],
+            item_description=r.particulars,
 
-            material_type=r[2],
+            material_type=r.item_type,
 
-            group=r[3],
+            group=r.item_group,
 
-            sub_group=r[4],
+            sub_group=r.sub_group,
+
+            sale_group=r.sale_group,
+
+            uom=str(r.uom) if r.uom is not None else None,
 
         )
 
@@ -4052,11 +4299,11 @@ def sku_id_lookup(
 
 ) -> SKUIdResponse:
 
-    """Get SKU ID for a specific item description (case-insensitive)."""
+    """Get SKU ID for a specific item description from `all_sku` (case-insensitive).
 
-    tbl = table_names(company)["sku"]
+    `company` is accepted for API-compat but ignored — `all_sku` is shared.
 
-
+    """
 
     # Handle "other" in any field — return null sku_id
 
@@ -4082,13 +4329,17 @@ def sku_id_lookup(
 
             sub_category=sub_category,
 
+            sale_group=None,
+
+            uom=None,
+
             company=company,
 
         )
 
 
 
-    where_clauses = ["UPPER(item_description) = UPPER(:desc)"]
+    where_clauses = ["UPPER(particulars) = UPPER(:desc)"]
 
     params: dict = {"desc": item_description}
 
@@ -4096,19 +4347,19 @@ def sku_id_lookup(
 
     if material_type:
 
-        where_clauses.append("UPPER(material_type) = UPPER(:mt)")
+        where_clauses.append("UPPER(item_type) = UPPER(:mt)")
 
         params["mt"] = material_type
 
     if item_category:
 
-        where_clauses.append("UPPER(item_category) = UPPER(:ic)")
+        where_clauses.append("UPPER(item_group) = UPPER(:ic)")
 
         params["ic"] = item_category
 
     if sub_category:
 
-        where_clauses.append("UPPER(sub_category) = UPPER(:sc)")
+        where_clauses.append("UPPER(sub_group) = UPPER(:sc)")
 
         params["sc"] = sub_category
 
@@ -4122,9 +4373,11 @@ def sku_id_lookup(
 
         text(f"""
 
-            SELECT id, item_description, material_type, item_category, sub_category
+            SELECT sku_id, particulars, item_type, item_group, sub_group,
 
-            FROM {tbl}
+                   sale_group, uom
+
+            FROM all_sku
 
             WHERE {where_sql}
 
@@ -4146,21 +4399,25 @@ def sku_id_lookup(
 
     return SKUIdResponse(
 
-        sku_id=row[0],
+        sku_id=row.sku_id,
 
-        id=row[0],
+        id=row.sku_id,
 
-        item_description=row[1],
+        item_description=row.particulars,
 
-        material_type=row[2],
+        material_type=row.item_type,
 
-        group=row[3],
+        group=row.item_group,
 
-        sub_group=row[4],
+        sub_group=row.sub_group,
 
-        item_category=row[3],
+        item_category=row.item_group,
 
-        sub_category=row[4],
+        sub_category=row.sub_group,
+
+        sale_group=row.sale_group,
+
+        uom=str(row.uom) if row.uom is not None else None,
 
         company=company,
 

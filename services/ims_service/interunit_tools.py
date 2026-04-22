@@ -17,7 +17,7 @@ from services.ims_service.interunit_models import (
 logger = get_logger("ims.interunit")
 
 
-# ── Helpers ──
+# -- Helpers --
 
 
 def _generate_request_no() -> str:
@@ -83,7 +83,7 @@ def _fetch_lines(db: Session, request_id: int) -> list:
     return [_map_line_row(r) for r in rows]
 
 
-# ── Warehouse dropdown ──
+# -- Warehouse dropdown --
 
 
 def get_warehouse_sites(active_only: bool, db: Session) -> list:
@@ -102,7 +102,7 @@ def get_warehouse_sites(active_only: bool, db: Session) -> list:
     ]
 
 
-# ── Create request ──
+# -- Create request --
 
 
 def create_request(data: RequestCreate, created_by: str, db: Session) -> dict:
@@ -205,7 +205,7 @@ def create_request(data: RequestCreate, created_by: str, db: Session) -> dict:
     return result
 
 
-# ── List requests ──
+# -- List requests --
 
 
 def list_requests(
@@ -303,7 +303,7 @@ def list_requests(
     }
 
 
-# ── Get single request ──
+# -- Get single request --
 
 
 def get_request(request_id: int, db: Session) -> dict:
@@ -326,7 +326,7 @@ def get_request(request_id: int, db: Session) -> dict:
     return result
 
 
-# ── Update request (Accept / Reject) ──
+# -- Update request (Accept / Reject) --
 
 
 def update_request(request_id: int, data: RequestUpdate, db: Session) -> dict:
@@ -369,7 +369,7 @@ def update_request(request_id: int, data: RequestUpdate, db: Session) -> dict:
     return _map_header_row(row)
 
 
-# ── Delete request ──
+# -- Delete request --
 
 
 def delete_request(request_id: int, db: Session) -> dict:
@@ -393,9 +393,9 @@ def delete_request(request_id: int, db: Session) -> dict:
     return {"success": True, "message": "Request deleted successfully"}
 
 
-# ══════════════════════════════════════════════
-#  Phase B – Transfer helpers
-# ══════════════════════════════════════════════
+# ----------------------------------------------
+#  Phase B   Transfer helpers
+# ----------------------------------------------
 
 
 def _generate_challan_no() -> str:
@@ -505,7 +505,7 @@ def _fetch_boxes(db: Session, header_id: int) -> list:
     return result
 
 
-# ── Create transfer ──
+# -- Create transfer --
 
 
 def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
@@ -644,7 +644,7 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
             boxes.append(box_row)
 
     # Line weights are already set correctly from frontend per-box values.
-    # Each line represents one box entry — no need to sum box weights back into lines.
+    # Each line represents one box entry   no need to sum box weights back into lines.
 
     # Determine status based on box count vs expected qty
     if boxes:
@@ -690,7 +690,7 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
     return result
 
 
-# ── List transfers ──
+# -- List transfers --
 
 
 def list_transfers(
@@ -796,7 +796,7 @@ def list_transfers(
     }
 
 
-# ── Bulk entry box lookup ──
+# -- Bulk entry box lookup --
 
 
 def get_bulk_entry_box(company: str, box_id: str, transaction_no: str, db: Session) -> dict:
@@ -848,7 +848,7 @@ def get_bulk_entry_box(company: str, box_id: str, transaction_no: str, db: Sessi
     raise HTTPException(404, f"Box with box_id '{box_id}' and transaction_no '{transaction_no}' not found in bulk entry boxes")
 
 
-# ── Get single transfer ──
+# -- Get single transfer --
 
 
 def get_transfer(transfer_id: int, db: Session) -> dict:
@@ -880,7 +880,7 @@ def get_transfer(transfer_id: int, db: Session) -> dict:
     return result
 
 
-# ── Update transfer ──
+# -- Update transfer --
 
 
 def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict:
@@ -893,7 +893,7 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
     if not existing:
         raise HTTPException(404, "Transfer not found")
 
-    # No status restriction — authorized users can edit transfers in any status
+    # No status restriction   authorized users can edit transfers in any status
 
     stock_trf_date = _convert_date(data.header.stock_trf_date)
 
@@ -1038,7 +1038,7 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
             boxes.append(box_row)
 
     # Line weights are already set correctly from frontend per-box values.
-    # Each line represents one box entry — no need to sum box weights back into lines.
+    # Each line represents one box entry   no need to sum box weights back into lines.
 
     # Determine status based on box count vs expected qty
     if boxes:
@@ -1074,7 +1074,7 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
     return result
 
 
-# ── Delete transfer ──
+# -- Delete transfer --
 
 
 def delete_transfer(transfer_id: int, db: Session) -> dict:
@@ -1086,7 +1086,7 @@ def delete_transfer(transfer_id: int, db: Session) -> dict:
     if not existing:
         raise HTTPException(404, "Transfer not found")
 
-    # No status restriction — authorized users can delete transfers in any status
+    # No status restriction   authorized users can delete transfers in any status
 
     # Delete associated transfer-in records first (cascade)
     transfer_in_headers = db.execute(
@@ -1134,7 +1134,7 @@ def delete_transfer(transfer_id: int, db: Session) -> dict:
         {"tid": transfer_id},
     )
 
-    # Delete transfer-out in FK order: boxes → lines → header
+    # Delete transfer-out in FK order: boxes ? lines ? header
     db.execute(
         text("DELETE FROM interunit_transfer_boxes WHERE header_id = :tid"),
         {"tid": transfer_id},
@@ -1161,13 +1161,13 @@ def delete_transfer(transfer_id: int, db: Session) -> dict:
     }
 
 
-# ══════════════════════════════════════════════
-#  Phase C – Transfer IN helpers
-# ══════════════════════════════════════════════
+# ----------------------------------------------
+#  Phase C   Transfer IN helpers
+# ----------------------------------------------
 
 
 def _map_transfer_in_header(row) -> dict:
-    return {
+    result = {
         "id": row.id,
         "transfer_out_id": row.transfer_out_id,
         "transfer_out_no": row.transfer_out_no or "",
@@ -1182,6 +1182,10 @@ def _map_transfer_in_header(row) -> dict:
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
+    # Include from_warehouse if available (from JOIN with transfers header)
+    if hasattr(row, "from_warehouse") and row.from_warehouse:
+        result["from_warehouse"] = row.from_warehouse
+    return result
 
 
 def _map_transfer_in_box(row) -> dict:
@@ -1218,7 +1222,7 @@ def _fetch_transfer_in_boxes(db: Session, header_id: int) -> list:
     return [_map_transfer_in_box(r) for r in rows]
 
 
-# ── Create transfer IN (GRN) ──
+# -- Create transfer IN (GRN) --
 
 
 def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
@@ -1336,7 +1340,7 @@ def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
     return result
 
 
-# ── Cold storage helper (shared by create_transfer_in & finalize) ──
+# -- Cold storage helper (shared by create_transfer_in & finalize) --
 
 
 def _restore_cold_stock_snapshots(transfer_in_id: Optional[int], transfer_out_id: Optional[int], db: Session):
@@ -1380,7 +1384,7 @@ def _restore_cold_stock_snapshots(transfer_in_id: Optional[int], transfer_out_id
     for snap in snapshots:
         cold_table = snap.source_table
         logger.info(
-            "COLD_STOCK_RESTORE: Processing snapshot — table=%s, box_id=%s, item=%s",
+            "COLD_STOCK_RESTORE: Processing snapshot   table=%s, box_id=%s, item=%s",
             cold_table, snap.box_id, snap.item_description,
         )
 
@@ -1392,7 +1396,7 @@ def _restore_cold_stock_snapshots(transfer_in_id: Optional[int], transfer_out_id
             logger.warning("COLD_STOCK_RESTORE: Table %s does not exist, skipping", cold_table)
             continue
 
-        # Check if already exists (avoid duplicates) — handle NULL transaction_no
+        # Check if already exists (avoid duplicates)   handle NULL transaction_no
         if snap.transaction_no:
             exists = db.execute(
                 text(f"SELECT id FROM {cold_table} WHERE box_id = :bid AND transaction_no = :txno"),
@@ -1447,7 +1451,7 @@ def _restore_cold_stock_snapshots(transfer_in_id: Optional[int], transfer_out_id
             },
         )
         logger.info(
-            "COLD_STOCK_RESTORE: Restored to %s — box_id=%s, transaction_no=%s, item=%s",
+            "COLD_STOCK_RESTORE: Restored to %s   box_id=%s, transaction_no=%s, item=%s",
             cold_table, snap.box_id, snap.transaction_no, snap.item_description,
         )
 
@@ -1520,7 +1524,7 @@ def _insert_cold_storage_items(header_id: int, cold_storage_items, challan_no: s
                 cs_item.storage_location or to_site,
             )
         else:
-            # No box details — insert a single summary row
+            # No box details   insert a single summary row
             db.execute(
                 text(f"""
                     INSERT INTO {cold_table}
@@ -1559,7 +1563,7 @@ def _insert_cold_storage_items(header_id: int, cold_storage_items, challan_no: s
             )
 
 
-# ── Pending Transfer IN (Phase C - real-time acknowledge) ──
+# -- Pending Transfer IN (Phase C - real-time acknowledge) --
 
 
 def create_pending_transfer_in(data: PendingTransferInCreate, db: Session) -> dict:
@@ -1653,7 +1657,7 @@ def acknowledge_pending_box(header_id: int, data: PendingBoxAcknowledge, db: Ses
 
     issue_json = json.dumps(data.issue) if data.issue else None
 
-    # Atomic upsert — safe against concurrent clients acknowledging the same box
+    # Atomic upsert   safe against concurrent clients acknowledging the same box
     # First ensure a unique constraint exists (idempotent)
     try:
         db.execute(text("""
@@ -1846,7 +1850,7 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
         to_site = tout.to_site if tout else None
         _insert_cold_storage_items(header_id, data.cold_storage_items, header.transfer_out_no, db, to_site=to_site)
 
-    # ── Subtract from cold stocks when transfer is FROM Cold Storage ──
+    # -- Subtract from cold stocks when transfer is FROM Cold Storage --
     transfer_out = db.execute(
         text("SELECT from_site, to_site FROM interunit_transfers_header WHERE id = :toid"),
         {"toid": header.transfer_out_id},
@@ -1967,7 +1971,7 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
                         {"orig_id": original.id},
                     )
                     logger.info(
-                        "COLD_STOCK_SUBTRACT: Snapshot saved & deleted from %s — box_id=%s, article=%s",
+                        "COLD_STOCK_SUBTRACT: Snapshot saved & deleted from %s   box_id=%s, article=%s",
                         cold_table, box.box_id, box.article,
                     )
                     break  # Found in this table, move to next box
@@ -2007,7 +2011,7 @@ def get_pending_by_transfer_out(transfer_out_id: int, db: Session) -> dict:
     return {"exists": True, "header": header}
 
 
-# ── List transfer INs ──
+# -- List transfer INs --
 
 
 def list_transfer_ins(
@@ -2056,11 +2060,13 @@ def list_transfer_ins(
                 h.grn_date, h.receiving_warehouse, h.received_by, h.received_at,
                 h.box_condition, h.condition_remarks, h.status,
                 h.created_at, h.updated_at,
-                COUNT(b.id) AS total_boxes_scanned
+                COUNT(b.id) AS total_boxes_scanned,
+                t.from_site AS from_warehouse
             FROM interunit_transfer_in_header h
             LEFT JOIN interunit_transfer_in_boxes b ON h.id = b.header_id
+            LEFT JOIN interunit_transfers_header t ON h.transfer_out_id = t.id
             WHERE {where}
-            GROUP BY h.id
+            GROUP BY h.id, t.from_site
             ORDER BY h.{sort_by} {direction}
             LIMIT :limit OFFSET :offset
         """),
@@ -2082,18 +2088,20 @@ def list_transfer_ins(
     }
 
 
-# ── Get single transfer IN ──
+# -- Get single transfer IN --
 
 
 def get_transfer_in(transfer_in_id: int, db: Session) -> dict:
     row = db.execute(
         text("""
-            SELECT id, transfer_out_id, transfer_out_no, grn_number,
-                   grn_date, receiving_warehouse, received_by, received_at,
-                   box_condition, condition_remarks, status,
-                   created_at, updated_at
-            FROM interunit_transfer_in_header
-            WHERE id = :tid
+            SELECT h.id, h.transfer_out_id, h.transfer_out_no, h.grn_number,
+                   h.grn_date, h.receiving_warehouse, h.received_by, h.received_at,
+                   h.box_condition, h.condition_remarks, h.status,
+                   h.created_at, h.updated_at,
+                   t.from_site AS from_warehouse
+            FROM interunit_transfer_in_header h
+            LEFT JOIN interunit_transfers_header t ON h.transfer_out_id = t.id
+            WHERE h.id = :tid
         """),
         {"tid": transfer_in_id},
     ).fetchone()
@@ -2109,7 +2117,7 @@ def get_transfer_in(transfer_in_id: int, db: Session) -> dict:
     return result
 
 
-# ── Delete transfer IN ──
+# -- Delete transfer IN --
 
 TRANSFER_IN_DELETE_ALLOWED_EMAILS = {"yash@candorfoods.in"}
 
@@ -2163,7 +2171,7 @@ def delete_transfer_in(transfer_in_id: int, user_email: str, db: Session) -> dic
     )
 
     if is_to_cold:
-        # Warehouse → Cold Storage: delete the cold stock rows that were inserted during transfer-in
+        # Warehouse ? Cold Storage: delete the cold stock rows that were inserted during transfer-in
         challan_no = getattr(header, "transfer_out_no", None)
         cold_stocks_tables = ["cfpl_cold_stocks", "cdpl_cold_stocks"]
         for cs_table in cold_stocks_tables:
@@ -2188,7 +2196,7 @@ def delete_transfer_in(transfer_in_id: int, user_email: str, db: Session) -> dic
                     )
 
     if is_from_cold:
-        # Cold Storage → Warehouse: restore the cold stock rows from snapshots
+        # Cold Storage ? Warehouse: restore the cold stock rows from snapshots
         _restore_cold_stock_snapshots(transfer_in_id, transfer_out_id, db)
 
     # Delete from interunit_transfer_in_boxes
@@ -2221,11 +2229,11 @@ def delete_transfer_in(transfer_in_id: int, user_email: str, db: Session) -> dic
     }
 
 
-# ══════════════════════════════════════════════
-#  Categorial Inventory Lookup (for Transfer & Request article section)
-# ══════════════════════════════════════════════
+# ----------------------------------------------
+#  All SKU Lookup (for Transfer & Request article section)
+# ----------------------------------------------
 
-_CATEGORIAL_TABLE = "public.categorial_inv"
+_CATEGORIAL_TABLE = "public.all_sku"
 
 
 def categorial_global_search(
@@ -2234,7 +2242,7 @@ def categorial_global_search(
     offset: int,
     db: Session,
 ) -> CategorialSearchResponse:
-    """Global search on categorial_inv.particulars — bypasses hierarchy."""
+    """Global search on all_sku.particulars   bypasses hierarchy."""
     search_term = search.strip() if search else None
 
     where_clauses = ["1=1"]
@@ -2247,7 +2255,7 @@ def categorial_global_search(
     where_sql = " AND ".join(where_clauses)
 
     total = db.execute(
-        text(f"SELECT COUNT(*) FROM (SELECT DISTINCT UPPER(particulars), UPPER(\"fg/rm/pm\") FROM {_CATEGORIAL_TABLE} WHERE {where_sql}) t"),
+        text(f"SELECT COUNT(*) FROM (SELECT DISTINCT UPPER(particulars), UPPER(item_type) FROM {_CATEGORIAL_TABLE} WHERE {where_sql}) t"),
         params,
     ).scalar_one()
 
@@ -2256,15 +2264,15 @@ def categorial_global_search(
         text(f"""
             SELECT desc_upper, mt, grp, sc, uom
             FROM (
-                SELECT DISTINCT ON (UPPER(particulars), UPPER("fg/rm/pm"))
+                SELECT DISTINCT ON (UPPER(particulars), UPPER(item_type))
                        UPPER(particulars) AS desc_upper,
-                       UPPER("fg/rm/pm") AS mt,
-                       UPPER("group") AS grp,
+                       UPPER(item_type) AS mt,
+                       UPPER(item_group) AS grp,
                        UPPER(sub_group) AS sc,
                        uom
                 FROM {_CATEGORIAL_TABLE}
                 WHERE {where_sql}
-                ORDER BY UPPER(particulars) ASC, UPPER("fg/rm/pm") ASC
+                ORDER BY UPPER(particulars) ASC, UPPER(item_type) ASC
             ) sub
             ORDER BY
                 CASE LOWER(sub.mt)
@@ -2312,19 +2320,19 @@ def categorial_dropdown(
     offset: int,
     db: Session,
 ) -> CategorialDropdownResponse:
-    """Cascading dropdown on categorial_inv: fg/rm/pm -> group -> sub_group -> particulars."""
+    """Cascading dropdown on all_sku: item_type -> item_group -> sub_group -> particulars."""
     material_type = material_type.strip() if material_type else None
     item_category = item_category.strip() if item_category else None
     sub_category = sub_category.strip() if sub_category else None
     search = search.strip() if search else None
 
-    # 1) All material types — sorted by priority: rm → fg → pm (only RM, PM, FG)
+    # 1) All material types   sorted by priority: rm ? fg ? pm (only RM, PM, FG)
     material_types = db.execute(
         text(f"""
             SELECT mt FROM (
-                SELECT DISTINCT UPPER("fg/rm/pm") AS mt FROM {_CATEGORIAL_TABLE}
-                WHERE "fg/rm/pm" IS NOT NULL
-                  AND UPPER("fg/rm/pm") IN ('RM', 'PM', 'FG')
+                SELECT DISTINCT UPPER(item_type) AS mt FROM {_CATEGORIAL_TABLE}
+                WHERE item_type IS NOT NULL
+                  AND UPPER(item_type) IN ('RM', 'PM', 'FG')
             ) sub
             ORDER BY
                 CASE LOWER(sub.mt)
@@ -2341,8 +2349,8 @@ def categorial_dropdown(
     if material_type:
         item_categories = db.execute(
             text(f"""
-                SELECT DISTINCT UPPER("group") AS grp FROM {_CATEGORIAL_TABLE}
-                WHERE UPPER("fg/rm/pm") = UPPER(:mt) AND "group" IS NOT NULL
+                SELECT DISTINCT UPPER(item_group) AS grp FROM {_CATEGORIAL_TABLE}
+                WHERE UPPER(item_type) = UPPER(:mt) AND item_group IS NOT NULL
                 ORDER BY grp ASC
             """),
             {"mt": material_type},
@@ -2354,8 +2362,8 @@ def categorial_dropdown(
         sub_categories = db.execute(
             text(f"""
                 SELECT DISTINCT UPPER(sub_group) AS sc FROM {_CATEGORIAL_TABLE}
-                WHERE UPPER("fg/rm/pm") = UPPER(:mt)
-                  AND UPPER("group") = UPPER(:ic)
+                WHERE UPPER(item_type) = UPPER(:mt)
+                  AND UPPER(item_group) = UPPER(:ic)
                   AND sub_group IS NOT NULL
                 ORDER BY sc ASC
             """),
@@ -2369,8 +2377,8 @@ def categorial_dropdown(
 
     if material_type and item_category and sub_category:
         where = [
-            'UPPER("fg/rm/pm") = UPPER(:mt)',
-            'UPPER("group") = UPPER(:ic)',
+            'UPPER(item_type) = UPPER(:mt)',
+            'UPPER(item_group) = UPPER(:ic)',
             "UPPER(sub_group) = UPPER(:sc)",
         ]
         params: dict = {"mt": material_type, "ic": item_category, "sc": sub_category}

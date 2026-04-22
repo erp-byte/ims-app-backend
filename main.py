@@ -30,6 +30,7 @@ from services.cold_storage_service.dashboard_server import router as dashboard_r
 from services.ims_service.inward_dashboard_server import router as inward_dashboard_router
 from services.ims_service.transfer_dashboard_server import router as transfer_dashboard_router
 from services.ims_service.jobwork_dashboard_server import router as jobwork_dashboard_router
+from services.ims_service.job_work_server import router as job_work_router
 
 
 logger = get_logger("main")
@@ -221,6 +222,7 @@ app.include_router(dashboard_router)
 app.include_router(inward_dashboard_router)
 app.include_router(transfer_dashboard_router)
 app.include_router(jobwork_dashboard_router)
+app.include_router(job_work_router)
 
 
 if __name__ == "__main__":

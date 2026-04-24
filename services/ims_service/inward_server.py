@@ -166,6 +166,15 @@ def list_warehouses_endpoint(
     return {"warehouses": list_distinct_warehouses(company, db)}
 
 
+@router.get("/{company}/warehouses")
+def list_warehouses_by_company_endpoint(
+    company: Company,
+    db: Session = Depends(get_db),
+):
+    """Distinct warehouse values — company as path param (used by frontend dropdown)."""
+    return {"warehouses": list_distinct_warehouses(company, db)}
+
+
 @router.get("/vendors")
 def vendors_endpoint(
     search: Optional[str] = Query(None, description="Filter vendor names (ILIKE)"),

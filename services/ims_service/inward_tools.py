@@ -274,6 +274,8 @@ def table_names(company: Company) -> dict:
 
         "sku": f"{prefix}sku",
 
+        "cold_stocks": f"{prefix}_cold_stocks",
+
     }
 
 
@@ -603,9 +605,35 @@ def union_source_ctes(company: Company) -> str:
     """
 
 
+# All known raw DB values that map to each canonical warehouse code.
+# Allows filtering by canonical code to match legacy-named rows.
+_WAREHOUSE_ALIASES: dict[str, list[str]] = {
+    "Savla D-39": [
+        "savla d-39", "savla d39", "savla-d39", "savla-d-39",
+        "savla d-39 cold", "savla d39 cold", "old savla", "old_savla",
+        "savla bond", "d-39", "d39", "savla",
+    ],
+    "Savla D-514": [
+        "savla d-514", "savla d514", "savla-d514", "savla-d-514",
+        "savla d-514 cold", "savla d514 cold", "new savla", "d-514", "d514",
+    ],
+    "Rishi": ["rishi", "rishi cold", "rishi cold storage", "rishi cold storage pvt ltd"],
+    "Supreme": ["supreme", "supreme cold", "supreme cold storage"],
+}
+
+def _warehouse_aliases(canonical: str) -> list[str]:
+    """Return all DB-level values (lowercased) that should match this canonical code."""
+    base = [canonical.lower()]
+    extras = _WAREHOUSE_ALIASES.get(canonical, [])
+    return list(dict.fromkeys(base + [a.lower() for a in extras]))
+
+
 def list_distinct_warehouses(company: Company, db: Session) -> list[str]:
-    """Return distinct non-empty warehouse values across inward + bulk entry transactions."""
+    """Return distinct non-empty warehouse values across inward + bulk entry transactions
+    and cold storage inward (storage_location), normalized to canonical codes."""
     prefix = "cfpl" if company == "CFPL" else "cdpl"
+    cold_table = f"{prefix}_cold_stocks"
+
     rows = db.execute(
         text(f"""
             SELECT DISTINCT TRIM(warehouse) AS warehouse
@@ -613,12 +641,29 @@ def list_distinct_warehouses(company: Company, db: Session) -> list[str]:
                 SELECT warehouse FROM {prefix}_transactions_v2
                 UNION ALL
                 SELECT warehouse FROM {prefix}_bulk_entry_transactions
+                UNION ALL
+                SELECT storage_location AS warehouse FROM {cold_table}
             ) w
             WHERE warehouse IS NOT NULL AND TRIM(warehouse) <> ''
             ORDER BY warehouse
         """)
     ).fetchall()
-    return [r.warehouse for r in rows]
+
+    # Build reverse alias map: lowercased raw value → canonical code
+    reverse: dict[str, str] = {}
+    for canonical, aliases in _WAREHOUSE_ALIASES.items():
+        reverse[canonical.lower()] = canonical
+        for alias in aliases:
+            reverse[alias.lower()] = canonical
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for (raw,) in rows:
+        canonical = reverse.get(raw.strip().lower().replace("_", " "), raw.strip())
+        if canonical not in seen:
+            seen.add(canonical)
+            result.append(canonical)
+    return sorted(result)
 
 
 def build_search_conditions(
@@ -636,10 +681,28 @@ def build_search_conditions(
     params: dict = {}
 
     if warehouse and warehouse.strip():
+        # Expand to all known aliases so filtering by canonical code matches legacy DB rows
+        all_values = _warehouse_aliases(warehouse.strip())
+        placeholders = ", ".join(f":wh{i}" for i in range(len(all_values)))
+        for i, val in enumerate(all_values):
+            params[f"wh{i}"] = val
 
-        where_clauses.append("TRIM(LOWER(COALESCE(t.warehouse, ''))) = TRIM(LOWER(:warehouse))")
+        cold_table = tables.get("cold_stocks", "")
+        is_cold = warehouse.strip() in _WAREHOUSE_ALIASES
 
-        params["warehouse"] = warehouse.strip()
+        if is_cold and cold_table:
+            # For cold storage warehouses: match transactions table warehouse column
+            # OR match via cold_stocks.storage_location → transaction_no join
+            where_clauses.append(
+                f"(TRIM(LOWER(COALESCE(t.warehouse, ''))) IN ({placeholders})"
+                f" OR t.transaction_no IN ("
+                f"   SELECT transaction_no FROM {cold_table}"
+                f"   WHERE TRIM(LOWER(COALESCE(storage_location, ''))) IN ({placeholders})"
+                f"   AND transaction_no IS NOT NULL"
+                f" ))"
+            )
+        else:
+            where_clauses.append(f"TRIM(LOWER(COALESCE(t.warehouse, ''))) IN ({placeholders})")
 
 
 

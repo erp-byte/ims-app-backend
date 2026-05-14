@@ -58,6 +58,7 @@ def _map_header_row(row) -> dict:
         "dn_no": row.dn_no,
         "conversion": str(row.conversion) if row.conversion is not None else "0",
         "sales_poc": row.sales_poc,
+        "business_head": getattr(row, "business_head", None),
         "remark": row.remark,
         "status": row.status or "Pending",
         "created_by": row.created_by,
@@ -148,14 +149,14 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             INSERT INTO {tables['header']}
                 (rtv_id, rtv_date, factory_unit, customer,
                  invoice_number, challan_no, dn_no, conversion,
-                 sales_poc, remark, status, created_by, created_ts)
+                 sales_poc, business_head, remark, status, created_by, created_ts)
             VALUES
                 (:rtv_id, NOW(), :factory_unit, :customer,
                  :invoice_number, :challan_no, :dn_no, :conversion,
-                 :sales_poc, :remark, 'Pending', :created_by, NOW())
+                 :sales_poc, :business_head, :remark, 'Pending', :created_by, NOW())
             RETURNING id, rtv_id, rtv_date, factory_unit, customer,
                       invoice_number, challan_no, dn_no, conversion,
-                      sales_poc, remark, status, created_by, created_ts, updated_at
+                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at
         """),
         {
             "rtv_id": rtv_id,
@@ -166,6 +167,7 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             "dn_no": data.header.dn_no,
             "conversion": float(data.header.conversion) if data.header.conversion else 0,
             "sales_poc": data.header.sales_poc,
+            "business_head": data.header.business_head,
             "remark": data.header.remark,
             "created_by": created_by,
         },
@@ -280,7 +282,7 @@ def list_rtvs(
         text(f"""
             SELECT h.id, h.rtv_id, h.rtv_date, h.factory_unit, h.customer,
                    h.invoice_number, h.challan_no, h.dn_no, h.conversion,
-                   h.sales_poc, h.remark, h.status, h.created_by, h.created_ts, h.updated_at,
+                   h.sales_poc, h.business_head, h.remark, h.status, h.created_by, h.created_ts, h.updated_at,
                    COUNT(DISTINCT l.id) AS items_count,
                    COUNT(DISTINCT b.id) AS boxes_count,
                    COALESCE(SUM(l.qty), 0) AS total_qty
@@ -319,7 +321,7 @@ def get_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
         text(f"""
             SELECT id, rtv_id, rtv_date, factory_unit, customer,
                    invoice_number, challan_no, dn_no, conversion,
-                   sales_poc, remark, status, created_by, created_ts, updated_at
+                   sales_poc, business_head, remark, status, created_by, created_ts, updated_at
             FROM {tables['header']}
             WHERE id = :hid
         """),
@@ -355,6 +357,7 @@ def update_rtv(company: Company, rtv_id_int: int, data: RTVHeaderUpdate, db: Ses
         "challan_no": data.challan_no,
         "dn_no": data.dn_no,
         "sales_poc": data.sales_poc,
+        "business_head": data.business_head,
         "remark": data.remark,
         "status": data.status,
     }
@@ -381,7 +384,7 @@ def update_rtv(company: Company, rtv_id_int: int, data: RTVHeaderUpdate, db: Ses
             WHERE id = :hid
             RETURNING id, rtv_id, rtv_date, factory_unit, customer,
                       invoice_number, challan_no, dn_no, conversion,
-                      sales_poc, remark, status, created_by, created_ts, updated_at
+                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at
         """),
         params,
     ).fetchone()
@@ -393,7 +396,7 @@ def delete_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
     tables = rtv_table_names(company)
 
     existing = db.execute(
-        text(f"SELECT id, rtv_id FROM {tables['header']} WHERE id = :hid"),
+        text(f"SELECT id, rtv_id, business_head, created_by FROM {tables['header']} WHERE id = :hid"),
         {"hid": rtv_id_int},
     ).fetchone()
     if not existing:
@@ -417,6 +420,8 @@ def delete_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
         "success": True,
         "message": "RTV deleted successfully",
         "rtv_id": existing.rtv_id,
+        "business_head": existing.business_head,
+        "created_by": existing.created_by,
     }
 
 
@@ -821,7 +826,7 @@ def export_rtv_records(
             SELECT
                 h.rtv_id, h.rtv_date, h.factory_unit, h.customer,
                 h.invoice_number, h.challan_no, h.dn_no, h.conversion,
-                h.sales_poc, h.remark, h.status, h.created_by, h.created_ts,
+                h.sales_poc, h.business_head, h.remark, h.status, h.created_by, h.created_ts,
                 l.material_type, l.item_category, l.sub_category,
                 l.item_description, l.uom, l.qty, l.rate, l.value,
                 l.net_weight AS line_net_weight, l.carton_weight AS line_carton_weight,
@@ -851,6 +856,7 @@ def export_rtv_records(
             "DN No": r.dn_no or "",
             "Conversion": str(r.conversion) if r.conversion is not None else "",
             "Sales POC": r.sales_poc or "",
+            "Business Head": r.business_head or "",
             "Remark": r.remark or "",
             "Status": r.status or "",
             "Created By": r.created_by or "",

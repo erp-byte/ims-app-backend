@@ -106,7 +106,7 @@ def export_rtv_endpoint(
     headers = [
         "RTV ID", "RTV Date", "Factory Unit", "Customer",
         "Invoice Number", "Challan No", "DN No", "Conversion",
-        "Sales POC", "Remark", "Status", "Created By", "Created At",
+        "Sales POC", "Business Head", "Remark", "Status", "Created By", "Created At",
         "Material Type", "Item Category", "Sub Category",
         "Item Description", "UOM", "Qty", "Rate", "Value", "Line Net Weight", "Line Carton Weight",
         "Box ID", "Box Article", "Box Number", "Box UOM", "Box Conversion",
@@ -235,11 +235,18 @@ def update_rtv_endpoint(
 def delete_rtv_endpoint(
     company: Company,
     rtv_id: int,
+    deleted_by: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     """Delete an RTV and all its lines and boxes."""
     result = delete_rtv(company, rtv_id, db)
-    notify_rtv_deleted(result.get("rtv_id", ""), company)
+    notify_rtv_deleted(
+        rtv_id=result.get("rtv_id", ""),
+        company=company,
+        business_head=result.get("business_head"),
+        created_by=result.get("created_by"),
+        deleted_by=deleted_by,
+    )
     return result
 
 

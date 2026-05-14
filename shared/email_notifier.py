@@ -13,6 +13,58 @@ JOB_WORK_TO = "billing@candorfoods.in"
 JOB_WORK_CC = ["b.hrithik@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
 WEEKLY_DIGEST_TO = ["b.hrithik@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
 
+# Business Head -> email map for RTV notifications.
+# Keys are matched case-insensitively against the business_head value stored on the RTV.
+BUSINESS_HEAD_EMAILS = {
+    "Prashant Pal": "prashant.pal@candorfoods.in",
+    "Ajay Bajaj": "ajay@candorfoods.in",
+    "Rakesh Ratra": "rakesh@candorfoods.in",
+    "Yash Gawdi": "yash@candorfoods.in",
+}
+
+# Constant CCs added to every RTV notification.
+RTV_CC_CONSTANT = [
+    "sunil.jasoria@candorfoods.in",
+    "b.hrithik@candorfoods.in",
+    "billing@candorfoods.in",
+    "satyendra@candorfoods.in",
+]
+
+
+def _lookup_business_head_email(business_head: str | None) -> str | None:
+    if not business_head:
+        return None
+    key = business_head.strip().lower()
+    for name, email in BUSINESS_HEAD_EMAILS.items():
+        if name.lower() == key:
+            return email
+    return None
+
+
+def _build_rtv_cc(business_head: str | None, *actors: str | None) -> list[str]:
+    """Build CC list: business head email + constant CC + entry-maker(s).
+
+    Duplicates and the TO address are removed. Empty values are skipped.
+    """
+    cc: list[str] = []
+    head_email = _lookup_business_head_email(business_head)
+    if head_email:
+        cc.append(head_email)
+    cc.extend(RTV_CC_CONSTANT)
+    for actor in actors:
+        if actor:
+            cc.append(actor)
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for addr in cc:
+        normalized = addr.strip().lower()
+        if not normalized or normalized in seen or normalized == RTV_NOTIFY_TO.lower():
+            continue
+        seen.add(normalized)
+        deduped.append(addr.strip())
+    return deduped
+
 
 def _send_email_background(
     subject: str,
@@ -102,6 +154,7 @@ def _rtv_email_html(action: str, header: dict, lines: list[dict], boxes: list[di
         ("DN No", header.get("dn_no", "") or "-"),
         ("Conversion", header.get("conversion", "0")),
         ("Sales POC", header.get("sales_poc", "") or "-"),
+        ("Business Head", header.get("business_head", "") or "-"),
         ("Remark", header.get("remark", "") or "-"),
         ("Status", header.get("status", "")),
         ("Created By", header.get("created_by", "") or "-"),
@@ -220,10 +273,12 @@ def notify_rtv_created(rtv_detail: dict) -> None:
         lines=rtv_detail.get("lines", []),
         boxes=rtv_detail.get("boxes", []),
     )
+    cc = _build_rtv_cc(rtv_detail.get("business_head"), rtv_detail.get("created_by"))
     _send_email_background(
         subject=f"RTV Created: {rtv_detail.get('rtv_id', '')}",
         html_body=html,
         plain_body=plain,
+        cc=cc,
     )
 
 
@@ -236,27 +291,44 @@ def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:
         boxes=rtv_detail.get("boxes", []),
         extra_info=f"Approved by: {approved_by}",
     )
+    cc = _build_rtv_cc(
+        rtv_detail.get("business_head"),
+        rtv_detail.get("created_by"),
+        approved_by,
+    )
     _send_email_background(
         subject=f"RTV Approved: {rtv_detail.get('rtv_id', '')}",
         html_body=html,
         plain_body=plain,
+        cc=cc,
     )
 
 
-def notify_rtv_deleted(rtv_id: str, company: str) -> None:
+def notify_rtv_deleted(
+    rtv_id: str,
+    company: str,
+    business_head: str | None = None,
+    created_by: str | None = None,
+    deleted_by: str | None = None,
+) -> None:
     """Send notification email when an RTV is deleted."""
-    header = {"rtv_id": rtv_id, "status": "Deleted"}
+    header = {"rtv_id": rtv_id, "status": "Deleted", "business_head": business_head, "created_by": created_by}
+    extra = f"RTV {rtv_id} in {company} has been permanently deleted along with all its lines and boxes."
+    if deleted_by:
+        extra += f" Deleted by: {deleted_by}."
     html, plain = _rtv_email_html(
         action="Deleted",
         header=header,
         lines=[],
         boxes=[],
-        extra_info=f"RTV {rtv_id} in {company} has been permanently deleted along with all its lines and boxes.",
+        extra_info=extra,
     )
+    cc = _build_rtv_cc(business_head, created_by, deleted_by)
     _send_email_background(
         subject=f"RTV Deleted: {rtv_id}",
         html_body=html,
         plain_body=plain,
+        cc=cc,
     )
 
 
@@ -268,10 +340,12 @@ def notify_rtv_header_updated(rtv_detail: dict) -> None:
         lines=[],
         boxes=[],
     )
+    cc = _build_rtv_cc(rtv_detail.get("business_head"), rtv_detail.get("created_by"))
     _send_email_background(
         subject=f"RTV Updated: {rtv_detail.get('rtv_id', '')}",
         html_body=html,
         plain_body=plain,
+        cc=cc,
     )
 
 
@@ -814,10 +888,12 @@ def notify_rtv_lines_updated(rtv_detail: dict) -> None:
         lines=rtv_detail.get("lines", []),
         boxes=rtv_detail.get("boxes", []),
     )
+    cc = _build_rtv_cc(rtv_detail.get("business_head"), rtv_detail.get("created_by"))
     _send_email_background(
         subject=f"RTV Lines Updated: {rtv_detail.get('rtv_id', '')}",
         html_body=html,
         plain_body=plain,
+        cc=cc,
     )
 
 

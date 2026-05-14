@@ -58,6 +58,20 @@ def _union_source(tables: List[str]) -> str:
     return f"({parts}) AS cs"
 
 
+# Canonical storage_location SQL expression. Raw rows often store storage_location
+# as "Savla" / "Savla Bond" with the actual cold-storage unit (D-39 vs D-514) in the
+# `unit` column — disambiguate via unit so the two warehouses are not merged.
+_CANONICAL_LOC = """
+    CASE
+        WHEN UPPER(TRIM(COALESCE(storage_location,''))) IN ('SAVLA','OLD SAVLA','SAVLA BOND','SAVLA D-39','SAVLA D39','SAVLA D-39 COLD','SAVLA D-514','SAVLA D514','SAVLA D-514 COLD','NEW SAVLA')
+             AND UPPER(TRIM(COALESCE(unit,''))) = 'D-514' THEN 'Savla D-514'
+        WHEN UPPER(TRIM(COALESCE(storage_location,''))) IN ('SAVLA','OLD SAVLA','SAVLA BOND','SAVLA D-39','SAVLA D39','SAVLA D-39 COLD','SAVLA D-514','SAVLA D514','SAVLA D-514 COLD','NEW SAVLA')
+             AND UPPER(TRIM(COALESCE(unit,''))) = 'D-39' THEN 'Savla D-39'
+        ELSE COALESCE(storage_location, 'Unassigned')
+    END
+"""
+
+
 def _f(v):
     return round(float(v), 2) if v else 0.0
 
@@ -83,12 +97,12 @@ async def get_stock_summary(
         loc_filter = ""
         params: dict = {}
         if storage_location:
-            loc_filter = "AND storage_location = :loc"
+            loc_filter = f"AND ({_CANONICAL_LOC}) = :loc"
             params["loc"] = storage_location
 
         l3_sql = text(f"""
             SELECT
-                COALESCE(storage_location, 'Unassigned')   AS storage_location,
+                {_CANONICAL_LOC} AS storage_location,
                 COALESCE(group_name, 'Ungrouped')          AS group_name,
                 COALESCE(item_subgroup, 'General')         AS item_subgroup,
                 COALESCE(item_mark, 'No Mark')             AS item_mark,
@@ -110,8 +124,8 @@ async def get_stock_summary(
                     THEN COALESCE(total_inventory_kgs, 0) ELSE 0 END) AS age_24_plus
             FROM {src}
             WHERE 1=1 {loc_filter}
-            GROUP BY storage_location, group_name, item_subgroup, item_mark
-            ORDER BY storage_location, group_name, item_subgroup, item_mark
+            GROUP BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
+            ORDER BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
         """)
         l3_rows = db.execute(l3_sql, params).fetchall()
 
@@ -194,12 +208,12 @@ async def get_ageing_summary(
         loc_filter = ""
         params: dict = {}
         if storage_location:
-            loc_filter = "AND storage_location = :loc"
+            loc_filter = f"AND ({_CANONICAL_LOC}) = :loc"
             params["loc"] = storage_location
 
         sql = text(f"""
             SELECT
-                COALESCE(storage_location, 'Unassigned') AS storage_location,
+                {_CANONICAL_LOC} AS storage_location,
                 COALESCE(group_name, 'Ungrouped')        AS group_name,
                 COALESCE(item_subgroup, 'General')       AS item_subgroup,
                 COALESCE(item_mark, 'No Mark')           AS item_mark,
@@ -217,8 +231,8 @@ async def get_ageing_summary(
                 SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) AS grand_total_value
             FROM {src}
             WHERE inward_dt IS NOT NULL {loc_filter}
-            GROUP BY storage_location, group_name, item_subgroup, item_mark
-            ORDER BY storage_location, group_name, item_subgroup, item_mark
+            GROUP BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
+            ORDER BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
         """)
         rows = db.execute(sql, params).fetchall()
 
@@ -269,6 +283,100 @@ async def get_ageing_summary(
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Tab 2b: Ageing Summary — Day-based brackets (<30, 30-60, 60-90, 90-180, >180)
+# ═══════════════════════════════════════════════════════════════════
+
+@router.get("/ageing-summary-days")
+async def get_ageing_summary_days(
+    company: str = Query("all"),
+    storage_location: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Same shape as /ageing-summary but with day-based brackets:
+    <30, 30-60, 60-90, 90-180, >180 days. Recomputed live from inward_dt
+    on every call so the response reflects current transactional state."""
+    tables = _resolve_tables(company)
+    src = _union_source(tables)
+
+    try:
+        loc_filter = ""
+        params: dict = {}
+        if storage_location:
+            loc_filter = f"AND ({_CANONICAL_LOC}) = :loc"
+            params["loc"] = storage_location
+
+        sql = text(f"""
+            SELECT
+                {_CANONICAL_LOC} AS storage_location,
+                COALESCE(group_name, 'Ungrouped')        AS group_name,
+                COALESCE(item_subgroup, 'General')       AS item_subgroup,
+                COALESCE(item_mark, 'No Mark')           AS item_mark,
+                SUM(CASE WHEN (CURRENT_DATE - inward_dt) < 30 THEN COALESCE(total_inventory_kgs,0) ELSE 0 END) AS kgs_lt30,
+                SUM(CASE WHEN (CURRENT_DATE - inward_dt) >= 30 AND (CURRENT_DATE - inward_dt) < 60 THEN COALESCE(total_inventory_kgs,0) ELSE 0 END) AS kgs_30_60,
+                SUM(CASE WHEN (CURRENT_DATE - inward_dt) >= 60 AND (CURRENT_DATE - inward_dt) < 90 THEN COALESCE(total_inventory_kgs,0) ELSE 0 END) AS kgs_60_90,
+                SUM(CASE WHEN (CURRENT_DATE - inward_dt) >= 90 AND (CURRENT_DATE - inward_dt) < 180 THEN COALESCE(total_inventory_kgs,0) ELSE 0 END) AS kgs_90_180,
+                SUM(CASE WHEN (CURRENT_DATE - inward_dt) >= 180 THEN COALESCE(total_inventory_kgs,0) ELSE 0 END) AS kgs_gt180,
+                SUM(CASE WHEN (CURRENT_DATE - inward_dt) < 30 THEN (COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0)) ELSE 0 END) AS val_lt30,
+                SUM(CASE WHEN (CURRENT_DATE - inward_dt) >= 30 AND (CURRENT_DATE - inward_dt) < 60 THEN (COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0)) ELSE 0 END) AS val_30_60,
+                SUM(CASE WHEN (CURRENT_DATE - inward_dt) >= 60 AND (CURRENT_DATE - inward_dt) < 90 THEN (COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0)) ELSE 0 END) AS val_60_90,
+                SUM(CASE WHEN (CURRENT_DATE - inward_dt) >= 90 AND (CURRENT_DATE - inward_dt) < 180 THEN (COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0)) ELSE 0 END) AS val_90_180,
+                SUM(CASE WHEN (CURRENT_DATE - inward_dt) >= 180 THEN (COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0)) ELSE 0 END) AS val_gt180,
+                SUM(COALESCE(total_inventory_kgs,0)) AS grand_total_kgs,
+                SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) AS grand_total_value
+            FROM {src}
+            WHERE inward_dt IS NOT NULL {loc_filter}
+            GROUP BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
+            ORDER BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
+        """)
+        rows = db.execute(sql, params).fetchall()
+
+        ZERO_B = {
+            "kgs_lt30": 0, "kgs_30_60": 0, "kgs_60_90": 0, "kgs_90_180": 0, "kgs_gt180": 0,
+            "val_lt30": 0, "val_30_60": 0, "val_60_90": 0, "val_90_180": 0, "val_gt180": 0,
+            "grand_total_kgs": 0, "grand_total_value": 0,
+        }
+
+        def _add(a, b):
+            return {k: round(a[k] + b[k], 2) for k in ZERO_B}
+
+        l3_idx: dict = {}; l2_agg: dict = {}; l1_agg: dict = {}
+
+        for r in rows:
+            entry = {
+                "kgs_lt30": _f(r.kgs_lt30), "kgs_30_60": _f(r.kgs_30_60), "kgs_60_90": _f(r.kgs_60_90),
+                "kgs_90_180": _f(r.kgs_90_180), "kgs_gt180": _f(r.kgs_gt180),
+                "val_lt30": _f(r.val_lt30), "val_30_60": _f(r.val_30_60), "val_60_90": _f(r.val_60_90),
+                "val_90_180": _f(r.val_90_180), "val_gt180": _f(r.val_gt180),
+                "grand_total_kgs": _f(r.grand_total_kgs), "grand_total_value": _f(r.grand_total_value),
+            }
+            k3 = (r.storage_location, r.group_name, r.item_subgroup)
+            l3_idx.setdefault(k3, []).append({"item_mark": r.item_mark, **entry})
+            l2_agg[k3] = _add(l2_agg.get(k3, dict(ZERO_B)), entry)
+            k1 = (r.storage_location, r.group_name)
+            l1_agg[k1] = _add(l1_agg.get(k1, dict(ZERO_B)), entry)
+
+        l2_idx: dict = {}
+        for (loc, grp, sg), agg in l2_agg.items():
+            l2_idx.setdefault((loc, grp), []).append({"item_subgroup": sg, **agg, "children": l3_idx.get((loc, grp, sg), [])})
+        for k in l2_idx:
+            l2_idx[k].sort(key=lambda x: x["item_subgroup"])
+
+        result = []
+        grand = dict(ZERO_B)
+        for (loc, grp) in sorted(l1_agg.keys()):
+            a = l1_agg[(loc, grp)]
+            grand = _add(grand, a)
+            result.append({"storage_location": loc, "group_name": grp, **a, "children": l2_idx.get((loc, grp), [])})
+
+        return {"as_of_date": date.today().isoformat(), "company": company.upper(), "data": result, "grand_total": grand}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Ageing-days summary error: %s", e)
+        raise HTTPException(500, f"Ageing-days summary error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Layer 4: Lot Details (Lazy-loaded, FIFO)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -289,7 +397,7 @@ async def get_lot_details(
             SELECT CASE WHEN SUM(COALESCE(total_inventory_kgs,0)) > 0
                 THEN SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) / SUM(COALESCE(total_inventory_kgs,0)) ELSE 0 END AS subgroup_avg_rate
             FROM {src}
-            WHERE COALESCE(storage_location,'Unassigned') = :loc
+            WHERE ({_CANONICAL_LOC}) = :loc
               AND COALESCE(group_name,'Ungrouped') = :grp
               AND COALESCE(item_subgroup,'General') = :sg
         """)
@@ -325,7 +433,7 @@ async def get_lot_details(
                     ELSE '> 24 Months'
                 END AS ageing_bracket
             FROM {src}
-            WHERE COALESCE(storage_location,'Unassigned') = :loc
+            WHERE ({_CANONICAL_LOC}) = :loc
               AND COALESCE(group_name,'Ungrouped') = :grp
               AND COALESCE(item_subgroup,'General') = :sg
               AND COALESCE(item_mark,'No Mark') = :mark
@@ -375,7 +483,7 @@ async def get_concentration(
     try:
         loc_filter = ""; params: dict = {}
         if storage_location:
-            loc_filter = "AND storage_location = :loc"; params["loc"] = storage_location
+            loc_filter = f"AND ({_CANONICAL_LOC}) = :loc"; params["loc"] = storage_location
 
         sql = text(f"""
             SELECT COALESCE(group_name,'Ungrouped') AS group_name,
@@ -444,7 +552,7 @@ async def get_inward_trend(
     try:
         loc_filter = ""; params: dict = {}
         if storage_location:
-            loc_filter = "AND storage_location = :loc"; params["loc"] = storage_location
+            loc_filter = f"AND ({_CANONICAL_LOC}) = :loc"; params["loc"] = storage_location
 
         # Monthly trend (last 12 months)
         sql = text(f"""
@@ -556,9 +664,9 @@ async def get_dashboard_storage_locations(
 
     try:
         rows = db.execute(text(f"""
-            SELECT DISTINCT storage_location FROM {src}
+            SELECT DISTINCT {_CANONICAL_LOC} AS storage_location FROM {src}
             WHERE storage_location IS NOT NULL AND storage_location != ''
-            ORDER BY storage_location
+            ORDER BY 1
         """)).fetchall()
         return {"locations": [r.storage_location for r in rows]}
     except Exception as e:
@@ -582,13 +690,13 @@ async def get_attention_flags(
     try:
         loc_filter = ""; params: dict = {}
         if storage_location:
-            loc_filter = "AND storage_location = :loc"; params["loc"] = storage_location
+            loc_filter = f"AND ({_CANONICAL_LOC}) = :loc"; params["loc"] = storage_location
 
         # Consolidated lot-level data
         sql = text(f"""
             SELECT
                 lot_no, MIN(inward_dt) AS inward_dt, MIN(inward_no) AS inward_no,
-                COALESCE(MIN(storage_location), 'Unassigned') AS storage_location,
+                MIN({_CANONICAL_LOC}) AS storage_location,
                 COALESCE(MIN(group_name), 'Ungrouped') AS group_name,
                 COALESCE(MIN(item_subgroup), 'General') AS item_subgroup,
                 COALESCE(MIN(item_mark), 'No Mark') AS item_mark,
@@ -706,12 +814,12 @@ async def get_slow_moving(
     try:
         loc_filter = ""; params: dict = {}
         if storage_location:
-            loc_filter = "AND storage_location = :loc"; params["loc"] = storage_location
+            loc_filter = f"AND ({_CANONICAL_LOC}) = :loc"; params["loc"] = storage_location
 
         sql = text(f"""
             SELECT
                 lot_no, MIN(inward_dt) AS inward_dt,
-                COALESCE(MIN(storage_location), 'Unassigned') AS storage_location,
+                MIN({_CANONICAL_LOC}) AS storage_location,
                 COALESCE(MIN(group_name), 'Ungrouped') AS group_name,
                 COALESCE(MIN(item_subgroup), 'General') AS item_subgroup,
                 COALESCE(MIN(item_mark), 'No Mark') AS item_mark,
@@ -804,17 +912,17 @@ async def get_activity_rundown(
     try:
         loc_filter = ""; params: dict = {}
         if storage_location:
-            loc_filter = "AND storage_location = :loc"; params["loc"] = storage_location
+            loc_filter = f"AND ({_CANONICAL_LOC}) = :loc"; params["loc"] = storage_location
 
         # §4A Location wise
         loc_sql = text(f"""
-            SELECT COALESCE(storage_location, 'Unassigned') AS location,
+            SELECT {_CANONICAL_LOC} AS location,
                 SUM(COALESCE(total_inventory_kgs, 0)) AS total_kgs,
                 SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) AS total_value,
                 COUNT(*) AS lot_count,
                 COUNT(DISTINCT group_name) AS group_count
             FROM {src} WHERE 1=1 {loc_filter}
-            GROUP BY storage_location ORDER BY SUM(COALESCE(total_inventory_kgs, 0)) DESC
+            GROUP BY {_CANONICAL_LOC} ORDER BY SUM(COALESCE(total_inventory_kgs, 0)) DESC
         """)
         locations = [{
             "location": r.location, "total_kgs": _f(r.total_kgs),

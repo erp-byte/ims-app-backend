@@ -405,14 +405,37 @@ def notify_job_work_material_out_created(payload: dict, header_id: int, created_
     challan_no = header.get("challan_no") or payload.get("challan_no", "")
     job_work_date = header.get("job_work_date") or payload.get("dated", "")
 
-    header_rows = _jw_table([
+    city = dispatch_to.get("city", "") or ""
+    state = dispatch_to.get("state", "") or ""
+    city_state = f"{city}, {state}".strip(", ") if (city or state) else ""
+
+    # Source → Destination summary (prominent banner above header table).
+    # When dispatching from Cold storage, the from_warehouse is "Cold storage"; if any
+    # line carries a more-specific cold_unit, use it as the source suffix.
+    source = header.get("from_warehouse", "") or "-"
+    cold_units = sorted({(it.get("cold_unit") or "").strip() for it in line_items if it.get("cold_unit")})
+    if source.lower() == "cold storage" and cold_units:
+        source = f"Cold storage ({', '.join(cold_units)})"
+    destination = header.get("to_party") or dispatch_to.get("name", "") or "-"
+    route_html = (
+        f'<div style="margin:0 0 14px;padding:10px 14px;border-left:4px solid #29417A;'
+        f'background:#f0f4fa;font-size:14px;">'
+        f'<strong style="color:#29417A;">Source → Destination:</strong> '
+        f'<span style="font-weight:600;">{source}</span> '
+        f'<span style="color:#29417A;font-weight:bold;">&rarr;</span> '
+        f'<span style="font-weight:600;">{destination}</span>'
+        f'</div>'
+    )
+
+    # Only include header fields that have actual values
+    all_header_fields = [
         ("Record ID", str(header_id)),
         ("Challan No", challan_no),
         ("Job Work Date", str(job_work_date)),
         ("From Warehouse", header.get("from_warehouse", "")),
         ("To Party", header.get("to_party") or dispatch_to.get("name", "")),
         ("Party Address", header.get("party_address") or dispatch_to.get("address", "")),
-        ("Party City / State", f"{dispatch_to.get('city', '')}, {dispatch_to.get('state', '')}"),
+        ("Party City / State", city_state),
         ("Contact Person", header.get("contact_person", "")),
         ("Contact Number", header.get("contact_number", "")),
         ("Purpose / Sub Category", header.get("purpose_of_work") or dispatch_to.get("sub_category", "")),
@@ -423,45 +446,77 @@ def notify_job_work_material_out_created(payload: dict, header_id: int, created_
         ("Dispatched Through", payload.get("dispatched_through", "")),
         ("Remarks", header.get("remarks") or payload.get("remarks", "")),
         ("Created By", created_by or "-"),
-    ])
-
-    columns = [
-        ("Sl", "sl_no"),
-        ("Item Description", "item_description"),
-        ("Material", "material_type"),
-        ("Category", "item_category"),
-        ("Sub Cat", "sub_category"),
-        ("Qty (Kgs)", "_qty_kgs"),
-        ("Qty (Boxes)", "_qty_boxes"),
-        ("Rate", "rate_per_kg"),
-        ("Amount", "amount"),
-        ("Lot No", "lot_number"),
     ]
-    normalized = []
+    filled_header_fields = [
+        (label, val) for label, val in all_header_fields
+        if val not in (None, "", "-", "None", ", ")
+    ]
+    header_rows = _jw_table(filled_header_fields)
+
+    # Build per-item summary: group by (item_description, lot_number)
+    # Use net_weight from the line directly so the email always reports NET weight,
+    # regardless of what the frontend put into quantity.kgs (which can be gross).
+    summary: dict[tuple, dict] = {}
     for it in line_items:
         qty = it.get("quantity", {}) or {}
-        normalized.append({
-            **it,
-            "item_description": it.get("item_description") or it.get("description", ""),
-            "_qty_kgs": qty.get("kgs", 0) if isinstance(qty, dict) else 0,
-            "_qty_boxes": qty.get("boxes", 0) if isinstance(qty, dict) else 0,
-        })
+        desc = it.get("item_description") or it.get("description", "") or "-"
+        lot = it.get("lot_number") or "-"
+        category = it.get("item_category") or "-"
+        key = (desc, lot, category)
+        try:
+            kgs = float(it.get("net_weight") or 0)
+        except (TypeError, ValueError):
+            kgs = 0.0
+        boxes = qty.get("boxes", 0) if isinstance(qty, dict) else 0
+        if key not in summary:
+            summary[key] = {"item_description": desc, "lot_number": lot, "category": category, "total_kgs": 0, "total_boxes": 0}
+        summary[key]["total_kgs"] += kgs
+        summary[key]["total_boxes"] += boxes
 
-    line_rows = _jw_lines_html(normalized, columns)
-    header_cells = "".join(
-        f'<th style="padding:8px 10px;text-align:left;">{label}</th>' for label, _ in columns
+    summary_rows = ""
+    grand_kgs = 0.0
+    grand_boxes = 0
+    for i, entry in enumerate(summary.values(), 1):
+        grand_kgs += entry["total_kgs"]
+        grand_boxes += entry["total_boxes"]
+        summary_rows += (
+            f'<tr style="background:{"#fff" if i % 2 else "#f8f9fa"};">'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{i}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{entry["item_description"]}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{entry["category"]}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{entry["total_kgs"]:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{entry["total_boxes"]}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{entry["lot_number"]}</td>'
+            f'</tr>'
+        )
+    if not summary_rows:
+        summary_rows = '<tr><td colspan="6" style="text-align:center;padding:8px;">No line items</td></tr>'
+    else:
+        summary_rows += (
+            f'<tr style="background:#e8edf5;font-weight:bold;">'
+            f'<td colspan="3" style="padding:6px 10px;border:1px solid #e0e0e0;">Total</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{grand_kgs:g} Kgs</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{grand_boxes} Boxes</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;"></td>'
+            f'</tr>'
+        )
+
+    summary_headers = "".join(
+        f'<th style="padding:8px 10px;text-align:left;">{h}</th>'
+        for h in ["Sl", "Item Description", "Category", "Net Wt (Kgs)", "Qty (Boxes)", "Lot No"]
     )
 
     body = f"""
+      {route_html}
       <h3 style="color:#29417A;margin:0 0 8px;">Header Details</h3>
       <table style="border-collapse:collapse;width:100%;font-size:13px;">
         <tbody>{header_rows}</tbody>
       </table>
 
-      <h3 style="color:#29417A;margin:24px 0 8px;">Line Items</h3>
+      <h3 style="color:#29417A;margin:24px 0 8px;">Material Summary</h3>
       <table style="border-collapse:collapse;width:100%;font-size:13px;">
-        <thead><tr style="background:#29417A;color:#fff;">{header_cells}</tr></thead>
-        <tbody>{line_rows}</tbody>
+        <thead><tr style="background:#29417A;color:#fff;">{summary_headers}</tr></thead>
+        <tbody>{summary_rows}</tbody>
       </table>
     """
 
@@ -474,20 +529,19 @@ def notify_job_work_material_out_created(payload: dict, header_id: int, created_
     plain_lines = [
         f"Job Work Material Out Created — Challan: {challan_no} (ID {header_id})",
         f"Date: {job_work_date}",
-        f"From: {header.get('from_warehouse', '')}",
-        f"To: {header.get('to_party') or dispatch_to.get('name', '')}",
+        f"Source → Destination: {source}  →  {destination}",
         f"Purpose: {header.get('purpose_of_work') or dispatch_to.get('sub_category', '')}",
         f"Vehicle: {header.get('vehicle_no') or payload.get('motor_vehicle_no', '')}",
         f"Created By: {created_by or '-'}",
         "",
-        "Line Items:",
+        "Material Summary:",
     ]
-    for it in normalized:
+    for entry in summary.values():
         plain_lines.append(
-            f"  {it.get('item_description', '')} | "
-            f"{it.get('_qty_kgs', 0)} kg / {it.get('_qty_boxes', 0)} box | "
-            f"Rate: {it.get('rate_per_kg', 0)} | Amount: {it.get('amount', 0)}"
+            f"  {entry['item_description']} | Lot: {entry['lot_number']} | "
+            f"{entry['total_kgs']:g} Kgs / {entry['total_boxes']} Boxes"
         )
+    plain_lines.append(f"  TOTAL: {grand_kgs:g} Kgs / {grand_boxes} Boxes")
 
     cc = list(JOB_WORK_CC)
     if created_by and created_by not in cc and created_by != JOB_WORK_TO:
@@ -542,7 +596,6 @@ def notify_job_work_material_in_created(payload: dict, ir_number: str, inward_re
             ("Box #", "box_number"),
             ("Item", "item_description"),
             ("Net Wt", "net_weight"),
-            ("Gross Wt", "gross_weight"),
             ("Lot No", "lot_no"),
             ("Location", "storage_location"),
         ]
@@ -602,7 +655,7 @@ def notify_job_work_material_in_created(payload: dict, ir_number: str, inward_re
         for b in boxes:
             plain_lines.append(
                 f"  {b.get('item_description', '')} Box#{b.get('box_number', '')} | "
-                f"Net: {b.get('net_weight', 0)} | Gross: {b.get('gross_weight', 0)} | "
+                f"Net: {b.get('net_weight', 0)} | "
                 f"Lot: {b.get('lot_no', '-')}"
             )
 
@@ -621,56 +674,109 @@ def notify_job_work_material_in_created(payload: dict, ir_number: str, inward_re
 def notify_job_work_material_out_updated(payload: dict, record_id: int, updated_by: str) -> None:
     """Send notification email when a Job Work Material Out is updated."""
     header = payload.get("header", {}) or {}
+    dispatch_to = payload.get("dispatch_to", {}) or {}
     line_items = payload.get("line_items", []) or []
 
     challan_no = header.get("challan_no") or payload.get("challan_no", "")
     job_work_date = header.get("job_work_date") or payload.get("dated", "")
 
-    header_rows = _jw_table([
+    # Source → Destination summary (prominent banner above header table).
+    # When dispatching from Cold storage, the from_warehouse is "Cold storage"; if any
+    # line carries a more-specific cold_unit, use it as the source suffix.
+    source = header.get("from_warehouse", "") or "-"
+    cold_units = sorted({(it.get("cold_unit") or "").strip() for it in line_items if it.get("cold_unit")})
+    if source.lower() == "cold storage" and cold_units:
+        source = f"Cold storage ({', '.join(cold_units)})"
+    destination = header.get("to_party") or dispatch_to.get("name", "") or "-"
+    route_html = (
+        f'<div style="margin:0 0 14px;padding:10px 14px;border-left:4px solid #29417A;'
+        f'background:#f0f4fa;font-size:14px;">'
+        f'<strong style="color:#29417A;">Source → Destination:</strong> '
+        f'<span style="font-weight:600;">{source}</span> '
+        f'<span style="color:#29417A;font-weight:bold;">&rarr;</span> '
+        f'<span style="font-weight:600;">{destination}</span>'
+        f'</div>'
+    )
+
+    all_header_fields = [
         ("Record ID", str(record_id)),
         ("Challan No", challan_no),
         ("Date", str(job_work_date)),
         ("Warehouse", header.get("from_warehouse", "")),
-        ("Party", header.get("to_party", "")),
-        ("Purpose", header.get("purpose_of_work", "")),
+        ("Party", header.get("to_party") or dispatch_to.get("name", "")),
+        ("Purpose", header.get("purpose_of_work") or dispatch_to.get("sub_category", "")),
         ("Vehicle No", header.get("vehicle_no") or payload.get("motor_vehicle_no", "")),
+        ("Remarks", header.get("remarks") or payload.get("remarks", "")),
         ("Updated By", updated_by or "-"),
-    ])
-
-    columns = [
-        ("Sl", "sl_no"),
-        ("Item Description", "item_description"),
-        ("Material", "material_type"),
-        ("Qty (Kgs)", "_qty_kgs"),
-        ("Qty (Boxes)", "_qty_boxes"),
-        ("Rate", "rate_per_kg"),
-        ("Amount", "amount"),
     ]
-    normalized = []
+    filled_header_fields = [
+        (label, val) for label, val in all_header_fields
+        if val not in (None, "", "-", "None")
+    ]
+    header_rows = _jw_table(filled_header_fields)
+
+    # Use net_weight directly so the email always reports NET weight, not gross.
+    summary: dict[tuple, dict] = {}
     for it in line_items:
         qty = it.get("quantity", {}) or {}
-        normalized.append({
-            **it,
-            "item_description": it.get("item_description") or it.get("description", ""),
-            "_qty_kgs": qty.get("kgs", 0) if isinstance(qty, dict) else 0,
-            "_qty_boxes": qty.get("boxes", 0) if isinstance(qty, dict) else 0,
-        })
+        desc = it.get("item_description") or it.get("description", "") or "-"
+        lot = it.get("lot_number") or "-"
+        category = it.get("item_category") or "-"
+        key = (desc, lot, category)
+        try:
+            kgs = float(it.get("net_weight") or 0)
+        except (TypeError, ValueError):
+            kgs = 0.0
+        boxes = qty.get("boxes", 0) if isinstance(qty, dict) else 0
+        if key not in summary:
+            summary[key] = {"item_description": desc, "lot_number": lot, "category": category, "total_kgs": 0, "total_boxes": 0}
+        summary[key]["total_kgs"] += kgs
+        summary[key]["total_boxes"] += boxes
 
-    line_rows = _jw_lines_html(normalized, columns)
-    header_cells = "".join(
-        f'<th style="padding:8px 10px;text-align:left;">{label}</th>' for label, _ in columns
+    summary_rows = ""
+    grand_kgs = 0.0
+    grand_boxes = 0
+    for i, entry in enumerate(summary.values(), 1):
+        grand_kgs += entry["total_kgs"]
+        grand_boxes += entry["total_boxes"]
+        summary_rows += (
+            f'<tr style="background:{"#fff" if i % 2 else "#f8f9fa"};">'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{i}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{entry["item_description"]}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{entry["category"]}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{entry["total_kgs"]:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{entry["total_boxes"]}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{entry["lot_number"]}</td>'
+            f'</tr>'
+        )
+    if not summary_rows:
+        summary_rows = '<tr><td colspan="6" style="text-align:center;padding:8px;">No line items</td></tr>'
+    else:
+        summary_rows += (
+            f'<tr style="background:#e8edf5;font-weight:bold;">'
+            f'<td colspan="3" style="padding:6px 10px;border:1px solid #e0e0e0;">Total</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{grand_kgs:g} Kgs</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{grand_boxes} Boxes</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;"></td>'
+            f'</tr>'
+        )
+
+    summary_headers = "".join(
+        f'<th style="padding:8px 10px;text-align:left;">{h}</th>'
+        for h in ["Sl", "Item Description", "Category", "Net Wt (Kgs)", "Qty (Boxes)", "Lot No"]
     )
 
     body = f"""
+      {route_html}
       <h3 style="color:#29417A;margin:0 0 8px;">Header Details</h3>
       <table style="border-collapse:collapse;width:100%;font-size:13px;">
         <tbody>{header_rows}</tbody>
       </table>
 
-      <h3 style="color:#29417A;margin:24px 0 8px;">Line Items</h3>
+      <h3 style="color:#29417A;margin:24px 0 8px;">Material Summary</h3>
       <table style="border-collapse:collapse;width:100%;font-size:13px;">
-        <thead><tr style="background:#29417A;color:#fff;">{header_cells}</tr></thead>
-        <tbody>{line_rows}</tbody>
+        <thead><tr style="background:#29417A;color:#fff;">{summary_headers}</tr></thead>
+        <tbody>{summary_rows}</tbody>
       </table>
     """
 
@@ -680,10 +786,20 @@ def notify_job_work_material_out_updated(payload: dict, record_id: int, updated_
         body_html=body,
     )
 
-    plain = (
-        f"Job Work Material Out Updated — Challan: {challan_no} (ID {record_id})\n"
-        f"Updated By: {updated_by or '-'}"
-    )
+    plain_lines = [
+        f"Job Work Material Out Updated — Challan: {challan_no} (ID {record_id})",
+        f"Updated By: {updated_by or '-'}",
+        f"Source → Destination: {source}  →  {destination}",
+        "",
+        "Material Summary:",
+    ]
+    for entry in summary.values():
+        plain_lines.append(
+            f"  {entry['item_description']} | Lot: {entry['lot_number']} | "
+            f"{entry['total_kgs']:g} Kgs / {entry['total_boxes']} Boxes"
+        )
+    if summary:
+        plain_lines.append(f"  TOTAL: {grand_kgs:g} Kgs / {grand_boxes} Boxes")
 
     cc = list(JOB_WORK_CC)
     if updated_by and updated_by not in cc and updated_by != JOB_WORK_TO:
@@ -691,7 +807,7 @@ def notify_job_work_material_out_updated(payload: dict, record_id: int, updated_
     _send_email_background(
         subject=f"Job Work Material Out Updated: {challan_no or record_id}",
         html_body=html,
-        plain_body=plain,
+        plain_body="\n".join(plain_lines),
         to=JOB_WORK_TO,
         cc=cc,
     )

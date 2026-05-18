@@ -1,4 +1,6 @@
+import json
 import time
+from datetime import datetime
 from typing import Optional
 
 from fastapi import HTTPException
@@ -552,3 +554,328 @@ def bulk_delete_cold_storage(record_ids: list[int], db: Session) -> dict:
     db.commit()
     logger.info("Bulk deleted %s cold storage records", deleted)
     return {"success": True, "message": f"{deleted} record(s) deleted", "deleted_count": deleted}
+
+
+# ── Direct Out ───────────────────────────────
+
+DIRECT_OUT_COLS = (
+    "id, transaction_no, transaction_type, company, entry_date, authority_person, "
+    "to_customer, warehouse, vehicle_no, invoice_no, remarks, lines, line_count, "
+    "total_issue_qty, status, created_by, created_at, updated_at, removed_stock_snapshot"
+)
+
+
+def _direct_out_table(company: str) -> str:
+    return f"{company.lower()}_cold_storage_direct_out"
+
+
+def _map_direct_out_row(row) -> dict:
+    lines_val = row.lines
+    if isinstance(lines_val, str):
+        try:
+            lines_val = json.loads(lines_val)
+        except Exception:
+            lines_val = []
+    snap_val = getattr(row, "removed_stock_snapshot", None) or []
+    if isinstance(snap_val, str):
+        try:
+            snap_val = json.loads(snap_val)
+        except Exception:
+            snap_val = []
+    return {
+        "removed_stock_snapshot": snap_val,
+        "id": row.id,
+        "transaction_no": row.transaction_no,
+        "transaction_type": row.transaction_type,
+        "company": row.company,
+        "entry_date": row.entry_date,
+        "authority_person": row.authority_person,
+        "to_customer": row.to_customer,
+        "warehouse": row.warehouse,
+        "vehicle_no": row.vehicle_no,
+        "invoice_no": row.invoice_no,
+        "remarks": row.remarks,
+        "lines": lines_val or [],
+        "line_count": row.line_count,
+        "total_issue_qty": float(row.total_issue_qty) if row.total_issue_qty is not None else None,
+        "status": row.status,
+        "created_by": row.created_by,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def create_direct_out(payload, db: Session) -> dict:
+    company = payload.company
+    table = _direct_out_table(company)
+    stocks_table = f"{company.lower()}_cold_stocks"
+
+    transaction_no = f"DO-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    lines_list = [l.model_dump() for l in payload.lines]
+    total_issue_qty = sum(float(l.issue_qty or 0) for l in payload.lines)
+
+    # ── Snapshot + delete the picked stock rows ──────────────
+    # Each row in cold_stocks = ONE carton/box. The form lets the user type
+    # issue_qty per line, which is interpreted as "number of boxes from this lot,
+    # starting with the picked box_id and continuing FIFO by id".
+    snapshot: list[dict] = []
+    all_ids_to_delete: list[int] = []
+
+    for line in payload.lines:
+        if line.stock_id is None:
+            continue
+        qty = max(1, int(line.issue_qty or 1))
+
+        # Pick the user's selected row first, then fill remainder from the same
+        # lot (other unissued boxes) ordered by id ASC. Exclude any ids already
+        # claimed by earlier lines in this same submission.
+        picked = db.execute(
+            text(
+                f"SELECT to_jsonb(t) AS row, t.id FROM {stocks_table} t "
+                f"WHERE t.id = :sid AND NOT (t.id = ANY(:taken))"
+            ),
+            {"sid": int(line.stock_id), "taken": all_ids_to_delete or [0]},
+        ).fetchone()
+        if not picked:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Stock row {line.stock_id} no longer available (already issued?)",
+            )
+        snapshot.append(picked.row)
+        all_ids_to_delete.append(picked.id)
+
+        remaining = qty - 1
+        if remaining > 0:
+            extras = db.execute(
+                text(
+                    f"SELECT to_jsonb(t) AS row, t.id FROM {stocks_table} t "
+                    f"WHERE t.lot_no = :lot AND NOT (t.id = ANY(:taken)) "
+                    f"ORDER BY t.id ASC LIMIT :lim"
+                ),
+                {
+                    "lot": line.lot_no,
+                    "taken": all_ids_to_delete,
+                    "lim": remaining,
+                },
+            ).fetchall()
+            if len(extras) < remaining:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Not enough boxes for lot {line.lot_no}: "
+                        f"requested {qty}, only {1 + len(extras)} available."
+                    ),
+                )
+            for ex in extras:
+                snapshot.append(ex.row)
+                all_ids_to_delete.append(ex.id)
+
+    snapshot_json = json.dumps(snapshot)
+    if all_ids_to_delete:
+        db.execute(
+            text(f"DELETE FROM {stocks_table} WHERE id = ANY(:ids)"),
+            {"ids": all_ids_to_delete},
+        )
+
+    params = {
+        "transaction_no": transaction_no,
+        "transaction_type": payload.transaction_type,
+        "company": company,
+        "entry_date": payload.entry_date,
+        "authority_person": payload.authority_person,
+        "to_customer": payload.to_customer,
+        "warehouse": payload.warehouse,
+        "vehicle_no": payload.vehicle_no,
+        "invoice_no": payload.invoice_no,
+        "remarks": payload.remarks,
+        "lines": json.dumps(lines_list),
+        "removed_stock_snapshot": snapshot_json,
+        "total_issue_qty": total_issue_qty,
+        "created_by": payload.created_by,
+    }
+
+    row = db.execute(
+        text(
+            f"INSERT INTO {table} ("
+            "transaction_no, transaction_type, company, entry_date, authority_person, "
+            "to_customer, warehouse, vehicle_no, invoice_no, remarks, lines, "
+            "removed_stock_snapshot, total_issue_qty, created_by"
+            ") VALUES ("
+            ":transaction_no, :transaction_type, :company, :entry_date, :authority_person, "
+            ":to_customer, :warehouse, :vehicle_no, :invoice_no, :remarks, CAST(:lines AS jsonb), "
+            "CAST(:removed_stock_snapshot AS jsonb), :total_issue_qty, :created_by"
+            f") RETURNING {DIRECT_OUT_COLS}"
+        ),
+        params,
+    ).fetchone()
+
+    db.commit()
+    logger.info(
+        "Created direct out %s for %s — removed %d stock rows",
+        transaction_no, company, len(all_ids_to_delete),
+    )
+    return _map_direct_out_row(row)
+
+
+def list_direct_out(
+    company: str,
+    page: int,
+    per_page: int,
+    search: Optional[str],
+    from_date: Optional[str],
+    to_date: Optional[str],
+    warehouse: Optional[str],
+    db: Session,
+) -> dict:
+    table = _direct_out_table(company)
+    conditions = []
+    params: dict = {}
+
+    if search:
+        conditions.append(
+            "(transaction_no ILIKE :search OR to_customer ILIKE :search OR invoice_no ILIKE :search)"
+        )
+        params["search"] = f"%{search}%"
+    if from_date:
+        conditions.append("entry_date >= :from_date")
+        params["from_date"] = from_date
+    if to_date:
+        conditions.append("entry_date <= :to_date")
+        params["to_date"] = to_date
+    if warehouse:
+        conditions.append("warehouse = :warehouse")
+        params["warehouse"] = warehouse
+
+    where = " AND ".join(conditions) if conditions else "1=1"
+
+    total = db.execute(
+        text(f"SELECT COUNT(*) AS cnt FROM {table} WHERE {where}"),
+        params,
+    ).scalar() or 0
+
+    offset = (page - 1) * per_page
+    params["limit"] = per_page
+    params["offset"] = offset
+
+    rows = db.execute(
+        text(
+            f"SELECT {DIRECT_OUT_COLS} FROM {table} WHERE {where} "
+            f"ORDER BY entry_date DESC, id DESC "
+            f"LIMIT :limit OFFSET :offset"
+        ),
+        params,
+    ).fetchall()
+
+    return {
+        "records": [_map_direct_out_row(r) for r in rows],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+    }
+
+
+def get_direct_out(company: str, transaction_no: str, db: Session) -> dict:
+    table = _direct_out_table(company)
+    row = db.execute(
+        text(f"SELECT {DIRECT_OUT_COLS} FROM {table} WHERE transaction_no = :tn"),
+        {"tn": transaction_no},
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Direct Out record not found")
+    return _map_direct_out_row(row)
+
+
+# Header-only fields editable via PUT. Lines + snapshot are intentionally NOT
+# editable here — changing line items requires delete + recreate so stock stays
+# consistent.
+DIRECT_OUT_EDITABLE = (
+    "entry_date", "authority_person", "to_customer",
+    "warehouse", "vehicle_no", "invoice_no", "remarks",
+)
+
+
+def update_direct_out(company: str, transaction_no: str, patch: dict, db: Session) -> dict:
+    table = _direct_out_table(company)
+
+    cols = [c for c in DIRECT_OUT_EDITABLE if c in patch]
+    if not cols:
+        raise HTTPException(status_code=400, detail="No editable fields provided")
+
+    set_clause = ", ".join(f"{c} = :{c}" for c in cols)
+    params = {c: patch[c] for c in cols}
+    params["tn"] = transaction_no
+
+    row = db.execute(
+        text(
+            f"UPDATE {table} SET {set_clause}, updated_at = NOW() "
+            f"WHERE transaction_no = :tn RETURNING {DIRECT_OUT_COLS}"
+        ),
+        params,
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Direct Out record not found")
+
+    db.commit()
+    logger.info("Updated direct-out %s (%s) — fields: %s", transaction_no, company, cols)
+    return _map_direct_out_row(row)
+
+
+# Hard-coded allowlist — only this email can delete Direct Out records.
+DIRECT_OUT_DELETE_ALLOWED_EMAILS = {"yash@candorfoods.in"}
+
+
+def delete_direct_out(
+    company: str,
+    transaction_no: str,
+    requested_by_email: Optional[str],
+    db: Session,
+) -> dict:
+    if not requested_by_email or requested_by_email.lower() not in DIRECT_OUT_DELETE_ALLOWED_EMAILS:
+        raise HTTPException(status_code=403, detail="Not authorized to delete Direct Out records")
+
+    table = _direct_out_table(company)
+    stocks_table = f"{company.lower()}_cold_stocks"
+
+    # Fetch the snapshot before deleting the direct-out record
+    snap_row = db.execute(
+        text(f"SELECT removed_stock_snapshot FROM {table} WHERE transaction_no = :tn"),
+        {"tn": transaction_no},
+    ).fetchone()
+    if not snap_row:
+        raise HTTPException(status_code=404, detail="Direct Out record not found")
+
+    snapshot = snap_row.removed_stock_snapshot or []
+    if isinstance(snapshot, str):
+        snapshot = json.loads(snapshot)
+
+    restored = 0
+    if snapshot:
+        # jsonb_populate_recordset rebuilds rows with original column types
+        result = db.execute(
+            text(
+                f"INSERT INTO {stocks_table} "
+                f"SELECT * FROM jsonb_populate_recordset(NULL::{stocks_table}, CAST(:snap AS jsonb)) "
+                f"ON CONFLICT (id) DO NOTHING"
+            ),
+            {"snap": json.dumps(snapshot)},
+        )
+        restored = result.rowcount or 0
+
+        # Keep id sequence ahead of any restored ids
+        db.execute(
+            text(
+                f"SELECT setval(pg_get_serial_sequence('{stocks_table}', 'id'), "
+                f"GREATEST((SELECT COALESCE(MAX(id), 1) FROM {stocks_table}), 1))"
+            )
+        )
+
+    db.execute(
+        text(f"DELETE FROM {table} WHERE transaction_no = :tn"),
+        {"tn": transaction_no},
+    )
+    db.commit()
+    logger.info(
+        "Deleted direct-out %s (%s) by %s — restored %d stock rows",
+        transaction_no, company, requested_by_email, restored,
+    )
+    return {"success": True, "transaction_no": transaction_no, "restored_stock_rows": restored}

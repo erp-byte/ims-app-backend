@@ -1,6 +1,6 @@
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Header, Query
 from sqlalchemy.orm import Session
 
 from shared.database import get_db
@@ -19,6 +19,10 @@ from services.cold_storage_service.models import (
     ColdStorageBoxUpsertResponse,
     ColdStorageApprovalRequest,
     ColdStorageApprovalResponse,
+    DirectOutCreate,
+    DirectOutRecord,
+    DirectOutListResponse,
+    DirectOutUpdate,
 )
 from services.cold_storage_service.tools import (
     list_cold_storage,
@@ -33,6 +37,11 @@ from services.cold_storage_service.tools import (
     list_boxes,
     upsert_box,
     lookup_box,
+    create_direct_out,
+    delete_direct_out,
+    list_direct_out,
+    update_direct_out,
+    get_direct_out,
 )
 
 router = APIRouter(prefix="/cold-storage", tags=["cold-storage"])
@@ -106,6 +115,73 @@ def bulk_delete_endpoint(
 ):
     """Delete multiple cold storage records by IDs."""
     return bulk_delete_cold_storage(record_ids, db)
+
+
+# ── Direct Out endpoints (before /{record_id} to avoid path conflict) ──
+
+
+@router.post("/direct-out", response_model=DirectOutRecord, status_code=201)
+def create_direct_out_endpoint(
+    data: DirectOutCreate,
+    db: Session = Depends(get_db),
+):
+    return create_direct_out(data, db)
+
+
+@router.get("/direct-out/{company}", response_model=DirectOutListResponse)
+def list_direct_out_endpoint(
+    company: Literal["CFPL", "CDPL"],
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=500),
+    search: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+    warehouse: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    return list_direct_out(
+        company=company,
+        page=page,
+        per_page=per_page,
+        search=search,
+        from_date=from_date,
+        to_date=to_date,
+        warehouse=warehouse,
+        db=db,
+    )
+
+
+@router.get("/direct-out/{company}/{transaction_no}", response_model=DirectOutRecord)
+def get_direct_out_endpoint(
+    company: Literal["CFPL", "CDPL"],
+    transaction_no: str,
+    db: Session = Depends(get_db),
+):
+    return get_direct_out(company, transaction_no, db)
+
+
+@router.put("/direct-out/{company}/{transaction_no}", response_model=DirectOutRecord)
+def update_direct_out_endpoint(
+    company: Literal["CFPL", "CDPL"],
+    transaction_no: str,
+    patch: DirectOutUpdate,
+    db: Session = Depends(get_db),
+):
+    return update_direct_out(
+        company, transaction_no,
+        patch.model_dump(exclude_unset=True),
+        db,
+    )
+
+
+@router.delete("/direct-out/{company}/{transaction_no}")
+def delete_direct_out_endpoint(
+    company: Literal["CFPL", "CDPL"],
+    transaction_no: str,
+    x_user_email: Optional[str] = Header(None, alias="X-User-Email"),
+    db: Session = Depends(get_db),
+):
+    return delete_direct_out(company, transaction_no, x_user_email, db)
 
 
 # ── Box endpoints (before /{record_id} to avoid path conflict) ──

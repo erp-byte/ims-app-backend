@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, List, Optional
+from typing import Annotated, Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -156,3 +156,75 @@ class ColdStorageApprovalResponse(BaseModel):
     id: int
     approved_by: str
     approved_at: Optional[str] = None
+
+
+# ── Direct Out schemas ───────────────────────
+
+
+class DirectOutLine(BaseModel):
+    stock_id: int
+    item_description: Optional[str] = None
+    lot_no: Optional[str] = None
+    inward_no: Optional[str] = None
+    item_mark: Optional[str] = None
+    issue_qty: float
+    uom: Optional[str] = None
+    unit: Optional[str] = None  # from cold_stocks.unit (e.g. D-39, D-514)
+    warehouse: Optional[str] = None
+    box_id: Optional[str] = None
+    transaction_no: Optional[str] = None
+    weight_kg_per_box: Optional[float] = None
+
+
+class DirectOutCreate(BaseModel):
+    transaction_type: Literal["DIRECT_OUT"] = "DIRECT_OUT"
+    company: Literal["CFPL", "CDPL"]
+    entry_date: str
+    authority_person: str
+    to_customer: str
+    warehouse: Optional[str] = None  # made optional — per-line warehouse comes from each stock row
+    vehicle_no: Optional[str] = None
+    invoice_no: Optional[str] = None
+    remarks: Optional[str] = None
+    lines: List[DirectOutLine]
+    created_by: Optional[str] = None
+
+
+class DirectOutRecord(BaseModel):
+    id: int
+    transaction_no: str
+    transaction_type: str
+    company: Optional[str] = None
+    entry_date: Optional[date] = None
+    authority_person: Optional[str] = None
+    to_customer: Optional[str] = None
+    warehouse: Optional[str] = None
+    vehicle_no: Optional[str] = None
+    invoice_no: Optional[str] = None
+    remarks: Optional[str] = None
+    lines: List[Any] = []
+    removed_stock_snapshot: List[Any] = []
+    line_count: Optional[int] = None
+    total_issue_qty: Optional[float] = None
+    status: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class DirectOutUpdate(BaseModel):
+    """Header-only patch. Article entries are NOT editable here."""
+    entry_date: Optional[str] = None
+    authority_person: Optional[str] = None
+    to_customer: Optional[str] = None
+    warehouse: Optional[str] = None
+    vehicle_no: Optional[str] = None
+    invoice_no: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class DirectOutListResponse(BaseModel):
+    records: List[DirectOutRecord] = []
+    total: int = 0
+    page: int = 1
+    per_page: int = 20

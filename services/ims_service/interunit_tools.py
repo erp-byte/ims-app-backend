@@ -604,6 +604,28 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
     # Insert boxes (if provided)
     boxes = []
     if data.boxes:
+        # Reject duplicate (box_id, transaction_no) pairs within the same transfer.
+        # Cold-storage box_ids must be unique per physical box; duplicates here mean
+        # the frontend fell back to a single cs_box_id for many boxes (see
+        # TRANS202605131331 incident) — saving would silently lose inventory on receive
+        # because the Transfer-In ON CONFLICT collapses duplicates.
+        seen_keys: set = set()
+        for box in data.boxes:
+            bid = (box.box_id or "").strip()
+            tno = (box.transaction_no or "").strip()
+            if bid and tno and tno != "DIRECT":
+                key = (bid, tno)
+                if key in seen_keys:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Duplicate box_id '{bid}' for transaction '{tno}' in this transfer. "
+                            "Every physical box must carry a unique box_id — re-add the cold-storage "
+                            "item so per-box IDs are fetched via FIFO."
+                        ),
+                    )
+                seen_keys.add(key)
+
         # Build article-to-line-id lookup for correct box-to-line association
         line_id_by_article: dict = {}
         for l in lines:
@@ -998,6 +1020,28 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
     # Insert boxes (if provided)
     boxes = []
     if data.boxes:
+        # Reject duplicate (box_id, transaction_no) pairs within the same transfer.
+        # Cold-storage box_ids must be unique per physical box; duplicates here mean
+        # the frontend fell back to a single cs_box_id for many boxes (see
+        # TRANS202605131331 incident) — saving would silently lose inventory on receive
+        # because the Transfer-In ON CONFLICT collapses duplicates.
+        seen_keys: set = set()
+        for box in data.boxes:
+            bid = (box.box_id or "").strip()
+            tno = (box.transaction_no or "").strip()
+            if bid and tno and tno != "DIRECT":
+                key = (bid, tno)
+                if key in seen_keys:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Duplicate box_id '{bid}' for transaction '{tno}' in this transfer. "
+                            "Every physical box must carry a unique box_id — re-add the cold-storage "
+                            "item so per-box IDs are fetched via FIFO."
+                        ),
+                    )
+                seen_keys.add(key)
+
         # Build article-to-line-id lookup for correct box-to-line association
         line_id_by_article: dict = {}
         for l in lines:

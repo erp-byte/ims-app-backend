@@ -1477,12 +1477,16 @@ def _insert_cold_storage_items(header_id: int, cold_storage_items, challan_no: s
             continue
 
         if cs_item.box_details:
-            # Per-box insert: one row per box in cold stocks
+            # Per-box insert: one row per box in cold stocks.
+            # Rate is ₹/kg, so each box carries the same rate; value is computed
+            # per-box as (box weight × rate) so heavier boxes carry more value.
             num_boxes = len(cs_item.box_details)
-            rate_per_box = (cs_item.rate / num_boxes) if (cs_item.rate and num_boxes > 0) else cs_item.rate
-            value_per_box = (cs_item.value / num_boxes) if (cs_item.value and num_boxes > 0) else cs_item.value
+            rate_kg = cs_item.rate or 0
 
             for box_detail in cs_item.box_details:
+                box_weight = float(box_detail.weight_kg or 0)
+                rate_per_box = rate_kg or None
+                value_per_box = (box_weight * rate_kg) if (rate_kg and box_weight) else None
                 db.execute(
                     text(f"""
                         INSERT INTO {cold_table}

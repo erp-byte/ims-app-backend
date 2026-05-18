@@ -1273,11 +1273,17 @@ def submit_material_in(
             "spl_remarks": box.get("spl_remarks", ""),
         })
 
-    # Insert into cfpl_cold_stocks / cdpl_cold_stocks if cold storage material-in
+    # Insert into cfpl_cold_stocks / cdpl_cold_stocks if cold storage material-in.
+    # Route by cold_company when provided; otherwise infer from inward_warehouse.
     cold_company = payload.get("cold_company", "")
     cold_inward_date = payload.get("cold_inward_date", "")
-    if cold_company and boxes:
+    inward_warehouse = payload.get("inward_warehouse", "")
+    cold_table = None
+    if cold_company:
         cold_table = "cfpl_cold_stocks" if cold_company == "cfpl" else "cdpl_cold_stocks"
+    elif inward_warehouse:
+        cold_table = _resolve_cold_table(inward_warehouse)
+    if cold_table and boxes:
         for box in boxes:
             weight = float(box.get("net_weight", 0))
             rate_val = float(box.get("rate", 0))
@@ -1297,7 +1303,9 @@ def submit_material_in(
                      :box_id, :transaction_no, :spl_remarks)
             """), {
                 "inward_dt": _parse_date_to_iso(cold_inward_date or payload.get("received_date", "")),
-                "unit": box.get("storage_location", ""),
+                # `unit` carries the warehouse code (Savla D-39 / Savla D-514 / Rishi)
+                # so D-39 and D-514 stay disambiguated in the cold-stock table.
+                "unit": inward_warehouse or box.get("storage_location", ""),
                 "inward_no": payload.get("challan_no", ""),
                 "item_description": box.get("item_description", ""),
                 "item_mark": box.get("item_mark", ""),

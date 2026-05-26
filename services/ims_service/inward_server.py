@@ -436,8 +436,13 @@ def approve_inward_endpoint(
 
 
 @router.get("/{company}/{transaction_no}")
-def get_inward_endpoint(company: Company, transaction_no: str, db: Session = Depends(get_db)):
-    return get_inward(company, transaction_no, db)
+def get_inward_endpoint(
+    company: Company,
+    transaction_no: str,
+    page: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    return get_inward(company, transaction_no, db, page=page)
 
 
 @router.put("/{company}/{transaction_no}")

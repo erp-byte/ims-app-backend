@@ -2050,7 +2050,7 @@ def create_inward_bulk_sticker(payload, db: Session) -> dict:
 
 
 
-def get_inward(company: Company, transaction_no: str, db: Session) -> dict:
+def get_inward(company: Company, transaction_no: str, db: Session, page: Optional[int] = None) -> dict:
 
     tables = table_names(company)
 
@@ -2125,6 +2125,13 @@ def get_inward(company: Company, transaction_no: str, db: Session) -> dict:
 
 
 
+        box_params: dict = {"txno": transaction_no}
+        box_pagination_sql = ""
+        if page is not None and page >= 1:
+            box_params["limit"] = 200
+            box_params["offset"] = (page - 1) * 200
+            box_pagination_sql = " LIMIT :limit OFFSET :offset"
+
         boxes_res = db.execute(
 
             text(f"""
@@ -2133,11 +2140,11 @@ def get_inward(company: Company, transaction_no: str, db: Session) -> dict:
 
                 WHERE transaction_no = :txno
 
-                ORDER BY article_description ASC, box_number ASC
+                ORDER BY article_description ASC, box_number ASC{box_pagination_sql}
 
             """),
 
-            {"txno": transaction_no},
+            box_params,
 
         ).fetchall()
 

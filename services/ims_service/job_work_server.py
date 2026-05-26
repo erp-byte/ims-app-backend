@@ -699,7 +699,7 @@ def update_material_out(
 @router.get("/list")
 def list_job_work_records(
     page: int = Query(1, ge=1),
-    per_page: int = Query(15, ge=1, le=100),
+    per_page: int = Query(15, ge=1, le=1000),
     challan_no: str = Query("", description="Search by challan number"),
     status: str = Query("", description="Filter by status"),
     date: str = Query("", description="Filter by date (YYYY-MM-DD)"),
@@ -731,11 +731,31 @@ def list_job_work_records(
         SELECT h.id, h.challan_no, h.job_work_date, h.from_warehouse, h.to_party,
                h.party_address, h.status, h.type, h.vehicle_no, h.driver_name,
                h.authorized_person, h.remarks, h.created_by, h.created_at,
+               h.sub_category,
                (SELECT COUNT(DISTINCT item_description) FROM jb_materialout_lines l WHERE l.header_id = h.id) as items_count,
                (SELECT string_agg(DISTINCT l2.item_description, ', ') FROM jb_materialout_lines l2 WHERE l2.header_id = h.id) as item_descriptions,
                (SELECT COALESCE(SUM(l3.quantity_boxes), 0) FROM jb_materialout_lines l3 WHERE l3.header_id = h.id) as total_qty,
                (SELECT COALESCE(SUM(l4.quantity_kgs), 0) FROM jb_materialout_lines l4 WHERE l4.header_id = h.id) as total_weight,
-               (SELECT COALESCE(SUM(CAST(l5.net_weight AS NUMERIC)), 0) FROM jb_materialout_lines l5 WHERE l5.header_id = h.id) as total_net_weight
+               (SELECT COALESCE(SUM(CAST(l5.net_weight AS NUMERIC)), 0) FROM jb_materialout_lines l5 WHERE l5.header_id = h.id) as total_net_weight,
+               -- Per-JWO aggregates from inward receipts (joined via header_id)
+               COALESCE((SELECT SUM(il.finished_goods_kgs)
+                         FROM jb_work_inward_lines il
+                         JOIN jb_work_inward_receipt ir ON ir.id = il.inward_receipt_id
+                         WHERE ir.header_id = h.id), 0) as total_fg_kgs,
+               COALESCE((SELECT SUM(il.waste_kgs)
+                         FROM jb_work_inward_lines il
+                         JOIN jb_work_inward_receipt ir ON ir.id = il.inward_receipt_id
+                         WHERE ir.header_id = h.id), 0) as total_waste_kgs,
+               COALESCE((SELECT SUM(il.rejection_kgs)
+                         FROM jb_work_inward_lines il
+                         JOIN jb_work_inward_receipt ir ON ir.id = il.inward_receipt_id
+                         WHERE ir.header_id = h.id), 0) as total_rejection_kgs,
+               (SELECT MAX(ir.receipt_date)
+                FROM jb_work_inward_receipt ir
+                WHERE ir.header_id = h.id) as last_receipt_date,
+               (SELECT COUNT(*)
+                FROM jb_work_inward_receipt ir
+                WHERE ir.header_id = h.id) as receipt_count
         FROM jb_materialout_header h
         {where_sql}
         ORDER BY h.created_at DESC
@@ -744,6 +764,15 @@ def list_job_work_records(
 
     records = []
     for r in rows:
+        # r[14] = sub_category, r[15-18] = old aggregates, r[19-21] = new FG/Waste/Rejection,
+        # r[22] = last_receipt_date, r[23] = receipt_count
+        dispatched = float(r[18] or 0) or float(r[17] or 0)  # prefer net, fallback gross
+        fg = float(r[19] or 0)
+        waste = float(r[20] or 0)
+        rejection = float(r[21] or 0)
+        accounted = fg + waste + rejection
+        unaccounted = round(max(0, dispatched - accounted), 3)
+        loss_pct = round((unaccounted / dispatched * 100), 2) if dispatched > 0 else 0.0
         records.append({
             "id": r[0],
             "challan_no": r[1],
@@ -759,11 +788,20 @@ def list_job_work_records(
             "remarks": r[11] or "",
             "created_by": r[12] or "",
             "created_at": str(r[13]) if r[13] else "",
-            "items_count": r[14] or 0,
-            "item_descriptions": r[15] or "",
-            "total_qty": int(r[16] or 0),
+            "sub_category": r[14] or "",      # process type (Deseeding/Cracking/etc.)
+            "items_count": r[15] or 0,
+            "item_descriptions": r[16] or "",
+            "total_qty": int(r[17] or 0),
             "total_weight": float(r[17] or 0),
             "total_net_weight": float(r[18] or 0),
+            # NEW — per-JWO aggregates for dashboard
+            "fg_received_kgs": fg,
+            "waste_received_kgs": waste,
+            "rejection_kgs": rejection,
+            "unaccounted_kgs": unaccounted,
+            "actual_loss_pct": loss_pct,
+            "last_receipt_date": str(r[22]) if r[22] else "",
+            "receipt_count": int(r[23] or 0),
         })
 
     return {"records": records, "total": total, "total_pages": total_pages, "page": page}
@@ -841,24 +879,29 @@ def search_material_out(
             cold_groups[key]["total_net_weight"] += float(net_wt or 0)
             cold_groups[key]["total_boxes"] += max(qty_boxes, 1)
         else:
-            # Non-cold line — keep as-is
+            # Non-cold line — use net_weight as dispatched qty; fall back to quantity_kgs if absent
+            net_wt_float = float(net_wt or 0) if net_wt else 0.0
+            dispatched_kgs = net_wt_float if net_wt_float > 0 else qty_kgs
             consolidated_lines.append({
                 "sl_no": sl_no,
                 "item_description": item_desc,
-                "quantity_kgs": qty_kgs,
+                "quantity_kgs": dispatched_kgs,
                 "quantity_boxes": qty_boxes,
-                "net_weight": str(net_wt or "0"),
+                "net_weight": str(dispatched_kgs),
             })
 
     # Append consolidated cold groups with sequential sl_no
     next_sl = max((c["sl_no"] for c in consolidated_lines), default=0) + 1
     for key, grp in cold_groups.items():
+        # Use net weight as dispatched qty for cold storage lines; fall back to gross if net is 0
+        net_wt_total = round(grp["total_net_weight"], 3)
+        dispatched_kgs = net_wt_total if net_wt_total > 0 else round(grp["total_kgs"], 3)
         consolidated_lines.append({
             "sl_no": next_sl,
             "item_description": grp["item_description"],
-            "quantity_kgs": round(grp["total_kgs"], 3),
+            "quantity_kgs": dispatched_kgs,
             "quantity_boxes": grp["total_boxes"],
-            "net_weight": str(round(grp["total_net_weight"], 3)),
+            "net_weight": str(dispatched_kgs),
         })
         next_sl += 1
 
@@ -1350,9 +1393,65 @@ def submit_material_in(
 
     db.commit()
 
-    # Send Material In Created notification
+    # Query cumulative data for the enriched Material In email
+    challan_summary = []
+    all_ir_lines = []
+    if header_id:
+        try:
+            summary_rows = db.execute(text("""
+                SELECT item_description,
+                       SUM(CASE WHEN net_weight IS NOT NULL AND net_weight != '' AND net_weight::numeric > 0
+                                THEN net_weight::numeric
+                                ELSE quantity_kgs END) AS sent_kgs,
+                       SUM(quantity_boxes) AS sent_boxes
+                FROM jb_materialout_lines
+                WHERE header_id = :hid
+                GROUP BY item_description
+                ORDER BY item_description
+            """), {"hid": header_id}).fetchall()
+            challan_summary = [
+                {
+                    "item_description": r[0] or "-",
+                    "sent_kgs": float(r[1] or 0),
+                    "sent_boxes": int(r[2] or 0),
+                }
+                for r in summary_rows
+            ]
+
+            ir_rows = db.execute(text("""
+                SELECT r.ir_number, r.receipt_date, r.receipt_type,
+                       l.item_description, l.finished_goods_kgs,
+                       l.waste_kgs, l.rejection_kgs,
+                       l.min_loss_pct, l.max_loss_pct
+                FROM jb_work_inward_receipt r
+                JOIN jb_work_inward_lines l ON l.inward_receipt_id = r.id
+                WHERE r.header_id = :hid
+                ORDER BY r.created_at ASC, l.sl_no ASC
+            """), {"hid": header_id}).fetchall()
+            all_ir_lines = [
+                {
+                    "ir_number": r[0],
+                    "receipt_date": str(r[1] or ""),
+                    "receipt_type": r[2] or "partial",
+                    "item_description": r[3] or "-",
+                    "finished_goods_kgs": float(r[4] or 0),
+                    "waste_kgs": float(r[5] or 0),
+                    "rejection_kgs": float(r[6] or 0),
+                    "min_loss_pct": float(r[7] or 0),
+                    "max_loss_pct": float(r[8] or 10),
+                }
+                for r in ir_rows
+            ]
+        except Exception as e:
+            _jw_logger.error(f"Failed to fetch cumulative IR data for email: {e}")
+
+    # Send Material In Created notification (with cumulative data)
     try:
-        notify_job_work_material_in_created(payload, ir_number, inward_receipt_id, created_by)
+        notify_job_work_material_in_created(
+            payload, ir_number, inward_receipt_id, created_by,
+            challan_summary=challan_summary,
+            all_ir_lines=all_ir_lines,
+        )
     except Exception as e:
         _jw_logger.error(f"Failed to queue material-in notification: {e}")
 
@@ -1366,24 +1465,29 @@ def submit_material_in(
         except Exception as e:
             _jw_logger.error(f"Failed to queue status-change notification: {e}")
 
-    # Detect excess loss from submitted items
-    for it in items:
-        loss_pct = 0
-        sent = float(it.get("sent_kgs", 0) or 0)
-        fg = float(it.get("finished_goods_kgs", 0) or 0)
-        waste = float(it.get("waste_kgs", 0) or 0)
-        rejection = float(it.get("rejection_kgs", 0) or 0)
-        if sent > 0:
-            accounted = fg + waste + rejection
-            loss_pct = ((sent - accounted) / sent) * 100
-        if loss_pct > 10:
-            try:
-                notify_job_work_excess_loss(
-                    challan_no_for_notify, header_id or 0, vendor_for_notify,
-                    it.get("description", ""), loss_pct, ir_number, created_by,
-                )
-            except Exception as e:
-                _jw_logger.error(f"Failed to queue excess-loss notification: {e}")
+    # Excess loss alert only on final receipt — uses cumulative totals across all IRs
+    if receipt_type == "final" and all_ir_lines:
+        total_sent = sum(float(s.get("sent_kgs") or 0) for s in challan_summary)
+        total_accounted = sum(
+            float(ln.get("finished_goods_kgs") or 0)
+            + float(ln.get("waste_kgs") or 0)
+            + float(ln.get("rejection_kgs") or 0)
+            for ln in all_ir_lines
+        )
+        if total_sent > 0:
+            total_loss_pct = ((total_sent - total_accounted) / total_sent) * 100
+            max_pct = max(
+                (float(ln.get("max_loss_pct") or 10) for ln in all_ir_lines),
+                default=10,
+            )
+            if total_loss_pct > max_pct:
+                try:
+                    notify_job_work_excess_loss(
+                        challan_no_for_notify, header_id or 0, vendor_for_notify,
+                        "All items (cumulative)", total_loss_pct, ir_number, created_by,
+                    )
+                except Exception as e:
+                    _jw_logger.error(f"Failed to queue excess-loss notification: {e}")
 
     return {
         "status": "success",

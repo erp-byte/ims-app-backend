@@ -2064,57 +2064,84 @@ def get_inward(company: Company, transaction_no: str, db: Session) -> dict:
 
     ).fetchone()
 
+    # Fall back to bulk entry tables if not found in v2 tables
+    _using_bulk_entry = False
     if not tx_res:
-
-        raise HTTPException(404, f"transaction_no '{transaction_no}' not found for {company}")
-
-
+        _prefix = "cfpl" if company == "CFPL" else "cdpl"
+        _be = {
+            "tx": f"{_prefix}_bulk_entry_transactions",
+            "art": f"{_prefix}_bulk_entry_articles",
+            "box": f"{_prefix}_bulk_entry_boxes",
+        }
+        tx_res = db.execute(
+            text(f"SELECT * FROM {_be['tx']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).fetchone()
+        if tx_res:
+            _using_bulk_entry = True
+        else:
+            raise HTTPException(404, f"transaction_no '{transaction_no}' not found for {company}")
 
     transaction = format_record_dates(dict(tx_res._mapping))
 
+    if _using_bulk_entry:
+        arts = db.execute(
+            text(f"SELECT * FROM {_be['art']} WHERE transaction_no = :txno ORDER BY id ASC"),
+            {"txno": transaction_no},
+        ).fetchall()
+        articles = [format_record_dates(dict(r._mapping)) for r in arts]
+
+        boxes_res = db.execute(
+            text(f"""
+                SELECT * FROM {_be['box']}
+                WHERE transaction_no = :txno
+                ORDER BY article_description ASC, box_number ASC
+            """),
+            {"txno": transaction_no},
+        ).fetchall()
+        boxes = [dict(r._mapping) for r in boxes_res]
+    else:
+        arts = db.execute(
+
+            text(f"""
+
+                SELECT a.*, s.material_type AS sku_material_type
+
+                FROM {tables['art']} a
+
+                LEFT JOIN {tables['sku']} s ON a.sku_id = s.id
+
+                WHERE a.transaction_no = :txno
+
+                ORDER BY a.id ASC
+
+            """),
+
+            {"txno": transaction_no},
+
+        ).fetchall()
+
+        articles = [format_record_dates(dict(r._mapping)) for r in arts]
 
 
-    arts = db.execute(
 
-        text(f"""
+        boxes_res = db.execute(
 
-            SELECT a.*, s.material_type AS sku_material_type
+            text(f"""
 
-            FROM {tables['art']} a
+                SELECT * FROM {tables['box']}
 
-            LEFT JOIN {tables['sku']} s ON a.sku_id = s.id
+                WHERE transaction_no = :txno
 
-            WHERE a.transaction_no = :txno
+                ORDER BY article_description ASC, box_number ASC
 
-            ORDER BY a.id ASC
+            """),
 
-        """),
+            {"txno": transaction_no},
 
-        {"txno": transaction_no},
+        ).fetchall()
 
-    ).fetchall()
-
-    articles = [format_record_dates(dict(r._mapping)) for r in arts]
-
-
-
-    boxes_res = db.execute(
-
-        text(f"""
-
-            SELECT * FROM {tables['box']}
-
-            WHERE transaction_no = :txno
-
-            ORDER BY article_description ASC, box_number ASC
-
-        """),
-
-        {"txno": transaction_no},
-
-    ).fetchall()
-
-    boxes = [dict(r._mapping) for r in boxes_res]
+        boxes = [dict(r._mapping) for r in boxes_res]
 
 
 
@@ -2421,77 +2448,134 @@ def update_inward(
 
 
 def delete_inward(company: Company, transaction_no: str, db: Session) -> dict:
+    from shared.email_notifier import notify_inward_deleted
 
     tables = table_names(company)
 
-
-
     existing = db.execute(
-
         text(f"SELECT transaction_no FROM {tables['tx']} WHERE transaction_no = :txno"),
-
         {"txno": transaction_no},
-
     ).fetchone()
 
-    if not existing:
+    if existing:
+        # Snapshot details for email before deleting
+        tx_row = db.execute(
+            text(f"SELECT entry_date, vendor_supplier_name, warehouse FROM {tables['tx']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).fetchone()
+        art_count = db.execute(
+            text(f"SELECT COUNT(*) FROM {tables['art']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).scalar() or 0
+        box_count = db.execute(
+            text(f"SELECT COUNT(*) FROM {tables['box']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).scalar() or 0
 
+        boxes_deleted = db.execute(
+            text(f"DELETE FROM {tables['box']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).rowcount
+        articles_deleted = db.execute(
+            text(f"DELETE FROM {tables['art']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).rowcount
+        transaction_deleted = db.execute(
+            text(f"DELETE FROM {tables['tx']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).rowcount
+        db.commit()
+
+        notify_inward_deleted(
+            transaction_no=transaction_no,
+            company=company,
+            entry_date=str(tx_row.entry_date) if tx_row and tx_row.entry_date else None,
+            vendor=tx_row.vendor_supplier_name if tx_row else None,
+            warehouse=tx_row.warehouse if tx_row else None,
+            articles_count=int(art_count),
+            boxes_count=int(box_count),
+            source="inward (v2)",
+        )
+        return {
+            "status": "deleted",
+            "transaction_no": transaction_no,
+            "company": company,
+            "deleted_counts": {
+                "transaction": transaction_deleted,
+                "articles": articles_deleted,
+                "boxes": boxes_deleted,
+            },
+        }
+
+    # Fall back to bulk entry tables
+    _prefix = "cfpl" if company == "CFPL" else "cdpl"
+    _be = {
+        "tx": f"{_prefix}_bulk_entry_transactions",
+        "art": f"{_prefix}_bulk_entry_articles",
+        "box": f"{_prefix}_bulk_entry_boxes",
+        "cold": f"{_prefix}_cold_stocks",
+    }
+
+    be_existing = db.execute(
+        text(f"SELECT transaction_no FROM {_be['tx']} WHERE transaction_no = :txno"),
+        {"txno": transaction_no},
+    ).fetchone()
+
+    if not be_existing:
         raise HTTPException(404, f"Transaction '{transaction_no}' not found")
 
+    # Snapshot details for email before deleting
+    tx_row = db.execute(
+        text(f"SELECT entry_date, vendor_supplier_name, warehouse FROM {_be['tx']} WHERE transaction_no = :txno"),
+        {"txno": transaction_no},
+    ).fetchone()
+    art_count = db.execute(
+        text(f"SELECT COUNT(*) FROM {_be['art']} WHERE transaction_no = :txno"),
+        {"txno": transaction_no},
+    ).scalar() or 0
+    box_count = db.execute(
+        text(f"SELECT COUNT(*) FROM {_be['box']} WHERE transaction_no = :txno"),
+        {"txno": transaction_no},
+    ).scalar() or 0
 
-
+    cold_deleted = db.execute(
+        text(f"DELETE FROM {_be['cold']} WHERE inward_transaction_no = :txno AND auto_created_from_inward = true"),
+        {"txno": transaction_no},
+    ).rowcount
     boxes_deleted = db.execute(
-
-        text(f"DELETE FROM {tables['box']} WHERE transaction_no = :txno"),
-
+        text(f"DELETE FROM {_be['box']} WHERE transaction_no = :txno"),
         {"txno": transaction_no},
-
     ).rowcount
-
-
-
     articles_deleted = db.execute(
-
-        text(f"DELETE FROM {tables['art']} WHERE transaction_no = :txno"),
-
+        text(f"DELETE FROM {_be['art']} WHERE transaction_no = :txno"),
         {"txno": transaction_no},
-
     ).rowcount
-
-
-
     transaction_deleted = db.execute(
-
-        text(f"DELETE FROM {tables['tx']} WHERE transaction_no = :txno"),
-
+        text(f"DELETE FROM {_be['tx']} WHERE transaction_no = :txno"),
         {"txno": transaction_no},
-
     ).rowcount
-
-
-
     db.commit()
 
-
-
+    notify_inward_deleted(
+        transaction_no=transaction_no,
+        company=company,
+        entry_date=str(tx_row.entry_date) if tx_row and tx_row.entry_date else None,
+        vendor=tx_row.vendor_supplier_name if tx_row else None,
+        warehouse=tx_row.warehouse if tx_row else None,
+        articles_count=int(art_count),
+        boxes_count=int(box_count),
+        source="bulk inward (cold storage)",
+    )
     return {
-
         "status": "deleted",
-
         "transaction_no": transaction_no,
-
         "company": company,
-
         "deleted_counts": {
-
             "transaction": transaction_deleted,
-
             "articles": articles_deleted,
-
             "boxes": boxes_deleted,
-
+            "cold_stocks": cold_deleted,
         },
-
     }
 
 

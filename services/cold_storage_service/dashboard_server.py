@@ -33,21 +33,27 @@ COMPANY_TABLE_MAP = {
 }
 
 
-def _resolve_tables(company: str) -> List[str]:
+def _resolve_tables(company: str, db: Optional[Session] = None) -> List[str]:
     c = company.strip().lower()
     if c == "all":
-        return list(COMPANY_TABLE_MAP.values())
-    table = COMPANY_TABLE_MAP.get(c)
-    if not table:
-        raise HTTPException(400, f"Unknown company: {company}. Use 'cfpl', 'cdpl', or 'all'.")
-    return [table]
+        tables = list(COMPANY_TABLE_MAP.values())
+    else:
+        table = COMPANY_TABLE_MAP.get(c)
+        if not table:
+            raise HTTPException(400, f"Unknown company: {company}. Use 'cfpl', 'cdpl', or 'all'.")
+        tables = [table]
+    # Lazy self-heal: ensure canonical columns/functions/trigger exist on first use.
+    if db is not None:
+        _ensure_canonical_columns(db)
+    return tables
 
 
 _COMMON_COLS = (
     "storage_location, group_name, item_subgroup, item_mark, item_description, "
     "lot_no, inward_dt, inward_no, unit, no_of_cartons, weight_kg, "
     "total_inventory_kgs, last_purchase_rate, "
-    "vakkal, exporter, spl_remarks"
+    "vakkal, exporter, spl_remarks, "
+    "canonical_warehouse, canonical_group, canonical_subgroup"
 )
 
 
@@ -58,18 +64,28 @@ def _union_source(tables: List[str]) -> str:
     return f"({parts}) AS cs"
 
 
-# Canonical storage_location SQL expression. Raw rows often store storage_location
-# as "Savla" / "Savla Bond" with the actual cold-storage unit (D-39 vs D-514) in the
-# `unit` column — disambiguate via unit so the two warehouses are not merged.
+# Canonical storage_location SQL expression.
+# Prefers the materialized `canonical_warehouse` column (populated by the
+# 20260525 migration + trigger). Falls back to legacy unit/storage_location
+# disambiguation only when the column is unpopulated.
 _CANONICAL_LOC = """
-    CASE
-        WHEN UPPER(TRIM(COALESCE(storage_location,''))) IN ('SAVLA','OLD SAVLA','SAVLA BOND','SAVLA D-39','SAVLA D39','SAVLA D-39 COLD','SAVLA D-514','SAVLA D514','SAVLA D-514 COLD','NEW SAVLA')
-             AND UPPER(TRIM(COALESCE(unit,''))) = 'D-514' THEN 'Savla D-514'
-        WHEN UPPER(TRIM(COALESCE(storage_location,''))) IN ('SAVLA','OLD SAVLA','SAVLA BOND','SAVLA D-39','SAVLA D39','SAVLA D-39 COLD','SAVLA D-514','SAVLA D514','SAVLA D-514 COLD','NEW SAVLA')
-             AND UPPER(TRIM(COALESCE(unit,''))) = 'D-39' THEN 'Savla D-39'
-        ELSE COALESCE(storage_location, 'Unassigned')
-    END
+    COALESCE(
+        canonical_warehouse,
+        CASE
+            WHEN UPPER(TRIM(COALESCE(storage_location,''))) IN ('SAVLA','OLD SAVLA','SAVLA BOND','SAVLA D-39','SAVLA D39','SAVLA D-39 COLD','SAVLA D-514','SAVLA D514','SAVLA D-514 COLD','NEW SAVLA')
+                 AND UPPER(TRIM(COALESCE(unit,''))) = 'D-514' THEN 'Savla D-514'
+            WHEN UPPER(TRIM(COALESCE(storage_location,''))) IN ('SAVLA','OLD SAVLA','SAVLA BOND','SAVLA D-39','SAVLA D39','SAVLA D-39 COLD','SAVLA D-514','SAVLA D514','SAVLA D-514 COLD','NEW SAVLA')
+                 AND UPPER(TRIM(COALESCE(unit,''))) = 'D-39' THEN 'Savla D-39'
+            ELSE NULL
+        END,
+        'Other'
+    )
 """
+
+# Title-cased group / subgroup, preferring canonical column (from all_sku lookup),
+# falling back to a case-folded version of the raw column.
+_CANONICAL_GROUP = "COALESCE(canonical_group, INITCAP(LOWER(NULLIF(TRIM(group_name),''))), 'Ungrouped')"
+_CANONICAL_SUBGROUP = "COALESCE(canonical_subgroup, INITCAP(LOWER(NULLIF(TRIM(item_subgroup),''))), 'General')"
 
 
 def _f(v):
@@ -78,6 +94,124 @@ def _f(v):
 
 def _avg(kgs, val):
     return round(val / kgs, 2) if kgs and kgs > 0 else 0.0
+
+
+# ───────────────────────────────────────────────────────────────────
+# Canonical column self-healing.
+# Migration SQL is embedded here so the dashboard works on a fresh DB
+# even if the operator hasn't run the migration file manually.
+# Runs once per process (guarded by `_CANONICAL_INIT_DONE`).
+# Idempotent — safe to re-run.
+# ───────────────────────────────────────────────────────────────────
+_CANONICAL_INIT_DONE = False
+
+
+def _ensure_canonical_columns(db: Session) -> None:
+    global _CANONICAL_INIT_DONE
+    if _CANONICAL_INIT_DONE:
+        return
+    try:
+        # Helper SQL functions
+        db.execute(text("""
+            CREATE OR REPLACE FUNCTION canonical_warehouse_fn(p_unit TEXT, p_storage_location TEXT)
+            RETURNS TEXT LANGUAGE plpgsql IMMUTABLE AS $$
+            DECLARE k TEXT;
+            BEGIN
+              IF p_unit IS NOT NULL AND length(trim(p_unit)) > 0 THEN
+                k := regexp_replace(lower(trim(p_unit)), '_', ' ', 'g');
+                IF k IN ('savla d-39','savla d39','d-39','d39','savla bond','old savla','savla d-39 cold','savla d39 cold') THEN RETURN 'Savla D-39';
+                ELSIF k IN ('savla d-514','savla d514','d-514','d514','new savla','savla d-514 cold') THEN RETURN 'Savla D-514';
+                ELSIF k IN ('rishi','rishi cold','rishi cold storage') THEN RETURN 'Rishi';
+                ELSIF k IN ('supreme','supreme cold','supreme cold storage') THEN RETURN 'Supreme';
+                ELSIF k IN ('w202','warehouse w202') THEN RETURN 'W202';
+                ELSIF k IN ('a101','warehouse a101') THEN RETURN 'A101';
+                ELSIF k IN ('a185','warehouse a185') THEN RETURN 'A185';
+                ELSIF k IN ('a68','warehouse a68') THEN RETURN 'A68';
+                ELSIF k IN ('f53','warehouse f53') THEN RETURN 'F53';
+                ELSIF k IN ('dev int','dev_int') THEN RETURN 'Dev Int';
+                END IF;
+              END IF;
+              IF p_storage_location IS NOT NULL AND length(trim(p_storage_location)) > 0 THEN
+                k := regexp_replace(lower(trim(p_storage_location)), '_', ' ', 'g');
+                IF k IN ('savla d-39','savla d39','d-39','d39','savla bond','old savla','savla d-39 cold','savla d39 cold') THEN RETURN 'Savla D-39';
+                ELSIF k IN ('savla d-514','savla d514','d-514','d514','new savla','savla d-514 cold') THEN RETURN 'Savla D-514';
+                ELSIF k IN ('rishi','rishi cold','rishi cold storage') THEN RETURN 'Rishi';
+                ELSIF k IN ('supreme','supreme cold','supreme cold storage') THEN RETURN 'Supreme';
+                ELSIF k IN ('w202','warehouse w202') THEN RETURN 'W202';
+                ELSIF k IN ('a101','warehouse a101') THEN RETURN 'A101';
+                ELSIF k IN ('a185','warehouse a185') THEN RETURN 'A185';
+                ELSIF k IN ('a68','warehouse a68') THEN RETURN 'A68';
+                ELSIF k IN ('f53','warehouse f53') THEN RETURN 'F53';
+                ELSIF k IN ('dev int','dev_int') THEN RETURN 'Dev Int';
+                END IF;
+              END IF;
+              RETURN NULL;
+            END;
+            $$;
+        """))
+        db.execute(text("""
+            CREATE OR REPLACE FUNCTION title_fold(p TEXT)
+            RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
+              SELECT CASE WHEN p IS NULL OR length(trim(p)) = 0 THEN NULL
+                          ELSE initcap(lower(trim(p))) END;
+            $$;
+        """))
+        db.execute(text("""
+            CREATE OR REPLACE FUNCTION sync_canonical_cold_stock()
+            RETURNS TRIGGER LANGUAGE plpgsql AS $$
+            BEGIN
+              NEW.canonical_warehouse := canonical_warehouse_fn(NEW.unit, NEW.storage_location);
+              NEW.canonical_group := COALESCE(
+                (SELECT title_fold(s.item_group) FROM all_sku s
+                  WHERE lower(s.particulars) = lower(NEW.item_description) LIMIT 1),
+                title_fold(NEW.group_name)
+              );
+              NEW.canonical_subgroup := COALESCE(
+                (SELECT title_fold(s.sub_group) FROM all_sku s
+                  WHERE lower(s.particulars) = lower(NEW.item_description) LIMIT 1),
+                title_fold(NEW.item_subgroup)
+              );
+              RETURN NEW;
+            END;
+            $$;
+        """))
+
+        # Per-table: columns, indexes, trigger — NO bulk backfill here.
+        # A full UPDATE of canonical_* on a large cold_stocks table can take
+        # minutes and saturate the DB connection pool, blocking unrelated
+        # endpoints (Inward, RTV, etc.). Auto-init only does fast DDL.
+        # The admin endpoint /admin/backfill-canonical still does the full
+        # backfill on demand. Meanwhile the SQL fallback in _CANONICAL_LOC /
+        # _CANONICAL_GROUP / _CANONICAL_SUBGROUP transparently handles rows
+        # whose canonical_* are still NULL.
+        for tbl in ("cfpl_cold_stocks", "cdpl_cold_stocks"):
+            exists = db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{tbl}"}).scalar()
+            if not exists:
+                continue
+            db.execute(text(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS canonical_warehouse TEXT"))
+            db.execute(text(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS canonical_group TEXT"))
+            db.execute(text(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS canonical_subgroup TEXT"))
+            db.execute(text(f"CREATE INDEX IF NOT EXISTS {tbl}_canon_wh_idx ON {tbl} (canonical_warehouse)"))
+            db.execute(text(
+                f"CREATE INDEX IF NOT EXISTS {tbl}_canon_wgs_idx "
+                f"ON {tbl} (canonical_warehouse, canonical_group, canonical_subgroup)"
+            ))
+            # Trigger (drop + recreate) — new INSERTs/UPDATEs will populate canonical_*
+            trig = f"{tbl}_sync_canonical"
+            db.execute(text(f"DROP TRIGGER IF EXISTS {trig} ON {tbl}"))
+            db.execute(text(
+                f"CREATE TRIGGER {trig} BEFORE INSERT OR UPDATE OF unit, storage_location, "
+                f"item_description, group_name, item_subgroup ON {tbl} "
+                f"FOR EACH ROW EXECUTE FUNCTION sync_canonical_cold_stock()"
+            ))
+        db.commit()
+        _CANONICAL_INIT_DONE = True
+        logger.info("Canonical columns/triggers ensured on cold_stocks tables.")
+    except Exception as e:
+        # Don't crash the dashboard if we can't add columns — fall back to
+        # raw column queries (the SQL has COALESCE guards already).
+        db.rollback()
+        logger.warning("Canonical column auto-init skipped: %s", e)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -90,7 +224,7 @@ async def get_stock_summary(
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    tables = _resolve_tables(company)
+    tables = _resolve_tables(company, db)
     src = _union_source(tables)
 
     try:
@@ -103,8 +237,8 @@ async def get_stock_summary(
         l3_sql = text(f"""
             SELECT
                 {_CANONICAL_LOC} AS storage_location,
-                COALESCE(group_name, 'Ungrouped')          AS group_name,
-                COALESCE(item_subgroup, 'General')         AS item_subgroup,
+                {_CANONICAL_GROUP}                          AS group_name,
+                {_CANONICAL_SUBGROUP}                       AS item_subgroup,
                 COALESCE(item_mark, 'No Mark')             AS item_mark,
                 COALESCE(SUM(COALESCE(total_inventory_kgs, 0)), 0)  AS total_kgs,
                 COALESCE(SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))), 0)       AS total_value,
@@ -124,8 +258,8 @@ async def get_stock_summary(
                     THEN COALESCE(total_inventory_kgs, 0) ELSE 0 END) AS age_24_plus
             FROM {src}
             WHERE 1=1 {loc_filter}
-            GROUP BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
-            ORDER BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
+            GROUP BY {_CANONICAL_LOC}, {_CANONICAL_GROUP}, {_CANONICAL_SUBGROUP}, COALESCE(item_mark, 'No Mark')
+            ORDER BY {_CANONICAL_LOC}, {_CANONICAL_GROUP}, {_CANONICAL_SUBGROUP}, COALESCE(item_mark, 'No Mark')
         """)
         l3_rows = db.execute(l3_sql, params).fetchall()
 
@@ -201,7 +335,7 @@ async def get_ageing_summary(
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    tables = _resolve_tables(company)
+    tables = _resolve_tables(company, db)
     src = _union_source(tables)
 
     try:
@@ -214,8 +348,8 @@ async def get_ageing_summary(
         sql = text(f"""
             SELECT
                 {_CANONICAL_LOC} AS storage_location,
-                COALESCE(group_name, 'Ungrouped')        AS group_name,
-                COALESCE(item_subgroup, 'General')       AS item_subgroup,
+                {_CANONICAL_GROUP}                        AS group_name,
+                {_CANONICAL_SUBGROUP}                     AS item_subgroup,
                 COALESCE(item_mark, 'No Mark')           AS item_mark,
                 SUM(CASE WHEN (CURRENT_DATE - inward_dt) < 183 THEN COALESCE(total_inventory_kgs,0) ELSE 0 END) AS kgs_0_6,
                 SUM(CASE WHEN (CURRENT_DATE - inward_dt) >= 183 AND (CURRENT_DATE - inward_dt) < 365 THEN COALESCE(total_inventory_kgs,0) ELSE 0 END) AS kgs_6_12,
@@ -231,8 +365,8 @@ async def get_ageing_summary(
                 SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) AS grand_total_value
             FROM {src}
             WHERE inward_dt IS NOT NULL {loc_filter}
-            GROUP BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
-            ORDER BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
+            GROUP BY {_CANONICAL_LOC}, {_CANONICAL_GROUP}, {_CANONICAL_SUBGROUP}, COALESCE(item_mark, 'No Mark')
+            ORDER BY {_CANONICAL_LOC}, {_CANONICAL_GROUP}, {_CANONICAL_SUBGROUP}, COALESCE(item_mark, 'No Mark')
         """)
         rows = db.execute(sql, params).fetchall()
 
@@ -295,7 +429,7 @@ async def get_ageing_summary_days(
     """Same shape as /ageing-summary but with day-based brackets:
     <30, 30-60, 60-90, 90-180, >180 days. Recomputed live from inward_dt
     on every call so the response reflects current transactional state."""
-    tables = _resolve_tables(company)
+    tables = _resolve_tables(company, db)
     src = _union_source(tables)
 
     try:
@@ -308,8 +442,8 @@ async def get_ageing_summary_days(
         sql = text(f"""
             SELECT
                 {_CANONICAL_LOC} AS storage_location,
-                COALESCE(group_name, 'Ungrouped')        AS group_name,
-                COALESCE(item_subgroup, 'General')       AS item_subgroup,
+                {_CANONICAL_GROUP}                        AS group_name,
+                {_CANONICAL_SUBGROUP}                     AS item_subgroup,
                 COALESCE(item_mark, 'No Mark')           AS item_mark,
                 SUM(CASE WHEN (CURRENT_DATE - inward_dt) < 30 THEN COALESCE(total_inventory_kgs,0) ELSE 0 END) AS kgs_lt30,
                 SUM(CASE WHEN (CURRENT_DATE - inward_dt) >= 30 AND (CURRENT_DATE - inward_dt) < 60 THEN COALESCE(total_inventory_kgs,0) ELSE 0 END) AS kgs_30_60,
@@ -325,8 +459,8 @@ async def get_ageing_summary_days(
                 SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) AS grand_total_value
             FROM {src}
             WHERE inward_dt IS NOT NULL {loc_filter}
-            GROUP BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
-            ORDER BY {_CANONICAL_LOC}, group_name, item_subgroup, item_mark
+            GROUP BY {_CANONICAL_LOC}, {_CANONICAL_GROUP}, {_CANONICAL_SUBGROUP}, COALESCE(item_mark, 'No Mark')
+            ORDER BY {_CANONICAL_LOC}, {_CANONICAL_GROUP}, {_CANONICAL_SUBGROUP}, COALESCE(item_mark, 'No Mark')
         """)
         rows = db.execute(sql, params).fetchall()
 
@@ -389,7 +523,7 @@ async def get_lot_details(
     item_mark: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    tables = _resolve_tables(company)
+    tables = _resolve_tables(company, db)
     src = _union_source(tables)
 
     try:
@@ -398,8 +532,8 @@ async def get_lot_details(
                 THEN SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) / SUM(COALESCE(total_inventory_kgs,0)) ELSE 0 END AS subgroup_avg_rate
             FROM {src}
             WHERE ({_CANONICAL_LOC}) = :loc
-              AND COALESCE(group_name,'Ungrouped') = :grp
-              AND COALESCE(item_subgroup,'General') = :sg
+              AND {_CANONICAL_GROUP} = :grp
+              AND {_CANONICAL_SUBGROUP} = :sg
         """)
         avg_row = db.execute(avg_sql, {"loc": storage_location, "grp": group_name, "sg": item_subgroup}).fetchone()
         subgroup_avg = float(avg_row.subgroup_avg_rate) if avg_row and avg_row.subgroup_avg_rate else 0.0
@@ -434,8 +568,8 @@ async def get_lot_details(
                 END AS ageing_bracket
             FROM {src}
             WHERE ({_CANONICAL_LOC}) = :loc
-              AND COALESCE(group_name,'Ungrouped') = :grp
-              AND COALESCE(item_subgroup,'General') = :sg
+              AND {_CANONICAL_GROUP} = :grp
+              AND {_CANONICAL_SUBGROUP} = :sg
               AND COALESCE(item_mark,'No Mark') = :mark
             GROUP BY lot_no
             ORDER BY MIN(inward_dt) ASC NULLS LAST, lot_no ASC
@@ -477,7 +611,7 @@ async def get_concentration(
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    tables = _resolve_tables(company)
+    tables = _resolve_tables(company, db)
     src = _union_source(tables)
 
     try:
@@ -486,8 +620,8 @@ async def get_concentration(
             loc_filter = f"AND ({_CANONICAL_LOC}) = :loc"; params["loc"] = storage_location
 
         sql = text(f"""
-            SELECT COALESCE(group_name,'Ungrouped') AS group_name,
-                COALESCE(item_subgroup,'General') AS item_subgroup,
+            SELECT {_CANONICAL_GROUP} AS group_name,
+                {_CANONICAL_SUBGROUP} AS item_subgroup,
                 SUM(COALESCE(total_inventory_kgs,0)) AS total_kgs,
                 SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) AS total_value, COUNT(*) AS lot_count,
                 SUM(CASE WHEN inward_dt IS NOT NULL AND (CURRENT_DATE - inward_dt) >= 548
@@ -495,7 +629,7 @@ async def get_concentration(
                 SUM(CASE WHEN inward_dt IS NOT NULL AND (CURRENT_DATE - inward_dt) >= 548
                     THEN (COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0)) ELSE 0 END) AS aged_18plus_value
             FROM {src} WHERE 1=1 {loc_filter}
-            GROUP BY group_name, item_subgroup ORDER BY SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) DESC
+            GROUP BY {_CANONICAL_GROUP}, {_CANONICAL_SUBGROUP} ORDER BY SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) DESC
         """)
         rows = db.execute(sql, params).fetchall()
 
@@ -546,7 +680,7 @@ async def get_inward_trend(
     db: Session = Depends(get_db),
 ):
     """Monthly inward trend with rich insights — by inward_dt from DB."""
-    tables = _resolve_tables(company)
+    tables = _resolve_tables(company, db)
     src = _union_source(tables)
 
     try:
@@ -591,12 +725,12 @@ async def get_inward_trend(
 
         # Top 5 groups by Kgs
         top_groups_sql = text(f"""
-            SELECT COALESCE(group_name, 'Ungrouped') AS group_name,
+            SELECT {_CANONICAL_GROUP} AS group_name,
                 SUM(COALESCE(total_inventory_kgs,0)) AS total_kgs,
                 SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) AS total_value,
                 COUNT(*) AS lot_count
             FROM {src} WHERE 1=1 {loc_filter}
-            GROUP BY group_name ORDER BY SUM(COALESCE(total_inventory_kgs,0)) DESC LIMIT 5
+            GROUP BY {_CANONICAL_GROUP} ORDER BY SUM(COALESCE(total_inventory_kgs,0)) DESC LIMIT 5
         """)
         top_groups = db.execute(top_groups_sql, params).fetchall()
 
@@ -659,7 +793,7 @@ async def get_dashboard_storage_locations(
     company: str = Query("all"),
     db: Session = Depends(get_db),
 ):
-    tables = _resolve_tables(company)
+    tables = _resolve_tables(company, db)
     src = _union_source(tables)
 
     try:
@@ -684,7 +818,7 @@ async def get_attention_flags(
     db: Session = Depends(get_db),
 ):
     """Compute attention flags from lot data. No outward tracking yet — uses inward_dt only."""
-    tables = _resolve_tables(company)
+    tables = _resolve_tables(company, db)
     src = _union_source(tables)
 
     try:
@@ -716,12 +850,12 @@ async def get_attention_flags(
 
         # Compute sub-group avg rates
         sg_avg_sql = text(f"""
-            SELECT COALESCE(item_subgroup, 'General') AS sg,
+            SELECT {_CANONICAL_SUBGROUP} AS sg,
                 CASE WHEN SUM(COALESCE(total_inventory_kgs,0)) > 0
                     THEN SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) / SUM(COALESCE(total_inventory_kgs,0))
                     ELSE 0 END AS avg_rate
             FROM {src} WHERE 1=1 {loc_filter}
-            GROUP BY item_subgroup
+            GROUP BY {_CANONICAL_SUBGROUP}
         """)
         sg_avgs = {r.sg: float(r.avg_rate or 0) for r in db.execute(sg_avg_sql, params).fetchall()}
 
@@ -808,7 +942,7 @@ async def get_slow_moving(
     db: Session = Depends(get_db),
 ):
     """Classify lots by movement status based on inward_dt age."""
-    tables = _resolve_tables(company)
+    tables = _resolve_tables(company, db)
     src = _union_source(tables)
 
     try:
@@ -906,7 +1040,7 @@ async def get_activity_rundown(
     db: Session = Depends(get_db),
 ):
     """Location-wise, company-wise, group-wise, exporter-wise breakdowns."""
-    tables = _resolve_tables(company)
+    tables = _resolve_tables(company, db)
     src = _union_source(tables)
 
     try:
@@ -957,13 +1091,13 @@ async def get_activity_rundown(
 
         # §4C Group/SubGroup wise
         grp_sql = text(f"""
-            SELECT COALESCE(group_name, 'Ungrouped') AS group_name,
-                COALESCE(item_subgroup, 'General') AS item_subgroup,
+            SELECT {_CANONICAL_GROUP} AS group_name,
+                {_CANONICAL_SUBGROUP} AS item_subgroup,
                 SUM(COALESCE(total_inventory_kgs, 0)) AS total_kgs,
                 SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) AS total_value,
                 COUNT(*) AS lot_count
             FROM {src} WHERE 1=1 {loc_filter}
-            GROUP BY group_name, item_subgroup
+            GROUP BY {_CANONICAL_GROUP}, {_CANONICAL_SUBGROUP}
             ORDER BY SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) DESC
         """)
         groups = [{
@@ -1002,3 +1136,96 @@ async def get_activity_rundown(
     except Exception as e:
         logger.error("Activity rundown error: %s", e)
         raise HTTPException(500, f"Activity rundown error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Admin: backfill canonical columns (one-time after migration)
+# ═══════════════════════════════════════════════════════════════════
+
+@router.post("/admin/backfill-canonical")
+async def backfill_canonical_columns(db: Session = Depends(get_db)):
+    """Re-run canonical_warehouse / canonical_group / canonical_subgroup
+    backfill for both cold-stock tables. Idempotent. Trigger keeps them
+    in sync going forward."""
+    summary = {}
+    for tbl in ("cfpl_cold_stocks", "cdpl_cold_stocks"):
+        exists = db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{tbl}"}).scalar()
+        if not exists:
+            summary[tbl] = "missing"
+            continue
+        db.execute(text(f"""
+            UPDATE {tbl} SET
+              canonical_warehouse = canonical_warehouse_fn(unit, storage_location),
+              canonical_group = COALESCE(
+                (SELECT title_fold(s.item_group) FROM all_sku s
+                  WHERE lower(s.particulars) = lower({tbl}.item_description) LIMIT 1),
+                title_fold({tbl}.group_name)
+              ),
+              canonical_subgroup = COALESCE(
+                (SELECT title_fold(s.sub_group) FROM all_sku s
+                  WHERE lower(s.particulars) = lower({tbl}.item_description) LIMIT 1),
+                title_fold({tbl}.item_subgroup)
+              )
+        """))
+        cnt = db.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
+        summary[tbl] = {"rows": int(cnt or 0)}
+    db.commit()
+    return {"status": "ok", "summary": summary}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Transaction resolver — used by "Open Transaction" buttons across IMS
+# ═══════════════════════════════════════════════════════════════════
+
+@router.get("/resolve-transaction")
+async def resolve_transaction_endpoint(
+    transaction_no: str = Query(..., description="Transaction number from a lot"),
+    db: Session = Depends(get_db),
+):
+    """Look up which module owns a transaction number. Returns the destination
+    URL path, or `exists_in_ims: false` if the transaction is legacy/pre-IMS
+    data — the UI should disable the Open button and show a Rectify CTA."""
+    from shared.canonicalize import resolve_transaction
+    return resolve_transaction(db, transaction_no)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Rectify endpoint — patch wrong warehouse / group / sub-group on a lot
+# ═══════════════════════════════════════════════════════════════════
+
+@router.post("/lots/{inward_no}/rectify")
+async def rectify_lot_metadata(
+    inward_no: str,
+    company: str = Query(...),
+    unit: Optional[str] = Query(None, description="New warehouse unit (e.g. D-39, Rishi)"),
+    storage_location: Optional[str] = Query(None),
+    group_name: Optional[str] = Query(None),
+    item_subgroup: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Update warehouse / group / sub-group on every cold-stock row with the
+    given inward_no. Trigger re-derives canonical_* columns automatically.
+    Used by the dashboard 'Rectify' CTA for legacy / mis-labelled lots."""
+    c = company.strip().lower()
+    tbl = COMPANY_TABLE_MAP.get(c)
+    if not tbl:
+        raise HTTPException(400, f"Unknown company: {company}")
+
+    sets, params = [], {"inward_no": inward_no}
+    if unit:
+        sets.append("unit = :unit"); params["unit"] = unit
+    if storage_location:
+        sets.append("storage_location = :sl"); params["sl"] = storage_location
+    if group_name:
+        sets.append("group_name = :gn"); params["gn"] = group_name
+    if item_subgroup:
+        sets.append("item_subgroup = :sg"); params["sg"] = item_subgroup
+    if not sets:
+        raise HTTPException(400, "Provide at least one field to update")
+
+    res = db.execute(
+        text(f"UPDATE {tbl} SET {', '.join(sets)} WHERE inward_no = :inward_no"),
+        params,
+    )
+    db.commit()
+    return {"status": "ok", "rows_updated": res.rowcount}

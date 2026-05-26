@@ -52,15 +52,24 @@ from services.ims_service.interunit_tools import (
     categorial_dropdown,
     get_bulk_entry_box,
 )
+from services.ims_service.pending_stock_tools import (
+    list_pending_transfers,
+    pending_by_lot,
+    backfill_pending_from_existing_transfers,
+)
 
 router = APIRouter(prefix="/interunit", tags=["interunit"])
 
-AUTHORIZED_DELETE_EMAILS = {"yash@candorfoods.in"}
+AUTHORIZED_DELETE_EMAILS = {"yash@candorfoods.in", "b.hrithik@candorfoods.in"}
+ADMIN_ROLES = {"admin", "developer"}
 
 
-def _check_delete_permission(user_email: str):
-    if user_email.lower() not in AUTHORIZED_DELETE_EMAILS:
-        raise HTTPException(403, "You are not authorized to delete records")
+def _check_delete_permission(user_email: str, user_role: str = ""):
+    if (user_email or "").lower() in AUTHORIZED_DELETE_EMAILS:
+        return
+    if (user_role or "").lower() in ADMIN_ROLES:
+        return
+    raise HTTPException(403, "You are not authorized to delete records")
 
 
 @router.get("/dropdowns/warehouse-sites", response_model=List[WarehouseSiteResponse])
@@ -69,6 +78,60 @@ def get_warehouse_sites_endpoint(
     db: Session = Depends(get_db),
 ):
     return get_warehouse_sites(active_only, db)
+
+
+@router.get("/pending-stock")
+def list_pending_stock_endpoint(
+    from_site: Optional[str] = Query(None),
+    to_site: Optional[str] = Query(None),
+    company: Optional[str] = Query(None, description="cfpl or cdpl"),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    search: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """List in-transit transfers grouped per transfer_out for the Pending modal."""
+    return list_pending_transfers(
+        db=db,
+        from_site=from_site,
+        to_site=to_site,
+        company=company,
+        from_date=from_date,
+        to_date=to_date,
+        search=search,
+    )
+
+
+@router.get("/pending-stock/by-lot")
+def pending_stock_by_lot_endpoint(
+    lot_no: Optional[str] = Query(None),
+    item_description: Optional[str] = Query(None),
+    from_site: Optional[str] = Query(None),
+    from_company: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Sum pending cartons/kg by (lot_no, item_description, from_site)
+    for inventory display deduction. Also returns box-level transactions."""
+    return pending_by_lot(
+        db=db,
+        lot_no=lot_no,
+        item_description=item_description,
+        from_site=from_site,
+        from_company=from_company,
+    )
+
+
+@router.post("/pending-stock/backfill")
+def backfill_pending_stock_endpoint(
+    user_email: str = Query(..., description="Email of user triggering backfill"),
+    user_role: str = Query("", description="Role (admin/developer bypass allowlist)"),
+    db: Session = Depends(get_db),
+):
+    """One-time backfill: park boxes from existing in-transit transfers
+    (status Dispatch/Partial, no Received Transfer In) into
+    pending_transfer_stock and deduct from source. Idempotent."""
+    _check_delete_permission(user_email, user_role)
+    return backfill_pending_from_existing_transfers(db)
 
 
 @router.get("/box-lookup/{company}")
@@ -116,7 +179,7 @@ def create_request_endpoint(
 @router.get("/requests", response_model=RequestListResponse)
 def list_requests_endpoint(
     page: int = Query(1, ge=1),
-    per_page: int = Query(10, ge=1, le=100),
+    per_page: int = Query(10, ge=1, le=1000),
     status: Optional[str] = Query(None),
     from_warehouse: Optional[str] = Query(None),
     to_warehouse: Optional[str] = Query(None),
@@ -168,7 +231,7 @@ def create_transfer_endpoint(
 @router.get("/transfers", response_model=TransferListResponse)
 def list_transfers_endpoint(
     page: int = Query(1, ge=1),
-    per_page: int = Query(10, ge=1, le=100),
+    per_page: int = Query(10, ge=1, le=1000),
     status: Optional[str] = Query(None),
     from_site: Optional[str] = Query(None),
     to_site: Optional[str] = Query(None),
@@ -206,9 +269,10 @@ def update_transfer_endpoint(
 def delete_transfer_endpoint(
     transfer_id: int,
     user_email: str = Query(..., description="Email of user performing delete"),
+    user_role: str = Query("", description="Role of user (admin/developer bypass allowlist)"),
     db: Session = Depends(get_db),
 ):
-    _check_delete_permission(user_email)
+    _check_delete_permission(user_email, user_role)
     return delete_transfer(transfer_id, db)
 
 
@@ -226,7 +290,7 @@ def create_transfer_in_endpoint(
 @router.get("/transfer-in", response_model=TransferInListResponse)
 def list_transfer_ins_endpoint(
     page: int = Query(1, ge=1),
-    per_page: int = Query(10, ge=1, le=100),
+    per_page: int = Query(10, ge=1, le=1000),
     receiving_warehouse: Optional[str] = Query(None),
     from_date: Optional[str] = Query(None),
     to_date: Optional[str] = Query(None),

@@ -103,13 +103,15 @@ def create_bulk_entry(payload, db: Session) -> dict:
         "transaction_no, sku_id, item_description, item_category, sub_category, "
         "material_type, quality_grade, uom, po_quantity, units, quantity_units, "
         "net_weight, total_weight, po_weight, lot_number, manufacturing_date, "
-        "expiry_date, unit_rate, total_amount, carton_weight, box_count"
+        "expiry_date, unit_rate, total_amount, carton_weight, box_count, "
+        "item_mark, spl_remarks, vakkal"
     )
     _ARTICLE_PARAMS = (
         ":transaction_no, :sku_id, :item_description, :item_category, :sub_category, "
         ":material_type, :quality_grade, :uom, :po_quantity, :units, :quantity_units, "
         ":net_weight, :total_weight, :po_weight, :lot_number, :manufacturing_date, "
-        ":expiry_date, :unit_rate, :total_amount, :carton_weight, :box_count"
+        ":expiry_date, :unit_rate, :total_amount, :carton_weight, :box_count, "
+        ":item_mark, :spl_remarks, :vakkal"
     )
 
     if payload.articles:
@@ -182,6 +184,74 @@ def create_bulk_entry(payload, db: Session) -> dict:
             box_ids=box_ids,
             boxes=box_infos,
         ))
+
+    # 4) Mirror into cold_stocks (one row per box)
+    _cold_table = f"{'cfpl' if payload.company == 'CFPL' else 'cdpl'}_cold_stocks"
+    _wh = t.warehouse or ""
+    _unit_map = {
+        "Savla D-39": "D-39",
+        "Savla D-514": "D-514",
+        "Rishi": "Rishi",
+        "Supreme": "Supreme",
+    }
+    _unit = _unit_map.get(_wh, _wh)
+    _entry_date = t.entry_date  # "YYYY-MM-DD" string, accepted by PG date column
+
+    cold_rows = []
+    for article, art_group in zip(payload.articles, all_box_groups):
+        _box_net = _safe_float(article.box_net_weight)
+        _rate = _safe_float(article.unit_rate)
+        _per_box_value = round(_box_net * _rate, 2) if (_box_net and _rate) else None
+        for box_info in art_group.boxes:
+            cold_rows.append({
+                "inward_dt": _entry_date,
+                "unit": _unit,
+                "inward_no": txno,
+                "cold_item_mark": article.item_mark,
+                "vakkal": article.vakkal,
+                "lot_no": article.lot_number,
+                "no_of_cartons": 1,
+                "weight_kg": _box_net,
+                "total_inventory_kgs": _box_net,
+                "group_name": article.item_category,
+                "item_description": article.item_description,
+                "storage_location": _wh,
+                "exporter": t.vendor_supplier_name,
+                "last_purchase_rate": _rate,
+                "box_id": box_info.box_id,
+                "transaction_no": txno,
+                "item_subgroup": article.sub_category,
+                "item_mark": article.item_mark,
+                "value": _per_box_value,
+                "inward_transaction_no": txno,
+                "auto_created_from_inward": True,
+                "spl_remarks": article.spl_remarks,
+                "canonical_warehouse": _wh,
+                "canonical_group": article.item_category,
+                "canonical_subgroup": article.sub_category,
+            })
+
+    if cold_rows:
+        db.execute(
+            text(f"""
+                INSERT INTO {_cold_table} (
+                    inward_dt, unit, inward_no, cold_item_mark, vakkal, lot_no,
+                    no_of_cartons, weight_kg, total_inventory_kgs, group_name,
+                    item_description, storage_location, exporter, last_purchase_rate,
+                    box_id, transaction_no, item_subgroup, item_mark, value,
+                    inward_transaction_no, auto_created_from_inward, spl_remarks,
+                    canonical_warehouse, canonical_group, canonical_subgroup
+                ) VALUES (
+                    :inward_dt, :unit, :inward_no, :cold_item_mark, :vakkal, :lot_no,
+                    :no_of_cartons, :weight_kg, :total_inventory_kgs, :group_name,
+                    :item_description, :storage_location, :exporter, :last_purchase_rate,
+                    :box_id, :transaction_no, :item_subgroup, :item_mark, :value,
+                    :inward_transaction_no, :auto_created_from_inward, :spl_remarks,
+                    :canonical_warehouse, :canonical_group, :canonical_subgroup
+                )
+            """),
+            cold_rows,
+        )
 
     db.commit()
     logger.info("Created bulk entry [%s]: %s with %s boxes", payload.company, txno, global_counter)
@@ -394,13 +464,15 @@ def update_bulk_entry(company: Company, transaction_no: str, payload, db: Sessio
             "transaction_no, sku_id, item_description, item_category, sub_category, "
             "material_type, quality_grade, uom, po_quantity, units, quantity_units, "
             "net_weight, total_weight, po_weight, lot_number, manufacturing_date, "
-            "expiry_date, unit_rate, total_amount, carton_weight, box_count"
+            "expiry_date, unit_rate, total_amount, carton_weight, box_count, "
+            "item_mark, spl_remarks, vakkal"
         )
         _ARTICLE_PARAMS = (
             ":transaction_no, :sku_id, :item_description, :item_category, :sub_category, "
             ":material_type, :quality_grade, :uom, :po_quantity, :units, :quantity_units, "
             ":net_weight, :total_weight, :po_weight, :lot_number, :manufacturing_date, "
-            ":expiry_date, :unit_rate, :total_amount, :carton_weight, :box_count"
+            ":expiry_date, :unit_rate, :total_amount, :carton_weight, :box_count, "
+            ":item_mark, :spl_remarks, :vakkal"
         )
 
         for article in payload.articles:
@@ -745,6 +817,9 @@ def _map_art_row(row) -> dict:
         "total_amount": _safe_float(row.total_amount),
         "carton_weight": _safe_float(row.carton_weight),
         "box_count": row.box_count,
+        "item_mark": row.item_mark if hasattr(row, "item_mark") else None,
+        "spl_remarks": row.spl_remarks if hasattr(row, "spl_remarks") else None,
+        "vakkal": row.vakkal if hasattr(row, "vakkal") else None,
         "created_at": _safe_str(row.created_at),
         "updated_at": _safe_str(row.updated_at),
     }

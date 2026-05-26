@@ -12,6 +12,7 @@ RTV_NOTIFY_TO = "pooja.parkar@candorfoods.in"
 JOB_WORK_TO = "billing@candorfoods.in"
 JOB_WORK_CC = ["b.hrithik@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
 WEEKLY_DIGEST_TO = ["b.hrithik@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
+INWARD_DELETE_TO = "b.hrithik@candorfoods.in"
 
 # Business Head -> email map for RTV notifications.
 # Keys are matched case-insensitively against the business_head value stored on the RTV.
@@ -72,6 +73,8 @@ def _send_email_background(
     plain_body: str,
     to: str | list[str] = RTV_NOTIFY_TO,
     cc: list[str] | None = None,
+    message_id: str | None = None,
+    in_reply_to: str | None = None,
 ) -> None:
     """Send email in a background thread so API response is not delayed."""
     def _send():
@@ -86,6 +89,12 @@ def _send_email_background(
                 msg["Cc"] = ", ".join(cc)
             msg.set_content(plain_body)
             msg.add_alternative(html_body, subtype="html")
+
+            if message_id:
+                msg["Message-ID"] = f"<{message_id}>"
+            if in_reply_to:
+                msg["In-Reply-To"] = f"<{in_reply_to}>"
+                msg["References"] = f"<{in_reply_to}>"
 
             recipients = to_list + (cc or [])
 
@@ -547,25 +556,42 @@ def notify_job_work_material_out_created(payload: dict, header_id: int, created_
     if created_by and created_by not in cc and created_by != JOB_WORK_TO:
         cc.append(created_by)
     _send_email_background(
-        subject=f"Job Work Material Out Created: {challan_no or header_id}",
+        subject=f"Job Work Challan: {challan_no or header_id}",
         html_body=html,
         plain_body="\n".join(plain_lines),
         to=JOB_WORK_TO,
         cc=cc,
+        message_id=f"JWO-{challan_no or header_id}@candorfoods.in",
     )
 
 
-def notify_job_work_material_in_created(payload: dict, ir_number: str, inward_receipt_id: int, created_by: str) -> None:
-    """Send notification email when a Job Work Material In (Inward Receipt) is created."""
+def notify_job_work_material_in_created(
+    payload: dict,
+    ir_number: str,
+    inward_receipt_id: int,
+    created_by: str,
+    challan_summary: list | None = None,
+    all_ir_lines: list | None = None,
+) -> None:
+    """Send notification email when a Job Work Material In (Inward Receipt) is created.
+
+    challan_summary: list of dicts {item_description, sent_kgs, sent_boxes} from jb_materialout_lines
+    all_ir_lines: list of dicts {ir_number, receipt_date, receipt_type, item_description,
+                  finished_goods_kgs, waste_kgs, rejection_kgs, min_loss_pct, max_loss_pct}
+                  for all IRs of this challan including the current one
+    """
     items = payload.get("items", []) or []
     boxes = payload.get("boxes", []) or []
+    receipt_type = payload.get("receipt_type", "partial")
+    original_challan_no = payload.get("original_challan_no", "") or str(inward_receipt_id)
+    is_partial = receipt_type.lower() == "partial"
 
+    # ── Section A: IR Header ─────────────────────────────────────────────
     header_rows = _jw_table([
         ("IR Number", ir_number),
-        ("Inward Receipt ID", str(inward_receipt_id)),
-        ("Against Challan", payload.get("original_challan_no", "")),
+        ("Against Challan", original_challan_no),
         ("Receipt Date", str(payload.get("received_date", ""))),
-        ("Receipt Type", payload.get("receipt_type", "")),
+        ("Receipt Type", receipt_type.title()),
         ("Inward Warehouse", payload.get("inward_warehouse", "")),
         ("Vehicle No", payload.get("vehicle_no", "")),
         ("Driver Name", payload.get("driver_name", "")),
@@ -573,35 +599,179 @@ def notify_job_work_material_in_created(payload: dict, ir_number: str, inward_re
         ("Created By", created_by or "-"),
     ])
 
-    line_columns = [
-        ("Sl", "sl_no"),
-        ("Description", "description"),
-        ("Sent Kgs", "sent_kgs"),
-        ("Sent Boxes", "sent_boxes"),
-        ("FG Kgs", "finished_goods_kgs"),
-        ("FG Boxes", "finished_goods_boxes"),
-        ("Waste Kgs", "waste_kgs"),
-        ("Rejection Kgs", "rejection_kgs"),
-        ("Process", "process_type"),
-    ]
-    line_rows = _jw_lines_html(items, line_columns)
-    line_headers = "".join(
-        f'<th style="padding:8px 10px;text-align:left;">{label}</th>' for label, _ in line_columns
+    # ── Section B: Current IR Lines with inline loss status ──────────────
+    def _loss_badge(loss_pct: float, max_pct: float, partial: bool) -> str:
+        if loss_pct <= 0:
+            return '<span style="color:#27ae60;font-weight:bold;">OK</span>'
+        if loss_pct > max_pct:
+            if partial:
+                return (
+                    f'<span style="color:#e67e22;font-weight:bold;">'
+                    f'{loss_pct:.1f}% &mdash; Partial, more expected</span>'
+                )
+            return (
+                f'<span style="color:#c0392b;font-weight:bold;">'
+                f'Excess {loss_pct:.1f}% (max {max_pct:.1f}%)</span>'
+            )
+        return f'<span style="color:#27ae60;">{loss_pct:.1f}% OK</span>'
+
+    cur_line_rows = ""
+    for i, it in enumerate(items, 1):
+        sent = float(it.get("sent_kgs") or 0)
+        fg = float(it.get("finished_goods_kgs") or 0)
+        waste = float(it.get("waste_kgs") or 0)
+        rej = float(it.get("rejection_kgs") or 0)
+        accounted = fg + waste + rej
+        loss_pct = ((sent - accounted) / sent * 100) if sent > 0 else 0
+        max_pct = float(it.get("max_loss_pct") or 10)
+        badge = _loss_badge(loss_pct, max_pct, is_partial)
+        bg = "#fff" if i % 2 else "#f8f9fa"
+        cur_line_rows += (
+            f'<tr style="background:{bg};">'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{i}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{it.get("description", "") or "-"}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{sent:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{fg:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{waste:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{rej:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{badge}</td>'
+            f'</tr>'
+        )
+    if not cur_line_rows:
+        cur_line_rows = '<tr><td colspan="7" style="text-align:center;padding:8px;">No line items</td></tr>'
+    cur_line_headers = "".join(
+        f'<th style="padding:8px 10px;text-align:left;">{h}</th>'
+        for h in ["Sl", "Description", "Sent Kgs", "FG Kgs", "Waste Kgs", "Rejection Kgs", "Loss Status"]
     )
 
+    # ── Section C: Challan IR History ────────────────────────────────────
+    ir_history: dict[str, dict] = {}
+    for ln in (all_ir_lines or []):
+        key = ln.get("ir_number", "?")
+        if key not in ir_history:
+            ir_history[key] = {
+                "ir_number": key,
+                "receipt_date": str(ln.get("receipt_date", "")),
+                "receipt_type": ln.get("receipt_type", ""),
+                "fg": 0.0, "waste": 0.0, "rejection": 0.0,
+            }
+        ir_history[key]["fg"] += float(ln.get("finished_goods_kgs") or 0)
+        ir_history[key]["waste"] += float(ln.get("waste_kgs") or 0)
+        ir_history[key]["rejection"] += float(ln.get("rejection_kgs") or 0)
+
+    history_rows = ""
+    total_fg = total_waste = total_rej = 0.0
+    for ir_key, ir in ir_history.items():
+        accounted = ir["fg"] + ir["waste"] + ir["rejection"]
+        total_fg += ir["fg"]
+        total_waste += ir["waste"]
+        total_rej += ir["rejection"]
+        is_current = ir_key == ir_number
+        row_style = "background:#dbeafe;font-weight:bold;" if is_current else "background:#fff;"
+        history_rows += (
+            f'<tr style="{row_style}">'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">'
+            f'{ir_key}{"&nbsp;&#9664; current" if is_current else ""}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{ir["receipt_date"]}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{ir["receipt_type"].title()}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{ir["fg"]:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{ir["waste"]:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{ir["rejection"]:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;font-weight:bold;">{accounted:g}</td>'
+            f'</tr>'
+        )
+    total_accounted_history = total_fg + total_waste + total_rej
+    if history_rows:
+        history_rows += (
+            f'<tr style="background:#e8edf5;font-weight:bold;">'
+            f'<td colspan="3" style="padding:6px 10px;border:1px solid #e0e0e0;">Total</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{total_fg:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{total_waste:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{total_rej:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{total_accounted_history:g}</td>'
+            f'</tr>'
+        )
+    else:
+        history_rows = '<tr><td colspan="7" style="text-align:center;padding:8px;">No history available</td></tr>'
+    history_headers = "".join(
+        f'<th style="padding:8px 10px;text-align:left;">{h}</th>'
+        for h in ["IR Number", "Date", "Type", "FG Kgs", "Waste Kgs", "Rejection Kgs", "Accounted Kgs"]
+    )
+
+    # ── Section D: Pendency per item ─────────────────────────────────────
+    received_by_item: dict[str, float] = {}
+    for ln in (all_ir_lines or []):
+        desc = ln.get("item_description", "") or "-"
+        received_by_item[desc] = received_by_item.get(desc, 0.0) + (
+            float(ln.get("finished_goods_kgs") or 0)
+            + float(ln.get("waste_kgs") or 0)
+            + float(ln.get("rejection_kgs") or 0)
+        )
+
+    pendency_rows = ""
+    total_sent_all = total_pending_all = 0.0
+    for item in (challan_summary or []):
+        desc = item.get("item_description", "") or "-"
+        sent = float(item.get("sent_kgs") or 0)
+        accounted = received_by_item.get(desc, 0.0)
+        pending = max(sent - accounted, 0.0)
+        total_sent_all += sent
+        total_pending_all += pending
+        if pending > 0:
+            row_style = "font-weight:bold;background:#fff9e6;"
+            pending_cell = f'<span style="color:#c0392b;">{pending:g} Kgs</span>'
+        else:
+            row_style = "color:#888;background:#f8f9fa;"
+            pending_cell = '<span style="color:#27ae60;">Fully accounted</span>'
+        pendency_rows += (
+            f'<tr style="{row_style}">'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{desc}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{sent:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{accounted:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{pending_cell}</td>'
+            f'</tr>'
+        )
+
+    if not pendency_rows:
+        pendency_rows = '<tr><td colspan="4" style="text-align:center;padding:8px;">No dispatch data available</td></tr>'
+    else:
+        total_pending_label = (
+            f'<span style="color:#c0392b;">{total_pending_all:g} Kgs pending</span>'
+            if total_pending_all > 0
+            else '<span style="color:#27ae60;">All accounted</span>'
+        )
+        pendency_rows += (
+            f'<tr style="background:#e8edf5;font-weight:bold;">'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">Total</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{total_sent_all:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{total_accounted_history:g}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{total_pending_label}</td>'
+            f'</tr>'
+        )
+
+    pendency_note = ""
+    if total_pending_all > 0 and is_partial:
+        pendency_note = (
+            f'<p style="margin:8px 0 0;color:#e67e22;font-size:13px;">'
+            f'&#9432; Further Material In receipt(s) expected &mdash; '
+            f'{total_pending_all:g} Kgs still pending.</p>'
+        )
+    pendency_headers = "".join(
+        f'<th style="padding:8px 10px;text-align:left;">{h}</th>'
+        for h in ["Item Description", "Sent Kgs", "Total Accounted", "Pending"]
+    )
+
+    # ── Boxes section ─────────────────────────────────────────────────────
     boxes_section = ""
     if boxes:
         box_columns = [
-            ("Box ID", "box_id"),
-            ("Box #", "box_number"),
-            ("Item", "item_description"),
-            ("Net Wt", "net_weight"),
-            ("Lot No", "lot_no"),
-            ("Location", "storage_location"),
+            ("Box ID", "box_id"), ("Box #", "box_number"), ("Item", "item_description"),
+            ("Net Wt", "net_weight"), ("Lot No", "lot_no"), ("Location", "storage_location"),
         ]
         box_rows = _jw_lines_html(boxes, box_columns)
         box_headers = "".join(
-            f'<th style="padding:8px 10px;text-align:left;">{label}</th>' for label, _ in box_columns
+            f'<th style="padding:8px 10px;text-align:left;">{label}</th>'
+            for label, _ in box_columns
         )
         boxes_section = f"""
       <h3 style="color:#29417A;margin:24px 0 8px;">Boxes</h3>
@@ -610,64 +780,76 @@ def notify_job_work_material_in_created(payload: dict, ir_number: str, inward_re
         <tbody>{box_rows}</tbody>
       </table>"""
 
+    # ── Assemble HTML ─────────────────────────────────────────────────────
     body = f"""
       <h3 style="color:#29417A;margin:0 0 8px;">Header Details</h3>
       <table style="border-collapse:collapse;width:100%;font-size:13px;">
         <tbody>{header_rows}</tbody>
       </table>
 
-      <h3 style="color:#29417A;margin:24px 0 8px;">Line Items</h3>
+      <h3 style="color:#29417A;margin:24px 0 8px;">Current Receipt Lines</h3>
       <table style="border-collapse:collapse;width:100%;font-size:13px;">
-        <thead><tr style="background:#29417A;color:#fff;">{line_headers}</tr></thead>
-        <tbody>{line_rows}</tbody>
+        <thead><tr style="background:#29417A;color:#fff;">{cur_line_headers}</tr></thead>
+        <tbody>{cur_line_rows}</tbody>
       </table>
+
+      <h3 style="color:#29417A;margin:24px 0 8px;">Challan IR History</h3>
+      <table style="border-collapse:collapse;width:100%;font-size:13px;">
+        <thead><tr style="background:#29417A;color:#fff;">{history_headers}</tr></thead>
+        <tbody>{history_rows}</tbody>
+      </table>
+
+      <h3 style="color:#29417A;margin:24px 0 8px;">Pendency</h3>
+      <table style="border-collapse:collapse;width:100%;font-size:13px;">
+        <thead><tr style="background:#29417A;color:#fff;">{pendency_headers}</tr></thead>
+        <tbody>{pendency_rows}</tbody>
+      </table>
+      {pendency_note}
 
       {boxes_section}
     """
 
     html = _jw_wrap(
-        title="Job Work — Material In Created",
-        subtitle=f"IR {ir_number}",
+        title=f"Job Work — Material In ({'Final' if not is_partial else 'Partial'})",
+        subtitle=f"IR {ir_number} | Challan {original_challan_no}",
         body_html=body,
     )
 
+    # ── Plain text fallback ───────────────────────────────────────────────
     plain_lines = [
-        f"Job Work Material In Created — IR: {ir_number} (ID {inward_receipt_id})",
-        f"Against Challan: {payload.get('original_challan_no', '')}",
-        f"Receipt Type: {payload.get('receipt_type', '')}",
+        f"Job Work Material In {'Final' if not is_partial else 'Partial'} — IR: {ir_number}",
+        f"Against Challan: {original_challan_no}",
+        f"Receipt Type: {receipt_type}",
         f"Receipt Date: {payload.get('received_date', '')}",
         f"Inward Warehouse: {payload.get('inward_warehouse', '')}",
         f"Created By: {created_by or '-'}",
         "",
-        "Line Items:",
+        "Current Receipt Lines:",
     ]
     for it in items:
+        sent = float(it.get("sent_kgs") or 0)
+        fg = float(it.get("finished_goods_kgs") or 0)
+        waste = float(it.get("waste_kgs") or 0)
+        rej = float(it.get("rejection_kgs") or 0)
+        loss_pct = ((sent - fg - waste - rej) / sent * 100) if sent > 0 else 0
         plain_lines.append(
-            f"  {it.get('description', '')} | "
-            f"Sent: {it.get('sent_kgs', 0)}kg/{it.get('sent_boxes', 0)}box | "
-            f"FG: {it.get('finished_goods_kgs', 0)}kg | "
-            f"Waste: {it.get('waste_kgs', 0)}kg | "
-            f"Rejection: {it.get('rejection_kgs', 0)}kg"
+            f"  {it.get('description', '')} | Sent: {sent:g} | FG: {fg:g} | "
+            f"Waste: {waste:g} | Rejection: {rej:g} | Loss: {loss_pct:.1f}%"
+            + (" [PARTIAL]" if is_partial else "")
         )
-    if boxes:
-        plain_lines.append("")
-        plain_lines.append("Boxes:")
-        for b in boxes:
-            plain_lines.append(
-                f"  {b.get('item_description', '')} Box#{b.get('box_number', '')} | "
-                f"Net: {b.get('net_weight', 0)} | "
-                f"Lot: {b.get('lot_no', '-')}"
-            )
+    if total_pending_all > 0:
+        plain_lines += ["", f"Pending: {total_pending_all:g} Kgs still outstanding."]
 
     cc = list(JOB_WORK_CC)
     if created_by and created_by not in cc and created_by != JOB_WORK_TO:
         cc.append(created_by)
     _send_email_background(
-        subject=f"Job Work Material In Created: {ir_number}",
+        subject=f"Job Work Challan: {original_challan_no}",
         html_body=html,
         plain_body="\n".join(plain_lines),
         to=JOB_WORK_TO,
         cc=cc,
+        in_reply_to=f"JWO-{original_challan_no}@candorfoods.in",
     )
 
 
@@ -805,11 +987,12 @@ def notify_job_work_material_out_updated(payload: dict, record_id: int, updated_
     if updated_by and updated_by not in cc and updated_by != JOB_WORK_TO:
         cc.append(updated_by)
     _send_email_background(
-        subject=f"Job Work Material Out Updated: {challan_no or record_id}",
+        subject=f"Job Work Challan: {challan_no or record_id}",
         html_body=html,
         plain_body="\n".join(plain_lines),
         to=JOB_WORK_TO,
         cc=cc,
+        in_reply_to=f"JWO-{challan_no or record_id}@candorfoods.in",
     )
 
 
@@ -846,11 +1029,12 @@ def notify_job_work_material_out_deleted(challan_no: str, record_id: int, delete
     if deleted_by and deleted_by not in cc and deleted_by != JOB_WORK_TO:
         cc.append(deleted_by)
     _send_email_background(
-        subject=f"Job Work Material Out Deleted: {challan_no or record_id}",
+        subject=f"Job Work Challan: {challan_no or record_id}",
         html_body=html,
         plain_body=plain,
         to=JOB_WORK_TO,
         cc=cc,
+        in_reply_to=f"JWO-{challan_no or record_id}@candorfoods.in",
     )
 
 
@@ -889,11 +1073,12 @@ def notify_job_work_material_in_deleted(ir_number: str, ir_id: int, challan_no: 
     if deleted_by and deleted_by not in cc and deleted_by != JOB_WORK_TO:
         cc.append(deleted_by)
     _send_email_background(
-        subject=f"Job Work Material In Deleted: {ir_number or ir_id}",
+        subject=f"Job Work Challan: {challan_no or ir_id}",
         html_body=html,
         plain_body=plain,
         to=JOB_WORK_TO,
         cc=cc,
+        in_reply_to=f"JWO-{challan_no or ir_id}@candorfoods.in",
     )
 
 
@@ -935,11 +1120,12 @@ def notify_job_work_status_changed(
     if changed_by and changed_by not in cc and changed_by != JOB_WORK_TO:
         cc.append(changed_by)
     _send_email_background(
-        subject=f"Job Work Status Changed: {challan_no or header_id} [{old_status} -> {new_status}]",
+        subject=f"Job Work Challan: {challan_no or header_id}",
         html_body=html,
         plain_body=plain,
         to=JOB_WORK_TO,
         cc=cc,
+        in_reply_to=f"JWO-{challan_no or header_id}@candorfoods.in",
     )
 
 
@@ -988,11 +1174,12 @@ def notify_job_work_excess_loss(
     if created_by and created_by not in cc and created_by != JOB_WORK_TO:
         cc.append(created_by)
     _send_email_background(
-        subject=f"ALERT: Excess Loss on Challan {challan_no or header_id} ({loss_pct:.2f}%)",
+        subject=f"Job Work Challan: {challan_no or header_id}",
         html_body=html,
         plain_body=plain,
         to=JOB_WORK_TO,
         cc=cc,
+        in_reply_to=f"JWO-{challan_no or header_id}@candorfoods.in",
     )
 
 
@@ -1170,3 +1357,84 @@ def send_job_work_weekly_digest() -> None:
         to=WEEKLY_DIGEST_TO,
     )
     logger.info(f"Weekly digest sent to {WEEKLY_DIGEST_TO}")
+
+
+# ════════════════════════════════════════════════════════════
+#  Inward Delete Notification
+# ════════════════════════════════════════════════════════════
+
+
+def notify_inward_deleted(
+    transaction_no: str,
+    company: str,
+    entry_date: str | None = None,
+    vendor: str | None = None,
+    warehouse: str | None = None,
+    articles_count: int = 0,
+    boxes_count: int = 0,
+    source: str = "inward",
+) -> None:
+    """Send notification to b.hrithik when an inward transaction is deleted."""
+    rows = [
+        ("Transaction No", transaction_no),
+        ("Company", company),
+        ("Entry Date", entry_date or "-"),
+        ("Vendor / Supplier", vendor or "-"),
+        ("Warehouse", warehouse or "-"),
+        ("Articles", str(articles_count)),
+        ("Boxes", str(boxes_count)),
+        ("Source", source),
+        ("Deleted At", datetime.now().strftime("%d %b %Y, %I:%M %p")),
+    ]
+    header_rows = ""
+    for label, value in rows:
+        header_rows += (
+            f'<tr>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;font-weight:bold;'
+            f'background:#f8f9fa;width:180px;">{label}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{value}</td>'
+            f'</tr>'
+        )
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Arial,sans-serif;margin:0;padding:0;background:#f4f4f4;">
+  <table width="100%" cellpadding="0" cellspacing="0"
+         style="max-width:640px;margin:20px auto;background:#fff;border-radius:8px;
+                overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+    <tr><td style="background:#c0392b;color:#fff;padding:20px 24px;">
+      <h2 style="margin:0;">Inward Deleted</h2>
+      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">
+        {transaction_no} &mdash; {company}
+      </p>
+    </td></tr>
+    <tr><td style="padding:20px 24px;">
+      <p style="color:#c0392b;font-weight:bold;margin:0 0 16px;">
+        The following inward transaction has been permanently deleted along with all its articles, boxes, and cold stock entries.
+      </p>
+      <table style="border-collapse:collapse;width:100%;font-size:13px;">
+        <tbody>{header_rows}</tbody>
+      </table>
+    </td></tr>
+    <tr><td style="background:#f8f9fa;padding:12px 24px;text-align:center;font-size:12px;color:#888;">
+      Candor Foods &mdash; IMS Inward Notification
+    </td></tr>
+  </table>
+</body></html>"""
+
+    plain = (
+        f"INWARD DELETED: {transaction_no} ({company})\n"
+        f"Entry Date: {entry_date or '-'}\n"
+        f"Vendor: {vendor or '-'}\n"
+        f"Warehouse: {warehouse or '-'}\n"
+        f"Articles: {articles_count} | Boxes: {boxes_count}\n"
+        f"Source: {source}\n"
+        f"Deleted At: {datetime.now().strftime('%d %b %Y, %I:%M %p')}"
+    )
+
+    _send_email_background(
+        subject=f"Inward Deleted: {transaction_no} [{company}]",
+        html_body=html,
+        plain_body=plain,
+        to=INWARD_DELETE_TO,
+    )

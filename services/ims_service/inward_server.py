@@ -29,15 +29,17 @@ from services.ims_service.inward_models import (
     BoxUpsertRequest,
     BoxUpsertResponse,
     BoxEditLogRequest,
-    BulkStickerPayload,
-    BulkStickerResponse,
 )
+from services.bulk_entry_service.models import (
+    BulkEntryPayload,
+    BulkEntryResponse,
+)
+from services.bulk_entry_service.tools import create_bulk_entry
 from services.ims_service.inward_tools import (
     list_inward_records,
     list_distinct_warehouses,
     export_inward_records,
     create_inward,
-    create_inward_bulk_sticker,
     get_inward,
     update_inward,
     delete_inward,
@@ -393,13 +395,13 @@ def create_inward_endpoint(payload: InwardPayloadFlexible, db: Session = Depends
     return create_inward(payload, db)
 
 
-@router.post("/bulk-sticker", status_code=201, response_model=BulkStickerResponse)
+@router.post("/bulk-sticker", status_code=201, response_model=BulkEntryResponse)
 def create_inward_bulk_sticker_endpoint(
-    payload: BulkStickerPayload,
+    payload: BulkEntryPayload,
     db: Session = Depends(get_db),
 ):
-    """Create inward entry with immediate box_id generation for bulk sticker printing."""
-    return create_inward_bulk_sticker(payload, db)
+    """Create cold-storage bulk inward — stores in cfpl/cdpl_bulk_entry_* tables."""
+    return create_bulk_entry(payload, db)
 
 
 @router.put("/{company}/{transaction_no}/box", response_model=BoxUpsertResponse)

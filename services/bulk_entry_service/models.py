@@ -67,6 +67,9 @@ class ArticleIn(BaseModel):
     box_count: PositiveInt
     box_net_weight: Optional[Decimal18_3] = None
     box_gross_weight: Optional[Decimal18_3] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
 
 
 class BulkEntryPayload(BaseModel):
@@ -127,6 +130,9 @@ class ArticleUpdateIn(BaseModel):
     box_count: Optional[PositiveInt] = None
     box_net_weight: Optional[Decimal18_3] = None
     box_gross_weight: Optional[Decimal18_3] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
 
 
 class BoxUpdateIn(BaseModel):
@@ -239,6 +245,9 @@ class ArticleResponse(BaseModel):
     total_amount: Optional[float] = None
     carton_weight: Optional[float] = None
     box_count: Optional[int] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 

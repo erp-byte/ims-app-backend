@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     WHATSAPP_ACCESS_TOKEN: str = ""
     WHATSAPP_PHONE_NUMBER_ID: str = ""
     WHATSAPP_RECIPIENT: str = ""
+    FRONTEND_URL: str = "https://ims.candorfoods.in"
+    BACKEND_URL: str = "https://mmvxmfvhmq.ap-south-1.awsapprunner.com"
 
     class Config:
         env_file = ".env"

@@ -2,11 +2,20 @@ import smtplib
 import threading
 from datetime import datetime
 from email.message import EmailMessage
+from urllib.parse import quote
 
 from shared.config_loader import settings
 from shared.logger import get_logger
 
 logger = get_logger("email.notifier")
+
+
+def _build_rtv_action_url(rtv_id: str, bh_email: str, action: str) -> str:
+    base = settings.BACKEND_URL.rstrip("/")
+    return (
+        f"{base}/rtv/action?rtv_id={quote(rtv_id)}"
+        f"&bh_email={quote(bh_email)}&action={action}"
+    )
 
 RTV_NOTIFY_TO = "pooja.parkar@candorfoods.in"
 JOB_WORK_TO = "billing@candorfoods.in"
@@ -150,8 +159,19 @@ def _build_boxes_html(boxes: list[dict]) -> str:
     return rows
 
 
-def _rtv_email_html(action: str, header: dict, lines: list[dict], boxes: list[dict], extra_info: str = "") -> tuple[str, str]:
-    """Return (html_body, plain_body) for an RTV notification email."""
+def _rtv_email_html(
+    action: str,
+    header: dict,
+    lines: list[dict],
+    boxes: list[dict],
+    extra_info: str = "",
+    action_buttons: list[tuple[str, str, str]] | None = None,
+) -> tuple[str, str]:
+    """Return (html_body, plain_body) for an RTV notification email.
+
+    action_buttons: optional list of (label, url, hex_color) tuples rendered as
+    a call-to-action row above the header table.
+    """
 
     header_fields = [
         ("RTV ID", header.get("rtv_id", "")),
@@ -202,6 +222,18 @@ def _rtv_email_html(action: str, header: dict, lines: list[dict], boxes: list[di
     if extra_info:
         extra_section = f'<p style="color:#555;margin:16px 0;">{extra_info}</p>'
 
+    buttons_section = ""
+    if action_buttons:
+        button_cells = "".join(
+            f'<a href="{url}" style="display:inline-block;padding:10px 24px;margin:0 6px;'
+            f'background:{color};color:#fff;text-decoration:none;font-weight:bold;'
+            f'border-radius:6px;font-size:14px;">{label}</a>'
+            for label, url, color in action_buttons
+        )
+        buttons_section = (
+            f'<div style="text-align:center;margin:8px 0 22px;">{button_cells}</div>'
+        )
+
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="font-family:Arial,sans-serif;margin:0;padding:0;background:#f4f4f4;">
@@ -213,6 +245,7 @@ def _rtv_email_html(action: str, header: dict, lines: list[dict], boxes: list[di
     <tr><td style="padding:20px 24px;">
 
       {extra_section}
+      {buttons_section}
 
       <h3 style="color:#29417A;margin:0 0 8px;">Header Details</h3>
       <table style="border-collapse:collapse;width:100%;font-size:13px;">
@@ -271,22 +304,114 @@ def _rtv_email_html(action: str, header: dict, lines: list[dict], boxes: list[di
                 f"Lot: {box.get('lot_number', '-')} | Box ID: {box.get('box_id', '-')}"
             )
 
+    if action_buttons:
+        plain_lines.append("")
+        plain_lines.append("Actions:")
+        for label, url, _color in action_buttons:
+            plain_lines.append(f"  {label}: {url}")
+
     return html, "\n".join(plain_lines)
 
 
 def notify_rtv_created(rtv_detail: dict) -> None:
-    """Send notification email when an RTV is created."""
+    """Send notification email when an RTV is created.
+
+    Business head is the primary recipient (TO) so the Approve / Reject / Hold
+    buttons land directly in their inbox. Each button URL carries
+    (rtv_id, bh_email, action) as query params; the backend rejects any
+    click whose bh_email doesn't match the business_head stored on the RTV.
+    """
+    rtv_id = rtv_detail.get("rtv_id", "")
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
+
+    # Buttons require a resolvable BH email — the backend validates that the
+    # email in the URL matches the BH stored on the RTV. If the RTV has no
+    # recognised business_head, send the mail without action buttons.
+    action_buttons: list[tuple[str, str, str]] | None = None
+    if rtv_id and bh_email:
+        action_buttons = [
+            ("Approve", _build_rtv_action_url(rtv_id, bh_email, "approve"), "#27ae60"),
+            ("Reject",  _build_rtv_action_url(rtv_id, bh_email, "reject"),  "#c0392b"),
+            ("Hold",    _build_rtv_action_url(rtv_id, bh_email, "hold"),    "#e67e22"),
+        ]
+
     html, plain = _rtv_email_html(
         action="Created",
         header=rtv_detail,
         lines=rtv_detail.get("lines", []),
         boxes=rtv_detail.get("boxes", []),
+        action_buttons=action_buttons,
     )
-    cc = _build_rtv_cc(rtv_detail.get("business_head"), rtv_detail.get("created_by"))
+
+    to_list: list[str] = []
+    if bh_email:
+        to_list.append(bh_email)
+    to_list.append(RTV_NOTIFY_TO)
+
+    to_lower = {addr.strip().lower() for addr in to_list}
+    cc_candidates: list[str] = list(RTV_CC_CONSTANT)
+    created_by = rtv_detail.get("created_by")
+    if created_by:
+        cc_candidates.append(created_by)
+    seen: set[str] = set()
+    cc: list[str] = []
+    for addr in cc_candidates:
+        normalized = addr.strip().lower()
+        if not normalized or normalized in seen or normalized in to_lower:
+            continue
+        seen.add(normalized)
+        cc.append(addr.strip())
+
     _send_email_background(
-        subject=f"RTV Created: {rtv_detail.get('rtv_id', '')}",
+        subject=f"RTV Created: {rtv_id}",
         html_body=html,
         plain_body=plain,
+        to=to_list,
+        cc=cc,
+    )
+
+
+def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: str) -> None:
+    """Send a confirmation mail after an Approve / Reject / Hold action.
+
+    Uses the same recipient pattern as notify_rtv_created (BH + pooja in TO,
+    constants + creator in CC) so everyone on the original Created mail sees
+    the outcome.
+    """
+    rtv_id = rtv_detail.get("rtv_id", "")
+    html, plain = _rtv_email_html(
+        action=new_status,
+        header=rtv_detail,
+        lines=rtv_detail.get("lines", []),
+        boxes=rtv_detail.get("boxes", []),
+        extra_info=f"{new_status} by: {actioned_by}",
+    )
+
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
+    to_list: list[str] = []
+    if bh_email:
+        to_list.append(bh_email)
+    to_list.append(RTV_NOTIFY_TO)
+
+    to_lower = {addr.strip().lower() for addr in to_list}
+    cc_candidates: list[str] = list(RTV_CC_CONSTANT)
+    created_by = rtv_detail.get("created_by")
+    if created_by:
+        cc_candidates.append(created_by)
+    seen: set[str] = set()
+    cc: list[str] = []
+    for addr in cc_candidates:
+        normalized = addr.strip().lower()
+        if not normalized or normalized in seen or normalized in to_lower:
+            continue
+        seen.add(normalized)
+        cc.append(addr.strip())
+
+    _send_email_background(
+        subject=f"RTV {new_status}: {rtv_id}",
+        html_body=html,
+        plain_body=plain,
+        to=to_list,
         cc=cc,
     )
 

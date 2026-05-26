@@ -243,3 +243,21 @@ class RTVApprovalResponse(BaseModel):
     company: str
     approved_by: str
     approved_at: str
+
+
+# ── Email action button request / response ───
+
+
+class RTVActionRequest(BaseModel):
+    rtv_id: str
+    business_head_email: str
+    action: Literal["approve", "reject", "hold"]
+
+
+class RTVActionResponse(BaseModel):
+    success: bool
+    rtv_id: str
+    company: str
+    status: str
+    actioned_by: str
+    actioned_at: str

@@ -1,9 +1,10 @@
 from io import BytesIO
 from datetime import date
-from typing import Optional
+from html import escape
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, Query
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from shared.database import get_db
@@ -22,6 +23,8 @@ from services.ims_service.rtv_models import (
     RTVApprovalRequest,
     RTVApprovalResponse,
     RTVBoxEditLogRequest,
+    RTVActionRequest,
+    RTVActionResponse,
 )
 from services.ims_service.rtv_tools import (
     create_rtv,
@@ -34,6 +37,8 @@ from services.ims_service.rtv_tools import (
     approve_rtv,
     log_rtv_box_edits,
     export_rtv_records,
+    set_rtv_status,
+    apply_rtv_email_action,
 )
 from shared.email_notifier import (
     notify_rtv_created,
@@ -41,6 +46,7 @@ from shared.email_notifier import (
     notify_rtv_deleted,
     notify_rtv_header_updated,
     notify_rtv_lines_updated,
+    notify_rtv_status_changed,
 )
 
 router = APIRouter(prefix="/rtv", tags=["rtv"])
@@ -169,6 +175,112 @@ def log_rtv_box_edit_endpoint(
 ):
     """Log audit entries for edits to a previously-printed RTV box."""
     return log_rtv_box_edits(payload, db)
+
+
+# ── Email-button action (Approve / Reject / Hold) ─────────
+# Registered before /{company} so FastAPI doesn't bind "action" as a company.
+
+
+def _email_action_html(title: str, message: str, color: str) -> str:
+    """Render the page that closes Gmail's in-app browser after a click."""
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{escape(title)}</title>
+</head>
+<body style="margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;background:#f4f4f4;">
+  <div style="max-width:480px;margin:60px auto;background:#fff;padding:36px 28px;border-radius:12px;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,0.08);">
+    <div style="width:64px;height:64px;border-radius:50%;background:{color};margin:0 auto 18px;line-height:64px;color:#fff;font-size:34px;font-weight:bold;">&#10003;</div>
+    <h2 style="margin:0 0 10px;color:#222;font-size:20px;">{escape(title)}</h2>
+    <p style="margin:0 0 22px;color:#555;font-size:14px;line-height:1.5;">{escape(message)}</p>
+    <p style="margin:0;color:#999;font-size:12px;">This window will close automatically.</p>
+  </div>
+  <script>
+    (function () {{
+      // Best-effort close of mail-client in-app browser.
+      function tryClose() {{
+        try {{ window.close(); }} catch (_) {{}}
+        try {{ self.close(); }} catch (_) {{}}
+        try {{ window.history.back(); }} catch (_) {{}}
+      }}
+      tryClose();
+      setTimeout(tryClose, 400);
+      setTimeout(tryClose, 1200);
+    }})();
+  </script>
+</body></html>"""
+
+
+@router.get("/action", response_class=HTMLResponse)
+def email_action_endpoint(
+    rtv_id: str = Query(..., description="RTV id from the Created mail link"),
+    bh_email: str = Query(..., description="Business head email from the link"),
+    action: Literal["approve", "reject", "hold"] = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Email-button GET endpoint.
+
+    Validates that bh_email matches the business_head stored on the RTV,
+    applies the status transition (Approve/Reject/Hold), fires a
+    confirmation mail naming who actioned the RTV, and returns an HTML page
+    that closes the mail-client in-app browser.
+    """
+    try:
+        result = apply_rtv_email_action(rtv_id=rtv_id, bh_email=bh_email, action=action, db=db)
+    except HTTPException as exc:
+        return HTMLResponse(
+            _email_action_html(
+                title="Action failed",
+                message=str(exc.detail),
+                color="#c0392b",
+            ),
+            status_code=exc.status_code,
+        )
+
+    if result["already_actioned"]:
+        return HTMLResponse(
+            _email_action_html(
+                title="Already actioned",
+                message=f"RTV {result['rtv_id']} is already {result['status']}.",
+                color="#e67e22",
+            )
+        )
+
+    # First successful state change → fire the confirmation mail.
+    detail = result.get("detail")
+    if isinstance(detail, dict):
+        notify_rtv_status_changed(
+            detail,
+            new_status=result["status"],
+            actioned_by=result["actioned_by"],
+        )
+
+    return HTMLResponse(
+        _email_action_html(
+            title=f"RTV {result['status']}",
+            message=f"RTV {result['rtv_id']} is now {result['status']}.",
+            color="#27ae60",
+        )
+    )
+
+
+@router.post("/action", response_model=RTVActionResponse)
+def set_rtv_status_endpoint(
+    payload: RTVActionRequest,
+    db: Session = Depends(get_db),
+):
+    """Programmatic status update (no token; for trusted internal callers).
+
+    Email buttons use the GET endpoint above with a signed token. This POST
+    remains for non-mail consumers and does NOT enforce BH-ownership.
+    """
+    return set_rtv_status(
+        rtv_id=payload.rtv_id,
+        business_head_email=payload.business_head_email,
+        action=payload.action,
+        db=db,
+    )
 
 
 # ── CRUD endpoints ───────────────────────────

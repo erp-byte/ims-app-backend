@@ -747,6 +747,184 @@ def approve_rtv(
 
 
 # ══════════════════════════════════════════════
+#  Email-action status transition (Approve / Reject / Hold)
+# ══════════════════════════════════════════════
+
+
+ACTION_TO_STATUS = {
+    "approve": "Approved",
+    "reject":  "Rejected",
+    "hold":    "On Hold",
+}
+
+
+def set_rtv_status(
+    rtv_id: str, business_head_email: str, action: str, db: Session
+) -> dict:
+    """Update an RTV's status from an email action button click.
+
+    Locates the RTV across both company-partitioned tables by its string
+    rtv_id, sets the status, and records the actor in approved_by/approved_at
+    (those columns already exist and now capture any state transition).
+    """
+    new_status = ACTION_TO_STATUS.get(action)
+    if not new_status:
+        raise HTTPException(400, f"Invalid action '{action}'")
+
+    matches: list = []
+    for company in ("CFPL", "CDPL"):
+        tables = rtv_table_names(company)
+        row = db.execute(
+            text(f"SELECT id FROM {tables['header']} WHERE rtv_id = :rid"),
+            {"rid": rtv_id},
+        ).fetchone()
+        if row:
+            matches.append((company, row.id))
+
+    if not matches:
+        raise HTTPException(404, f"RTV {rtv_id} not found")
+    if len(matches) > 1:
+        raise HTTPException(
+            409, f"RTV id {rtv_id} is ambiguous — matches in {[m[0] for m in matches]}"
+        )
+
+    company, header_id = matches[0]
+    tables = rtv_table_names(company)
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    db.execute(
+        text(f"""
+            UPDATE {tables['header']}
+            SET status      = :status,
+                approved_by = :actor,
+                approved_at = :actioned_at,
+                updated_at  = NOW()
+            WHERE id = :hid
+        """),
+        {
+            "hid": header_id,
+            "status": new_status,
+            "actor": business_head_email,
+            "actioned_at": now,
+        },
+    )
+    db.commit()
+
+    return {
+        "success": True,
+        "rtv_id": rtv_id,
+        "company": company,
+        "status": new_status,
+        "actioned_by": business_head_email,
+        "actioned_at": now,
+    }
+
+
+def apply_rtv_email_action(
+    rtv_id: str, bh_email: str, action: str, db: Session
+) -> dict:
+    """Apply an email-button action after validating BH ownership against the DB.
+
+    Returns a dict describing the outcome. Caller is expected to fire the
+    confirmation mail when ``already_actioned`` is False.
+    """
+    if not rtv_id or not bh_email:
+        raise HTTPException(400, "Missing rtv_id or bh_email")
+    if action not in ACTION_TO_STATUS:
+        raise HTTPException(400, f"Invalid action '{action}'")
+
+    new_status = ACTION_TO_STATUS[action]
+
+    matches: list = []
+    for company in ("CFPL", "CDPL"):
+        tables = rtv_table_names(company)
+        row = db.execute(
+            text(
+                f"SELECT id, status, business_head FROM {tables['header']} WHERE rtv_id = :rid"
+            ),
+            {"rid": rtv_id},
+        ).fetchone()
+        if row:
+            matches.append((company, row))
+
+    if not matches:
+        raise HTTPException(404, f"RTV {rtv_id} not found")
+    if len(matches) > 1:
+        raise HTTPException(
+            409, f"RTV id {rtv_id} ambiguous across {[m[0] for m in matches]}"
+        )
+
+    company, row = matches[0]
+    header_id = row.id
+    current_status = (row.status or "Pending")
+
+    # Validate the URL's bh_email matches the BH stored on the RTV record.
+    from shared.email_notifier import _lookup_business_head_email
+    rtv_bh_email = _lookup_business_head_email(row.business_head)
+    if not rtv_bh_email or rtv_bh_email.lower() != bh_email.lower():
+        raise HTTPException(
+            403, "This action link is not authorised for the recipient on file"
+        )
+
+    # Idempotency: if the RTV has already moved out of Pending, do nothing.
+    if current_status != "Pending":
+        detail = get_rtv(company, header_id, db)
+        return {
+            "already_actioned": True,
+            "rtv_id": rtv_id,
+            "company": company,
+            "status": current_status,
+            "requested_status": new_status,
+            "detail": detail,
+        }
+
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    tables = rtv_table_names(company)
+    result = db.execute(
+        text(
+            f"""
+            UPDATE {tables['header']}
+            SET status      = :status,
+                approved_by = :actor,
+                approved_at = :actioned_at,
+                updated_at  = NOW()
+            WHERE id = :hid AND status = 'Pending'
+            """
+        ),
+        {
+            "hid": header_id,
+            "status": new_status,
+            "actor": bh_email,
+            "actioned_at": now,
+        },
+    )
+    db.commit()
+
+    if result.rowcount == 0:
+        # Lost a race with a concurrent click — re-read and report as already actioned.
+        detail = get_rtv(company, header_id, db)
+        return {
+            "already_actioned": True,
+            "rtv_id": rtv_id,
+            "company": company,
+            "status": detail.get("status") if isinstance(detail, dict) else "",
+            "requested_status": new_status,
+            "detail": detail,
+        }
+
+    detail = get_rtv(company, header_id, db)
+    return {
+        "already_actioned": False,
+        "rtv_id": rtv_id,
+        "company": company,
+        "status": new_status,
+        "actioned_by": bh_email,
+        "actioned_at": now,
+        "detail": detail,
+    }
+
+
+# ══════════════════════════════════════════════
 #  Box edit logging
 # ══════════════════════════════════════════════
 

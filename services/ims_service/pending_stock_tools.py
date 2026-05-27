@@ -268,13 +268,17 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
     picked = 0
     for p in pending_rows:
         dest = p.destination_table
-        if not _table_exists(db, dest):
-            logger.warning("PICK_PENDING: destination table %s missing, skip box_id=%s", dest, p.box_id)
-            continue
 
-        cold_json = p.cold_storage_data or {}
-
+        # Transfer-in only stores in interunit_transfer_in tables.
+        # For cold-destination transfers (cold→cold), insert into destination cold_stocks.
+        # For warehouse-destination transfers (cold→warehouse), do NOT insert into
+        # bulk_entry_boxes — the interunit_transfer_in_boxes records are the final state.
         if dest.endswith("_cold_stocks"):
+            if not _table_exists(db, dest):
+                logger.warning("PICK_PENDING: destination table %s missing, skip box_id=%s", dest, p.box_id)
+                continue
+
+            cold_json = p.cold_storage_data or {}
             db.execute(
                 text(f"""
                     INSERT INTO {dest}
@@ -289,6 +293,7 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
                          :total_inventory_kgs, :group_name, :item_subgroup, :storage_location,
                          :exporter, :last_purchase_rate, :value,
                          :box_id, :transaction_no, :spl_remarks)
+                    ON CONFLICT DO NOTHING
                 """),
                 {
                     "inward_dt": cold_json.get("inward_dt"),
@@ -310,25 +315,6 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
                     "box_id": p.box_id,
                     "transaction_no": p.transaction_no,
                     "spl_remarks": cold_json.get("spl_remarks"),
-                },
-            )
-        else:
-            db.execute(
-                text(f"""
-                    INSERT INTO {dest}
-                        (box_id, transaction_no, article_description, lot_number,
-                         net_weight, gross_weight)
-                    VALUES
-                        (:box_id, :transaction_no, :article, :lot_no,
-                         :net_weight, :gross_weight)
-                """),
-                {
-                    "box_id": p.box_id,
-                    "transaction_no": p.transaction_no,
-                    "article": p.article or p.item_description,
-                    "lot_no": p.lot_no,
-                    "net_weight": p.net_weight or p.weight_kg,
-                    "gross_weight": p.gross_weight,
                 },
             )
 
@@ -513,6 +499,8 @@ def restore_to_source(transfer_out_id: int, db: Session) -> int:
     ).fetchall()
 
     restored = 0
+    box_number_counters: dict = {}
+
     for p in pending_rows:
         src = p.source_table
         if not _table_exists(db, src):
@@ -537,6 +525,7 @@ def restore_to_source(transfer_out_id: int, db: Session) -> int:
                          :total_inventory_kgs, :group_name, :item_subgroup, :storage_location,
                          :exporter, :last_purchase_rate, :value,
                          :box_id, :transaction_no, :spl_remarks)
+                    ON CONFLICT DO NOTHING
                 """),
                 {
                     "inward_dt": cold_json.get("inward_dt"),
@@ -561,14 +550,19 @@ def restore_to_source(transfer_out_id: int, db: Session) -> int:
                 },
             )
         else:
+            article_key = (p.transaction_no or "", p.article or p.item_description or "")
+            box_number_counters[article_key] = box_number_counters.get(article_key, 0) + 1
+            box_num = box_number_counters[article_key]
+
             db.execute(
                 text(f"""
                     INSERT INTO {src}
                         (box_id, transaction_no, article_description, lot_number,
-                         net_weight, gross_weight)
+                         net_weight, gross_weight, box_number, count)
                     VALUES
                         (:box_id, :transaction_no, :article, :lot_no,
-                         :net_weight, :gross_weight)
+                         :net_weight, :gross_weight, :box_number, :count)
+                    ON CONFLICT DO NOTHING
                 """),
                 {
                     "box_id": p.box_id,
@@ -577,6 +571,8 @@ def restore_to_source(transfer_out_id: int, db: Session) -> int:
                     "lot_no": p.lot_no,
                     "net_weight": p.net_weight or p.weight_kg,
                     "gross_weight": p.gross_weight,
+                    "box_number": box_num,
+                    "count": p.no_of_cartons or 1,
                 },
             )
 

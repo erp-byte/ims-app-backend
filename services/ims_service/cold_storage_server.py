@@ -370,7 +370,7 @@ def download_cold_stocks_category_summary(
 
 @router.get("/stocks/search")
 def search_cold_storage_stocks(
-    company: str = Query(..., description="Company code: cfpl or cdpl"),
+    company: Optional[str] = Query(None, description="Ignored — always searches cfpl_cold_stocks first, then cdpl_cold_stocks"),
     lot_no: Optional[str] = Query(None),
     item_description: Optional[str] = Query(None),
     group_name: Optional[str] = Query(None),
@@ -405,8 +405,23 @@ def search_cold_storage_stocks(
         params["unit"] = f"%{unit}%"
 
     if storage_location:
-        where_clauses.append("storage_location = :storage_location")
-        params["storage_location"] = storage_location
+        sl = storage_location.strip()
+        sl_lower = sl.lower()
+        # Savla D-39 and D-514 may be stored as storage_location="Savla" + unit="D-39"/"D-514"
+        # Support both the full name and the split representation, case-insensitively
+        if sl_lower == "savla d-39":
+            where_clauses.append(
+                "(storage_location ILIKE :sl_full OR (storage_location ILIKE 'Savla' AND unit ILIKE 'D-39'))"
+            )
+            params["sl_full"] = sl
+        elif sl_lower == "savla d-514":
+            where_clauses.append(
+                "(storage_location ILIKE :sl_full OR (storage_location ILIKE 'Savla' AND unit ILIKE 'D-514'))"
+            )
+            params["sl_full"] = sl
+        else:
+            where_clauses.append("storage_location ILIKE :storage_location")
+            params["storage_location"] = sl
 
     if q:
         where_clauses.append(
@@ -416,36 +431,45 @@ def search_cold_storage_stocks(
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
     params["limit"] = limit
-    table = _get_cold_table(company)
 
-    rows = db.execute(
-        text(f"""
-            SELECT MIN(id) AS id,
-                   MIN(inward_dt) AS inward_dt,
-                   MIN(unit) AS unit,
-                   COALESCE(inward_no, '') AS inward_no,
-                   item_description,
-                   COALESCE(item_mark, '') AS item_mark,
-                   MAX(vakkal) AS vakkal,
-                   COALESCE(lot_no, '') AS lot_no,
-                   SUM(no_of_cartons) AS no_of_cartons,
-                   MIN(weight_kg) AS weight_kg,
-                   SUM(COALESCE(no_of_cartons, 0) * COALESCE(weight_kg, 0)) AS total_inventory_kgs,
-                   MAX(group_name) AS group_name,
-                   COALESCE(storage_location, '') AS storage_location,
-                   MAX(exporter) AS exporter,
-                   MIN(last_purchase_rate) AS last_purchase_rate,
-                   SUM(value) AS value,
-                   MIN(box_id) AS box_id,
-                   MIN(transaction_no) AS transaction_no
-            FROM {table}
-            WHERE {where_sql}
-            GROUP BY item_description, COALESCE(lot_no, ''), COALESCE(inward_no, ''), COALESCE(item_mark, ''), COALESCE(storage_location, '')
-            ORDER BY MIN(inward_dt) ASC, MIN(id) ASC
-            LIMIT :limit
-        """),
-        params,
-    ).fetchall()
+    _SEARCH_SQL = """
+        SELECT MIN(id) AS id,
+               MIN(inward_dt) AS inward_dt,
+               MIN(unit) AS unit,
+               COALESCE(inward_no, '') AS inward_no,
+               item_description,
+               COALESCE(item_mark, '') AS item_mark,
+               MAX(vakkal) AS vakkal,
+               COALESCE(lot_no, '') AS lot_no,
+               SUM(no_of_cartons) AS no_of_cartons,
+               MIN(weight_kg) AS weight_kg,
+               SUM(COALESCE(no_of_cartons, 0) * COALESCE(weight_kg, 0)) AS total_inventory_kgs,
+               MAX(group_name) AS group_name,
+               COALESCE(storage_location, '') AS storage_location,
+               MAX(exporter) AS exporter,
+               MIN(last_purchase_rate) AS last_purchase_rate,
+               SUM(value) AS value,
+               MIN(box_id) AS box_id,
+               MIN(transaction_no) AS transaction_no
+        FROM {table}
+        WHERE {where_sql}
+        GROUP BY item_description, COALESCE(lot_no, ''), COALESCE(inward_no, ''), COALESCE(item_mark, ''), COALESCE(storage_location, ''), COALESCE(unit, '')
+        ORDER BY MIN(inward_dt) ASC, MIN(id) ASC
+        LIMIT :limit
+    """
+
+    # Always search cfpl_cold_stocks first; fall back to cdpl_cold_stocks if empty
+    rows = []
+    for tbl in ["cfpl_cold_stocks", "cdpl_cold_stocks"]:
+        tbl_exists = db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{tbl}"}).scalar()
+        if not tbl_exists:
+            continue
+        rows = db.execute(
+            text(_SEARCH_SQL.format(table=tbl, where_sql=where_sql)),
+            params,
+        ).fetchall()
+        if rows:
+            break
 
     results = [
         {
@@ -601,17 +625,26 @@ def _ensure_inner_cold_transfer_table(db: Session):
     db.commit()
 
 
+def _resolve_record_table(record_id: int, db: Session) -> Optional[str]:
+    """Find which cold stocks table contains the given record ID (cfpl first, then cdpl)."""
+    for tbl in ["cfpl_cold_stocks", "cdpl_cold_stocks"]:
+        tbl_exists = db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{tbl}"}).scalar()
+        if not tbl_exists:
+            continue
+        row = db.execute(text(f"SELECT id FROM {tbl} WHERE id = :rid"), {"rid": record_id}).fetchone()
+        if row:
+            return tbl
+    return None
+
+
 @router.post("/inner-transfer")
 def inner_cold_transfer(payload: InnerTransferPayload, db: Session = Depends(get_db)):
     """
-    For each line, transfer `quantity` boxes from old lot to new lot in company-specific cold stocks table.
-    - If transferring ALL boxes: just update the lot_no on the existing record.
-    - If transferring PARTIAL boxes: reduce the original record's cartons/weight,
-      and INSERT a new record with the new lot_no and the transferred cartons/weight.
-    - Save every transfer line into inner_cold_transfer table for record-keeping.
+    For each line, transfer `quantity` boxes from old lot to new lot in cold stocks table.
+    Table is resolved per record (cfpl_cold_stocks first, cdpl_cold_stocks fallback) so the
+    submit works regardless of which company is in the URL.
     """
-    cold_table = _get_cold_table(payload.company)
-    logger.info(f"Inner cold transfer request: challan={payload.header.challan_no}, company={payload.company}, table={cold_table}, lines={len(payload.lines)}")
+    logger.info(f"Inner cold transfer request: challan={payload.header.challan_no}, company={payload.company}, lines={len(payload.lines)}")
 
     _ensure_inner_cold_transfer_table(db)
 
@@ -624,6 +657,12 @@ def inner_cold_transfer(payload: InnerTransferPayload, db: Session = Depends(get
 
             if not line.stock_record_id:
                 errors.append(f"Line {idx + 1}: stock_record_id is required")
+                continue
+
+            # Resolve which table holds this record (cfpl first, cdpl fallback)
+            cold_table = _resolve_record_table(line.stock_record_id, db)
+            if not cold_table:
+                errors.append(f"Line {idx + 1}: Record ID {line.stock_record_id} not found in any cold stocks table")
                 continue
 
             # Fetch the reference record to get item details

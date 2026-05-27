@@ -98,6 +98,15 @@ def _run_startup_migrations():
         except Exception:
             db.rollback()
 
+        # Add approval columns to bulk entry transaction tables
+        for _be_tbl in ("cfpl_bulk_entry_transactions", "cdpl_bulk_entry_transactions"):
+            try:
+                db.execute(text(f"ALTER TABLE {_be_tbl} ADD COLUMN IF NOT EXISTS approved_by VARCHAR(255)"))
+                db.execute(text(f"ALTER TABLE {_be_tbl} ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP"))
+                db.commit()
+            except Exception:
+                db.rollback()
+
         # Jobwork tables
         try:
             db.execute(text("""
@@ -201,7 +210,13 @@ app = FastAPI(
 app.add_middleware(RouteObfuscationMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:4000",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:4000",
+        "https://candorims.netlify.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

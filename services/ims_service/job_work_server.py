@@ -170,6 +170,7 @@ def _ensure_tables(db: Session):
     try:
         db.execute(text("ALTER TABLE jb_work_inward_receipt ADD COLUMN IF NOT EXISTS challan_no VARCHAR(100)"))
         db.execute(text("ALTER TABLE jb_work_inward_receipt ADD COLUMN IF NOT EXISTS inward_warehouse VARCHAR(255)"))
+        db.execute(text("ALTER TABLE jb_work_inward_receipt ADD COLUMN IF NOT EXISTS header_id INTEGER REFERENCES jb_materialout_header(id) ON DELETE CASCADE"))
     except Exception:
         pass
 
@@ -764,12 +765,14 @@ def list_job_work_records(
 
     records = []
     for r in rows:
-        # r[14] = sub_category, r[15-18] = old aggregates, r[19-21] = new FG/Waste/Rejection,
-        # r[22] = last_receipt_date, r[23] = receipt_count
-        dispatched = float(r[18] or 0) or float(r[17] or 0)  # prefer net, fallback gross
-        fg = float(r[19] or 0)
-        waste = float(r[20] or 0)
-        rejection = float(r[21] or 0)
+        # r[14]=sub_category, r[15]=items_count, r[16]=item_descriptions,
+        # r[17]=total_qty, r[18]=total_weight, r[19]=total_net_weight,
+        # r[20]=total_fg_kgs, r[21]=total_waste_kgs, r[22]=total_rejection_kgs,
+        # r[23]=last_receipt_date, r[24]=receipt_count
+        dispatched = float(r[19] or 0) or float(r[18] or 0)  # prefer net_weight, fallback quantity_kgs
+        fg = float(r[20] or 0)
+        waste = float(r[21] or 0)
+        rejection = float(r[22] or 0)
         accounted = fg + waste + rejection
         unaccounted = round(max(0, dispatched - accounted), 3)
         loss_pct = round((unaccounted / dispatched * 100), 2) if dispatched > 0 else 0.0
@@ -788,20 +791,19 @@ def list_job_work_records(
             "remarks": r[11] or "",
             "created_by": r[12] or "",
             "created_at": str(r[13]) if r[13] else "",
-            "sub_category": r[14] or "",      # process type (Deseeding/Cracking/etc.)
+            "sub_category": r[14] or "",
             "items_count": r[15] or 0,
             "item_descriptions": r[16] or "",
             "total_qty": int(r[17] or 0),
-            "total_weight": float(r[17] or 0),
-            "total_net_weight": float(r[18] or 0),
-            # NEW — per-JWO aggregates for dashboard
+            "total_weight": float(r[18] or 0),
+            "total_net_weight": float(r[19] or 0),
             "fg_received_kgs": fg,
             "waste_received_kgs": waste,
             "rejection_kgs": rejection,
             "unaccounted_kgs": unaccounted,
             "actual_loss_pct": loss_pct,
-            "last_receipt_date": str(r[22]) if r[22] else "",
-            "receipt_count": int(r[23] or 0),
+            "last_receipt_date": str(r[23]) if r[23] else "",
+            "receipt_count": int(r[24] or 0),
         })
 
     return {"records": records, "total": total, "total_pages": total_pages, "page": page}

@@ -2602,22 +2602,29 @@ def approve_inward(
 ) -> dict:
 
     tables = table_names(company)
-
-
+    _using_bulk_entry = False
 
     existing = db.execute(
-
         text(f"SELECT transaction_no, status FROM {tables['tx']} WHERE transaction_no = :txno"),
-
         {"txno": transaction_no},
-
     ).fetchone()
 
     if not existing:
+        _prefix = "cfpl" if company == "CFPL" else "cdpl"
+        tables = {
+            "tx": f"{_prefix}_bulk_entry_transactions",
+            "art": f"{_prefix}_bulk_entry_articles",
+            "box": f"{_prefix}_bulk_entry_boxes",
+        }
+        existing = db.execute(
+            text(f"SELECT transaction_no, status FROM {tables['tx']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).fetchone()
+        if existing:
+            _using_bulk_entry = True
 
+    if not existing:
         raise HTTPException(404, f"Transaction '{transaction_no}' not found")
-
-
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2654,6 +2661,11 @@ def approve_inward(
     if payload.transaction:
 
         tx_data = clean_date_fields(payload.transaction.model_dump(exclude_none=True))
+
+        # bulk_entry_transactions has no service/rtv columns
+        if _using_bulk_entry:
+            tx_data.pop("service", None)
+            tx_data.pop("rtv", None)
 
         for field, value in tx_data.items():
 
@@ -2851,20 +2863,25 @@ def upsert_box(
 
     tables = table_names(company)
 
-
-
     # Verify transaction exists
-
     existing_tx = db.execute(
-
         text(f"SELECT transaction_no FROM {tables['tx']} WHERE transaction_no = :txno"),
-
         {"txno": transaction_no},
-
     ).fetchone()
 
     if not existing_tx:
+        _prefix = "cfpl" if company == "CFPL" else "cdpl"
+        tables = {
+            "tx": f"{_prefix}_bulk_entry_transactions",
+            "art": f"{_prefix}_bulk_entry_articles",
+            "box": f"{_prefix}_bulk_entry_boxes",
+        }
+        existing_tx = db.execute(
+            text(f"SELECT transaction_no FROM {tables['tx']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).fetchone()
 
+    if not existing_tx:
         raise HTTPException(404, f"Transaction '{transaction_no}' not found")
 
 

@@ -185,7 +185,23 @@ class InwardListItem(BaseModel):
     source: str = "inward"
     item_descriptions: List[str]
     quantities_and_uoms: List[str]
+    article_items_with_qty: List[str] = []
     has_edits: bool = False
+    # Hover card detail fields
+    approval_authority: Optional[str] = None
+    vehicle_number: Optional[str] = None
+    transporter_name: Optional[str] = None
+    lr_number: Optional[str] = None
+    challan_number: Optional[str] = None
+    grn_number: Optional[str] = None
+    grn_quantity: Optional[float] = None
+    system_grn_date: Optional[str] = None
+    source_location: Optional[str] = None
+    destination_location: Optional[str] = None
+    remark: Optional[str] = None
+    net_weight: Optional[float] = None
+    total_weight: Optional[float] = None
+    box_count: Optional[int] = None
 
 
 class InwardListResponse(BaseModel):

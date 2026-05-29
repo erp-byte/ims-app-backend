@@ -237,6 +237,7 @@ class TransferHeaderResponse(BaseModel):
     created_ts: Optional[datetime] = None
     approved_ts: Optional[datetime] = None
     has_variance: bool = False
+    from_cold_unit: Optional[str] = None  # canonical sub-cold name (Savla D-39 / D-514 / Rishi / Supreme Cold)
 
 
 class TransferLineResponse(BaseModel):

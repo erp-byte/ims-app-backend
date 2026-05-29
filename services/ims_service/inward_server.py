@@ -456,5 +456,10 @@ def update_inward_endpoint(
 
 
 @router.delete("/{company}/{transaction_no}")
-def delete_inward_endpoint(company: Company, transaction_no: str, db: Session = Depends(get_db)):
-    return delete_inward(company, transaction_no, db)
+def delete_inward_endpoint(
+    company: Company,
+    transaction_no: str,
+    user_email: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    return delete_inward(company, transaction_no, db, deleted_by=user_email)

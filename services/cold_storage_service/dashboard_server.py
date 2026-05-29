@@ -242,7 +242,7 @@ async def get_stock_summary(
                 COALESCE(item_mark, 'No Mark')             AS item_mark,
                 COALESCE(SUM(COALESCE(total_inventory_kgs, 0)), 0)  AS total_kgs,
                 COALESCE(SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))), 0)       AS total_value,
-                COUNT(*)                                    AS lot_count,
+                COUNT(DISTINCT COALESCE(lot_no, ''))        AS lot_count,
                 SUM(CASE WHEN inward_dt IS NOT NULL AND (CURRENT_DATE - inward_dt) < 183
                     THEN COALESCE(total_inventory_kgs, 0) ELSE 0 END) AS age_0_6,
                 SUM(CASE WHEN inward_dt IS NOT NULL AND (CURRENT_DATE - inward_dt) >= 183
@@ -623,7 +623,8 @@ async def get_concentration(
             SELECT {_CANONICAL_GROUP} AS group_name,
                 {_CANONICAL_SUBGROUP} AS item_subgroup,
                 SUM(COALESCE(total_inventory_kgs,0)) AS total_kgs,
-                SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) AS total_value, COUNT(*) AS lot_count,
+                SUM((COALESCE(last_purchase_rate,0)*COALESCE(total_inventory_kgs,0))) AS total_value,
+                COUNT(DISTINCT COALESCE(lot_no, '')) AS lot_count,
                 SUM(CASE WHEN inward_dt IS NOT NULL AND (CURRENT_DATE - inward_dt) >= 548
                     THEN COALESCE(total_inventory_kgs,0) ELSE 0 END) AS aged_18plus_kgs,
                 SUM(CASE WHEN inward_dt IS NOT NULL AND (CURRENT_DATE - inward_dt) >= 548
@@ -643,7 +644,7 @@ async def get_concentration(
         for i, r in enumerate(rows):
             kgs = float(r.total_kgs or 0); val = float(r.total_value or 0); lots = int(r.lot_count or 0)
             pct = round((val / grand_value) * 100, 1) if grand_value > 0 else 0
-            frag = "high" if lots > 25 else ("medium" if lots >= 10 else "normal")
+            frag = "normal" if lots > 25 else ("medium" if lots >= 10 else "high")
             items.append({"rank": i+1, "group_name": r.group_name, "item_subgroup": r.item_subgroup,
                 "total_kgs": round(kgs, 2), "total_value": round(val, 2), "portfolio_pct": pct,
                 "avg_rate": round(val/kgs, 2) if kgs > 0 else 0, "lot_count": lots, "fragmentation": frag})

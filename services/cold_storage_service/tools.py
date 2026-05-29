@@ -677,6 +677,43 @@ def create_direct_out(payload, db: Session) -> dict:
             {"ids": all_ids_to_delete},
         )
 
+        # ── DISPOSITION LEDGER ─────────────────────────────────
+        # Audit: record every box that left cold_stocks via this Direct Out so
+        # future Transfer-In / Job-Work scans can answer "where did box X go?"
+        # and can reconcile fungibly (same txn, same lot = arbitrary labels).
+        try:
+            from services.ims_service.pending_stock_tools import (
+                _ensure_reconciliation_schema,
+                _write_disposition,
+            )
+            _ensure_reconciliation_schema(db)
+            for row_data in snapshot:
+                if not isinstance(row_data, dict):
+                    continue
+                bid = row_data.get("box_id")
+                txn = row_data.get("transaction_no")
+                if not bid or not txn:
+                    continue
+                _write_disposition(
+                    db,
+                    box_id=str(bid),
+                    transaction_no=str(txn),
+                    lot_no=row_data.get("lot_no"),
+                    item_description=row_data.get("item_description"),
+                    from_company=company,
+                    unit=row_data.get("unit"),
+                    from_site=row_data.get("storage_location") or row_data.get("warehouse"),
+                    source_table=stocks_table,
+                    disposition_type="direct_out",
+                    disposition_ref_table=table,
+                    disposition_ref_no=transaction_no,
+                    disposed_by=payload.created_by,
+                    snapshot_data=row_data,
+                    notes=f"Direct Out to {payload.to_customer or '-'}",
+                )
+        except Exception as e:
+            logger.warning("Direct Out disposition write skipped: %s", e)
+
     params = {
         "transaction_no": transaction_no,
         "transaction_type": payload.transaction_type,
@@ -868,6 +905,26 @@ def delete_direct_out(
                 f"GREATEST((SELECT COALESCE(MAX(id), 1) FROM {stocks_table}), 1))"
             )
         )
+
+    # Revert disposition rows for every box restored.
+    try:
+        from services.ims_service.pending_stock_tools import _revert_disposition
+        for row_data in snapshot:
+            if not isinstance(row_data, dict):
+                continue
+            bid = row_data.get("box_id")
+            txn = row_data.get("transaction_no")
+            if not bid or not txn:
+                continue
+            _revert_disposition(
+                db,
+                box_id=str(bid),
+                transaction_no=str(txn),
+                disposition_type="direct_out",
+                reverted_reason=f"Direct Out {transaction_no} deleted by {requested_by_email}",
+            )
+    except Exception as e:
+        logger.warning("Direct Out disposition revert skipped: %s", e)
 
     db.execute(
         text(f"DELETE FROM {table} WHERE transaction_no = :tn"),

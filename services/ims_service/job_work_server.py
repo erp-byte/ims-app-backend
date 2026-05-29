@@ -200,6 +200,16 @@ def _ensure_tables(db: Session):
 
 
     # ── JB INWARD BOXES — table created manually in DB ──
+    # Additive columns (idempotent): rejection support + per-box case-pack snapshot
+    for stmt in (
+        "ALTER TABLE jb_inward_boxes ADD COLUMN IF NOT EXISTS box_type VARCHAR(20) NOT NULL DEFAULT 'FG'",
+        "ALTER TABLE jb_inward_boxes ADD COLUMN IF NOT EXISTS unit_pack_size NUMERIC(10,3)",
+        "CREATE INDEX IF NOT EXISTS idx_jb_inward_boxes_box_type ON jb_inward_boxes(box_type)",
+    ):
+        try:
+            db.execute(text(stmt))
+        except Exception:
+            pass
 
     db.commit()
     _tables_created = True
@@ -283,8 +293,9 @@ def all_sku_search(
         text(f"""
             SELECT DISTINCT ON (UPPER(particulars))
                    UPPER(particulars) AS item_desc,
-                   UPPER(item_group) AS grp,
-                   UPPER(sub_group) AS sg
+                   UPPER(item_group)  AS grp,
+                   UPPER(sub_group)   AS sg,
+                   uom                AS uom
             FROM {tbl}
             WHERE LOWER(particulars) LIKE :search
               AND particulars IS NOT NULL AND particulars != ''
@@ -296,9 +307,39 @@ def all_sku_search(
 
     return {
         "items": [
-            {"item_description": r[0], "item_group": r[1] or "", "sub_group": r[2] or ""}
+            {
+                "item_description": r[0],
+                "item_group":       r[1] or "",
+                "sub_group":        r[2] or "",
+                "uom":              str(r[3]) if r[3] is not None else "",
+            }
             for r in rows
         ]
+    }
+
+
+@router.get("/sku-detail")
+def sku_detail(description: str = Query(""), db: Session = Depends(get_db)):
+    """Single-particular master detail; used by Article Entry cascading-dropdown path
+    to fetch uom after a particular is picked."""
+    desc = description.strip()
+    if not desc:
+        return {"uom": "", "item_group": "", "sub_group": ""}
+    row = db.execute(
+        text("""
+            SELECT uom, item_group, sub_group
+            FROM all_sku
+            WHERE UPPER(particulars) = UPPER(:d)
+            LIMIT 1
+        """),
+        {"d": desc},
+    ).fetchone()
+    if not row:
+        return {"uom": "", "item_group": "", "sub_group": ""}
+    return {
+        "uom":        str(row[0]) if row[0] is not None else "",
+        "item_group": row[1] or "",
+        "sub_group":  row[2] or "",
     }
 
 
@@ -330,7 +371,35 @@ def _resolve_cold_table(cold_unit: str):
 
 def _deduct_cold_storage_stock(db: Session, header_id: int, line_items: list):
     """Delete rows from cold storage tables for each dispatched box.
-    Before deleting, snapshot the full cold row into jb_materialout_lines.cold_storage_snapshot."""
+    Before deleting, snapshot the full cold row into jb_materialout_lines.cold_storage_snapshot.
+
+    Also writes an entry to cold_stock_disposition for every deducted box so a
+    later Transfer-In scan can resolve a "missing" box_id as a legitimate
+    fungible relabel from this Job Work Out pool.
+    """
+    # Cache header context once per call.
+    header_ctx = None
+    try:
+        header_ctx = db.execute(
+            text("""SELECT challan_no, company, created_by
+                    FROM jb_materialout_header WHERE id = :id"""),
+            {"id": header_id},
+        ).mappings().fetchone()
+    except Exception as e:
+        _jw_logger.warning("Could not load header for disposition write: %s", e)
+
+    # Pre-import disposition helpers (audit-only — soft-failures).
+    _write_disp = None
+    try:
+        from services.ims_service.pending_stock_tools import (
+            _ensure_reconciliation_schema,
+            _write_disposition as _wd,
+        )
+        _ensure_reconciliation_schema(db)
+        _write_disp = _wd
+    except Exception as e:
+        _jw_logger.warning("Disposition helpers unavailable: %s", e)
+
     for item in line_items:
         box_id = item.get("box_id", "")
         transaction_no = item.get("transaction_no", "")
@@ -385,6 +454,29 @@ def _deduct_cold_storage_stock(db: Session, header_id: int, line_items: list):
             {"box_id": box_id, "transaction_no": transaction_no},
         )
 
+        # ── DISPOSITION LEDGER (audit) ─────────────────────────
+        if _write_disp is not None:
+            row_dict = dict(cold_row) if cold_row else {}
+            row_dict.pop("id", None)
+            _write_disp(
+                db,
+                box_id=str(box_id),
+                transaction_no=str(transaction_no),
+                lot_no=row_dict.get("lot_no") or item.get("lot_number"),
+                item_description=row_dict.get("item_description") or item.get("description"),
+                from_company=(header_ctx or {}).get("company") if header_ctx else None,
+                unit=row_dict.get("unit") or cold_unit,
+                from_site=row_dict.get("storage_location") or row_dict.get("warehouse"),
+                source_table=table,
+                disposition_type="job_work_out",
+                disposition_ref_table="jb_materialout_header",
+                disposition_ref_id=header_id,
+                disposition_ref_no=(header_ctx or {}).get("challan_no") if header_ctx else None,
+                disposed_by=(header_ctx or {}).get("created_by") if header_ctx else None,
+                snapshot_data=row_dict if row_dict else None,
+                notes="Job Work material-out",
+            )
+
 
 def _restore_cold_storage_stock(db: Session, header_id: int):
     """Re-insert rows into cold storage tables from saved snapshots (reversal on delete)."""
@@ -395,6 +487,13 @@ def _restore_cold_storage_stock(db: Session, header_id: int):
         WHERE header_id = :header_id
     """), {"header_id": header_id}).mappings().all()
 
+    _revert_disp = None
+    try:
+        from services.ims_service.pending_stock_tools import _revert_disposition as _rd
+        _revert_disp = _rd
+    except Exception as e:
+        _jw_logger.warning("Disposition revert helper unavailable: %s", e)
+
     for l in lines:
         box_id = l["box_id"] or ""
         transaction_no = l["transaction_no"] or ""
@@ -404,6 +503,15 @@ def _restore_cold_storage_stock(db: Session, header_id: int):
         table = _resolve_cold_table(cold_unit)
         if not table:
             continue
+
+        if _revert_disp is not None:
+            _revert_disp(
+                db,
+                box_id=str(box_id),
+                transaction_no=str(transaction_no),
+                disposition_type="job_work_out",
+                reverted_reason=f"Job Work header {header_id} deletion",
+            )
 
         # Check if row already exists (avoid duplicates)
         existing = db.execute(
@@ -1250,6 +1358,52 @@ def submit_material_in(
 
     # Insert inward receipt line items (including loss config per line)
     loss_config = payload.get("loss_config") or {}
+
+    # Authoritative box counts per item from the actual payload.boxes list
+    boxes_payload = payload.get("boxes", []) or []
+    fg_counts_by_desc:  dict[str, int] = {}
+    rej_counts_by_desc: dict[str, int] = {}
+    for _b in boxes_payload:
+        _desc = (_b.get("item_description") or "").strip()
+        if not _desc:
+            continue
+        if (_b.get("box_type") or "FG").upper() == "REJECTION":
+            rej_counts_by_desc[_desc] = rej_counts_by_desc.get(_desc, 0) + 1
+        else:
+            fg_counts_by_desc[_desc] = fg_counts_by_desc.get(_desc, 0) + 1
+
+    # Per-item kg caps: total net_weight in a bucket must not exceed the user's stated kg.
+    sent_caps_fg:  dict[str, float] = {}
+    sent_caps_rej: dict[str, float] = {}
+    for _it in items:
+        _d = (_it.get("description") or "").strip()
+        sent_caps_fg[_d]  = sent_caps_fg.get(_d, 0.0)  + float(_it.get("finished_goods_kgs") or 0)
+        sent_caps_rej[_d] = sent_caps_rej.get(_d, 0.0) + float(_it.get("rejection_kgs") or 0)
+
+    box_kg_fg:  dict[str, float] = {}
+    box_kg_rej: dict[str, float] = {}
+    for _b in boxes_payload:
+        _d  = (_b.get("item_description") or "").strip()
+        _bt = (_b.get("box_type") or "FG").upper()
+        _w  = float(_b.get("net_weight") or 0)
+        if _bt == "REJECTION":
+            box_kg_rej[_d] = box_kg_rej.get(_d, 0.0) + _w
+        else:
+            box_kg_fg[_d] = box_kg_fg.get(_d, 0.0) + _w
+
+    for _d, _w in box_kg_fg.items():
+        if _w > sent_caps_fg.get(_d, 0.0) + 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=f"FG box net-weight total ({_w:.3f}kg) exceeds FG Received ({sent_caps_fg.get(_d, 0.0):.3f}kg) for '{_d}'.",
+            )
+    for _d, _w in box_kg_rej.items():
+        if _w > sent_caps_rej.get(_d, 0.0) + 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Rejection box net-weight total ({_w:.3f}kg) exceeds Rejection ({sent_caps_rej.get(_d, 0.0):.3f}kg) for '{_d}'.",
+            )
+
     for item in items:
         db.execute(text("""
             INSERT INTO jb_work_inward_lines
@@ -1269,11 +1423,11 @@ def submit_material_in(
             "sent_kgs": float(item.get("sent_kgs", 0)),
             "sent_boxes": int(item.get("sent_boxes", 0)),
             "fg_kgs": float(item.get("finished_goods_kgs", 0)),
-            "fg_boxes": int(item.get("finished_goods_boxes", 0)),
+            "fg_boxes":        int(fg_counts_by_desc.get((item.get("description") or "").strip(), int(item.get("finished_goods_boxes", 0)))),
             "waste_kgs": float(item.get("waste_kgs", 0)),
             "waste_type": item.get("waste_type", ""),
             "rejection_kgs": float(item.get("rejection_kgs", 0)),
-            "rejection_boxes": int(item.get("rejection_boxes", 0)),
+            "rejection_boxes": int(rej_counts_by_desc.get((item.get("description") or "").strip(), int(item.get("rejection_boxes", 0)))),
             "remarks": item.get("line_remarks", ""),
             "process_type": item.get("process_type") or loss_config.get("process_type", "") or header_process_type,
             "min_loss_pct": float(item.get("min_loss_pct") or loss_config.get("min_loss_pct", 0)),
@@ -1291,12 +1445,14 @@ def submit_material_in(
                 (inward_receipt_id, transaction_no, box_id, box_number,
                  item_description, item_group, sub_group,
                  net_weight, gross_weight, inward_warehouse,
-                 vakkal, lot_no, item_mark, storage_location, exporter, rate, spl_remarks)
+                 vakkal, lot_no, item_mark, storage_location, exporter, rate, spl_remarks,
+                 box_type, unit_pack_size)
             VALUES
                 (:ir_id, :transaction_no, :box_id, :box_number,
                  :item_description, :item_group, :sub_group,
                  :net_weight, :gross_weight, :inward_warehouse,
-                 :vakkal, :lot_no, :item_mark, :storage_location, :exporter, :rate, :spl_remarks)
+                 :vakkal, :lot_no, :item_mark, :storage_location, :exporter, :rate, :spl_remarks,
+                 :box_type, :unit_pack_size)
             ON CONFLICT (transaction_no, box_id) DO NOTHING
         """), {
             "ir_id": inward_receipt_id,
@@ -1316,6 +1472,8 @@ def submit_material_in(
             "exporter": box.get("exporter", ""),
             "rate": float(box.get("rate", 0)),
             "spl_remarks": box.get("spl_remarks", ""),
+            "box_type": (box.get("box_type") or "FG").upper(),
+            "unit_pack_size": (float(box["unit_pack_size"]) if box.get("unit_pack_size") not in (None, "", 0) else None),
         })
 
     # Insert into cfpl_cold_stocks / cdpl_cold_stocks if cold storage material-in.
@@ -1365,7 +1523,11 @@ def submit_material_in(
                 "value": value_val,
                 "box_id": box.get("box_id", ""),
                 "transaction_no": box.get("transaction_no", ""),
-                "spl_remarks": box.get("spl_remarks", ""),
+                "spl_remarks": (
+                    f"[REJECTION] {box.get('spl_remarks', '') or ''}".strip()
+                    if (box.get("box_type") or "FG").upper() == "REJECTION"
+                    else box.get("spl_remarks", "")
+                ),
             })
 
     # Detect status change and notify
@@ -1581,7 +1743,10 @@ def get_material_in_detail(
     row = db.execute(text("""
         SELECT ir.id, ir.ir_number, ir.challan_no, ir.header_id, ir.receipt_date,
                ir.receipt_type, ir.vehicle_no, ir.driver_name, ir.remarks, ir.created_by, ir.created_at,
-               h.challan_no as jwo_challan, h.to_party, h.sub_category, h.from_warehouse
+               h.challan_no as jwo_challan, h.to_party, h.sub_category, h.from_warehouse,
+               ir.inward_warehouse,
+               COALESCE((SELECT SUM(CAST(ml.net_weight AS NUMERIC)) FROM jb_materialout_lines ml WHERE ml.header_id = ir.header_id), 0) AS dispatched_net,
+               COALESCE((SELECT SUM(ml.quantity_kgs) FROM jb_materialout_lines ml WHERE ml.header_id = ir.header_id), 0) AS dispatched_qty
         FROM jb_work_inward_receipt ir
         LEFT JOIN jb_materialout_header h ON h.id = ir.header_id
         WHERE ir.id = :id
@@ -1590,15 +1755,41 @@ def get_material_in_detail(
     if not row:
         raise HTTPException(status_code=404, detail="Inward receipt not found")
 
-    # Fetch line items
+    header_id = row[3]
+    dispatched_kgs = float(row[16] or 0) if float(row[16] or 0) > 0 else float(row[17] or 0)
+
+    # Fetch line items for this receipt
     lines = db.execute(text("""
         SELECT sl_no, item_description, sent_kgs, sent_boxes,
                finished_goods_kgs, finished_goods_boxes, waste_kgs, waste_type,
-               rejection_kgs, rejection_boxes, line_remarks, process_type
+               rejection_kgs, rejection_boxes, line_remarks, process_type,
+               min_loss_pct, max_loss_pct
         FROM jb_work_inward_lines
         WHERE inward_receipt_id = :ir_id
         ORDER BY sl_no
     """), {"ir_id": ir_id}).fetchall()
+
+    # Cumulative totals across ALL receipts for the same JWO
+    cum = db.execute(text("""
+        SELECT
+            COUNT(DISTINCT ir2.id) AS receipt_count,
+            COALESCE(SUM(il2.finished_goods_kgs), 0) AS cum_fg,
+            COALESCE(SUM(il2.waste_kgs), 0) AS cum_waste,
+            COALESCE(SUM(il2.rejection_kgs), 0) AS cum_rejection,
+            COALESCE(SUM(il2.sent_kgs), 0) AS cum_sent
+        FROM jb_work_inward_receipt ir2
+        JOIN jb_work_inward_lines il2 ON il2.inward_receipt_id = ir2.id
+        WHERE ir2.header_id = :hid
+    """), {"hid": header_id}).fetchone() if header_id else None
+
+    cum_fg = float(cum[1] or 0) if cum else 0
+    cum_waste = float(cum[2] or 0) if cum else 0
+    cum_rejection = float(cum[3] or 0) if cum else 0
+    receipt_count = int(cum[0] or 0) if cum else 0
+    cum_accounted = cum_fg + cum_waste + cum_rejection
+    cum_unaccounted = max(0, dispatched_kgs - cum_accounted)
+    cum_loss_pct = round((cum_accounted - cum_fg) / dispatched_kgs * 100, 2) if dispatched_kgs > 0 else 0
+    remaining_kgs = max(0, dispatched_kgs - cum_fg)
 
     return {
         "receipt": {
@@ -1617,6 +1808,7 @@ def get_material_in_detail(
             "to_party": row[12] or "",
             "process_type": row[13] or "",
             "from_warehouse": row[14] or "",
+            "inward_warehouse": row[15] or "",
         },
         "lines": [{
             "sl_no": l[0],
@@ -1631,7 +1823,19 @@ def get_material_in_detail(
             "rejection_boxes": int(l[9] or 0),
             "line_remarks": l[10] or "",
             "process_type": l[11] or "",
+            "min_loss_pct": float(l[12] or 0),
+            "max_loss_pct": float(l[13] or 0),
         } for l in lines],
+        "cumulative": {
+            "dispatched_kgs": round(dispatched_kgs, 2),
+            "receipt_count": receipt_count,
+            "cum_fg_kgs": round(cum_fg, 2),
+            "cum_waste_kgs": round(cum_waste, 2),
+            "cum_rejection_kgs": round(cum_rejection, 2),
+            "cum_unaccounted_kgs": round(cum_unaccounted, 2),
+            "cum_loss_pct": cum_loss_pct,
+            "remaining_kgs": round(remaining_kgs, 2),
+        },
     }
 
 

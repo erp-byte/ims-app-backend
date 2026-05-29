@@ -1,6 +1,7 @@
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from shared.database import get_db
@@ -51,6 +52,7 @@ from services.ims_service.interunit_tools import (
     categorial_global_search,
     categorial_dropdown,
     get_bulk_entry_box,
+    generate_transfer_in_qrs,
 )
 from services.ims_service.pending_stock_tools import (
     list_pending_transfers,
@@ -359,7 +361,248 @@ def finalize_transfer_in_endpoint(
     return finalize_transfer_in(header_id, data, db)
 
 
+@router.post("/transfer-in/{header_id}/generate-qrs")
+def generate_transfer_in_qrs_endpoint(
+    header_id: int,
+    db: Session = Depends(get_db),
+):
+    return generate_transfer_in_qrs(header_id, db)
+
+
 # ── Transfer IN detail/delete (must come after /pending and /{id}/acknowledge routes) ──
+
+
+@router.get("/transfer-in/{transfer_in_id}/reconciliation")
+def get_transfer_in_reconciliation(
+    transfer_in_id: int,
+    db: Session = Depends(get_db),
+):
+    """STBR audit report for one Transfer IN — all box-id reconciliations
+    (matched / overridden / propagated / conflict) with original vs actual
+    box IDs, source of scan, who scanned, when.
+
+    Returns:
+        {
+          "transfer_in_id": int,
+          "total":          int,
+          "by_status":      { matched: N, overridden: N, ... },
+          "rows":           [ {id, lot_no, transaction_no, original_box_id,
+                               actual_box_id, reconciliation_status, scan_source,
+                               scanned_by, scanned_at, propagated_from_id, ... } ]
+        }
+    """
+    # Verify the table exists; self-heal init writes it on first STBR call.
+    exists = db.execute(
+        text("SELECT to_regclass('public.transfer_box_reconciliation')")
+    ).scalar()
+    if not exists:
+        return {"transfer_in_id": transfer_in_id, "total": 0, "by_status": {}, "rows": []}
+
+    rows = db.execute(
+        text("""
+            SELECT id, transfer_in_id, transfer_out_id, lot_no, transaction_no,
+                   original_box_id, actual_box_id, reconciliation_status,
+                   conflict_reason, scan_source, scanned_by, scanned_at,
+                   from_company, to_company, from_site, to_site,
+                   propagated_from_id
+            FROM transfer_box_reconciliation
+            WHERE transfer_in_id = :tid
+            ORDER BY scanned_at ASC, id ASC
+        """),
+        {"tid": transfer_in_id},
+    ).fetchall()
+
+    by_status: dict = {}
+    out_rows = []
+    for r in rows:
+        s = r.reconciliation_status or "unknown"
+        by_status[s] = by_status.get(s, 0) + 1
+        out_rows.append({
+            "id": r.id,
+            "transfer_in_id": r.transfer_in_id,
+            "transfer_out_id": r.transfer_out_id,
+            "lot_no": r.lot_no,
+            "transaction_no": r.transaction_no,
+            "original_box_id": r.original_box_id,
+            "actual_box_id": r.actual_box_id,
+            "reconciliation_status": r.reconciliation_status,
+            "conflict_reason": r.conflict_reason,
+            "scan_source": r.scan_source,
+            "scanned_by": r.scanned_by,
+            "scanned_at": r.scanned_at.isoformat() if r.scanned_at else None,
+            "from_company": r.from_company,
+            "to_company": r.to_company,
+            "from_site": r.from_site,
+            "to_site": r.to_site,
+            "propagated_from_id": r.propagated_from_id,
+        })
+
+    return {
+        "transfer_in_id": transfer_in_id,
+        "total": len(out_rows),
+        "by_status": by_status,
+        "rows": out_rows,
+    }
+
+
+@router.get("/box-history/{box_id}")
+def get_box_history(
+    box_id: str,
+    transaction_no: Optional[str] = Query(None, alias="txn"),
+    db: Session = Depends(get_db),
+):
+    """Trace a single box across all four ledgers:
+
+      1. cold_stocks (cfpl/cdpl) — is it currently sitting in cold storage?
+      2. boxes_v2     (cfpl/cdpl) — is it currently in warehouse inventory?
+      3. pending_transfer_stock   — is it parked in transit right now?
+      4. cold_stock_disposition   — every "left source" event (Direct Out,
+                                    Job Work, Transfer Out, fungible relabel).
+      5. transfer_box_reconciliation — every STBR scan that touched this box.
+
+    `txn` is optional but strongly recommended — a single box_id label may
+    repeat across different inward batches, and txn pins us to one pool.
+
+    Returns one consolidated audit dossier per (box_id, [txn]).
+    """
+    txn = (transaction_no or "").strip() or None
+
+    def _scan_table(tbl_name: str) -> list:
+        exists = db.execute(text("SELECT to_regclass(:t)"), {"t": tbl_name}).scalar()
+        if not exists:
+            return []
+        where = "box_id = :b"
+        params = {"b": box_id}
+        if txn:
+            where += " AND transaction_no = :t"
+            params["t"] = txn
+        try:
+            rows = db.execute(
+                text(f"SELECT * FROM {tbl_name} WHERE {where} ORDER BY id ASC"),
+                params,
+            ).mappings().all()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    cold_stocks = []
+    for tbl in ("cfpl_cold_stocks", "cdpl_cold_stocks"):
+        for r in _scan_table(tbl):
+            r["_table"] = tbl
+            cold_stocks.append(r)
+
+    warehouse_boxes = []
+    for tbl in ("cfpl_boxes_v2", "cdpl_boxes_v2"):
+        for r in _scan_table(tbl):
+            r["_table"] = tbl
+            warehouse_boxes.append(r)
+
+    pending = _scan_table("pending_transfer_stock")
+
+    # Disposition ledger — include reverted rows so we see history.
+    dispositions = []
+    exists = db.execute(text("SELECT to_regclass('public.cold_stock_disposition')")).scalar()
+    if exists:
+        where = "(box_id = :b OR (notes LIKE '%' || :b || '%'))"
+        params = {"b": box_id}
+        if txn:
+            where = "box_id = :b AND transaction_no = :t"
+            params["t"] = txn
+        try:
+            disp_rows = db.execute(
+                text(f"""
+                    SELECT id, box_id, transaction_no, lot_no, item_description,
+                           from_company, unit, from_site, source_table,
+                           disposition_type, disposition_ref_table,
+                           disposition_ref_id, disposition_ref_no,
+                           disposed_by, disposed_at, reverted, reverted_at,
+                           reverted_reason, snapshot_data, notes
+                    FROM cold_stock_disposition
+                    WHERE {where}
+                    ORDER BY disposed_at ASC, id ASC
+                """),
+                params,
+            ).mappings().all()
+            dispositions = [dict(r) for r in disp_rows]
+        except Exception:
+            dispositions = []
+
+    # Reconciliation ledger — STBR audit
+    reconciliations = []
+    exists = db.execute(text("SELECT to_regclass('public.transfer_box_reconciliation')")).scalar()
+    if exists:
+        where_clauses = ["(original_box_id = :b OR actual_box_id = :b)"]
+        params = {"b": box_id}
+        if txn:
+            where_clauses.append("transaction_no = :t")
+            params["t"] = txn
+        try:
+            rec_rows = db.execute(
+                text(f"""
+                    SELECT id, transfer_in_id, transfer_out_id, lot_no, transaction_no,
+                           original_box_id, actual_box_id, reconciliation_status,
+                           conflict_reason, scan_source, scanned_by, scanned_at,
+                           from_company, to_company, from_site, to_site,
+                           propagated_from_id
+                    FROM transfer_box_reconciliation
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY scanned_at ASC, id ASC
+                """),
+                params,
+            ).mappings().all()
+            reconciliations = [dict(r) for r in rec_rows]
+        except Exception:
+            reconciliations = []
+
+    # Build a flat unified timeline (best-effort sort by timestamp).
+    def _ts(row, *keys):
+        for k in keys:
+            v = row.get(k)
+            if v:
+                return v.isoformat() if hasattr(v, "isoformat") else str(v)
+        return ""
+
+    timeline = []
+    for d in dispositions:
+        timeline.append({
+            "kind": "disposition",
+            "when": _ts(d, "disposed_at"),
+            "summary": f"{d.get('disposition_type')} → ref={d.get('disposition_ref_no')}"
+                       + (" (REVERTED)" if d.get("reverted") else ""),
+            "row_id": d.get("id"),
+            "raw": d,
+        })
+    for r in reconciliations:
+        timeline.append({
+            "kind": "reconciliation",
+            "when": _ts(r, "scanned_at"),
+            "summary": f"{r.get('reconciliation_status')}: "
+                       f"{r.get('original_box_id')} → {r.get('actual_box_id')}",
+            "row_id": r.get("id"),
+            "raw": r,
+        })
+    timeline.sort(key=lambda x: x["when"] or "")
+
+    return {
+        "box_id": box_id,
+        "transaction_no": txn,
+        "current_state": {
+            "cold_stocks": cold_stocks,
+            "warehouse_boxes": warehouse_boxes,
+            "pending_transit": pending,
+        },
+        "dispositions": dispositions,
+        "reconciliations": reconciliations,
+        "timeline": timeline,
+        "summary": {
+            "in_cold_stocks": len(cold_stocks),
+            "in_warehouse": len(warehouse_boxes),
+            "in_transit": len(pending),
+            "disposition_events": len(dispositions),
+            "active_dispositions": sum(1 for d in dispositions if not d.get("reverted")),
+            "reconciliation_events": len(reconciliations),
+        },
+    }
 
 
 @router.get("/transfer-in/{transfer_in_id}", response_model=TransferInDetail)

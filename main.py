@@ -216,6 +216,7 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "http://127.0.0.1:4000",
         "https://candorims.netlify.app",
+        "https://8vp3hks5-8000.inc1.devtunnels.ms",
     ],
     allow_credentials=True,
     allow_methods=["*"],

@@ -1032,7 +1032,31 @@ def list_inward_records(
 
                     t.warehouse,
 
-                    STRING_AGG(DISTINCT a.item_description, ', ' ORDER BY a.item_description) AS article_descriptions,
+                    t.vehicle_number,
+
+                    t.transporter_name,
+
+                    t.lr_number,
+
+                    t.challan_number,
+
+                    t.grn_number,
+
+                    t.grn_quantity,
+
+                    t.approval_authority,
+
+                    t.source_location,
+
+                    t.destination_location,
+
+                    t.remark,
+
+                    SUM(a.net_weight) AS net_weight,
+
+                    SUM(a.total_weight) AS total_weight,
+
+                    STRING_AGG(DISTINCT a.item_description, chr(10) ORDER BY a.item_description) AS article_descriptions,
 
                     STRING_AGG(DISTINCT
 
@@ -1066,6 +1090,32 @@ def list_inward_records(
 
                     ) FILTER (WHERE a.quantity_units IS NOT NULL) AS article_quantities,
 
+                    -- Combined per-item label: "ItemName (X.XX kg)"
+                    -- ORDER BY must repeat the full DISTINCT expression (PostgreSQL DISTINCT+ORDER BY constraint)
+                    STRING_AGG(DISTINCT
+                        a.item_description ||
+                        CASE
+                            WHEN a.net_weight IS NOT NULL AND a.net_weight > 0
+                            THEN ' (' || ROUND(a.net_weight::numeric, 2)::text || ' kg)'
+                            WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
+                            THEN ' (' || a.quantity_units::text || ' ' || a.uom || ')'
+                            WHEN a.quantity_units IS NOT NULL
+                            THEN ' (' || a.quantity_units::text || ')'
+                            ELSE ''
+                        END,
+                        chr(10)
+                        ORDER BY a.item_description ||
+                        CASE
+                            WHEN a.net_weight IS NOT NULL AND a.net_weight > 0
+                            THEN ' (' || ROUND(a.net_weight::numeric, 2)::text || ' kg)'
+                            WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
+                            THEN ' (' || a.quantity_units::text || ' ' || a.uom || ')'
+                            WHEN a.quantity_units IS NOT NULL
+                            THEN ' (' || a.quantity_units::text || ')'
+                            ELSE ''
+                        END
+                    ) FILTER (WHERE a.item_description IS NOT NULL) AS article_items_with_qty,
+
                     COUNT(DISTINCT b.box_number) AS box_count,
 
                     STRING_AGG(DISTINCT b.article_description, ', ' ORDER BY b.article_description) AS box_descriptions
@@ -1084,7 +1134,7 @@ def list_inward_records(
 
                     ON t.transaction_no = b.transaction_no AND t._source = b._source
 
-                GROUP BY t.transaction_no, t._source, t.entry_date, t.system_grn_date, t.status, t.invoice_number, t.po_number, t.vendor_supplier_name, t.customer_party_name, t.total_amount, t.warehouse
+                GROUP BY t.transaction_no, t._source, t.entry_date, t.system_grn_date, t.status, t.invoice_number, t.po_number, t.vendor_supplier_name, t.customer_party_name, t.total_amount, t.warehouse, t.vehicle_number, t.transporter_name, t.lr_number, t.challan_number, t.grn_number, t.grn_quantity, t.approval_authority, t.source_location, t.destination_location, t.remark
 
             )
 
@@ -1122,6 +1172,36 @@ def list_inward_records(
 
                 END AS quantities_and_uoms_text,
 
+                td.article_items_with_qty AS article_items_with_qty_text,
+
+                td.vehicle_number,
+
+                td.transporter_name,
+
+                td.lr_number,
+
+                td.challan_number,
+
+                td.grn_number,
+
+                td.grn_quantity,
+
+                td.system_grn_date,
+
+                td.approval_authority,
+
+                td.source_location,
+
+                td.destination_location,
+
+                td.remark,
+
+                td.net_weight,
+
+                td.total_weight,
+
+                td.box_count,
+
                 CASE
 
                     WHEN td._source = 'inward' THEN EXISTS (
@@ -1156,7 +1236,7 @@ def list_inward_records(
 
         if record.item_descriptions_text and record.item_descriptions_text.strip():
 
-            item_descriptions = [d.strip() for d in record.item_descriptions_text.split(",") if d.strip()]
+            item_descriptions = [d.strip() for d in record.item_descriptions_text.split("\n") if d.strip()]
 
 
 
@@ -1165,6 +1245,12 @@ def list_inward_records(
         if record.quantities_and_uoms_text and record.quantities_and_uoms_text.strip():
 
             quantities_and_uoms = [q.strip() for q in record.quantities_and_uoms_text.split(",") if q.strip()]
+
+        # Combined per-item "Name (X kg)" list — newline-separated so commas in names are safe
+        article_items_with_qty: list[str] = []
+        raw_items_qty = getattr(record, "article_items_with_qty_text", None)
+        if raw_items_qty and raw_items_qty.strip():
+            article_items_with_qty = [x.strip() for x in raw_items_qty.split("\n") if x.strip()]
 
 
 
@@ -1196,7 +1282,37 @@ def list_inward_records(
 
                 quantities_and_uoms=quantities_and_uoms,
 
+                article_items_with_qty=article_items_with_qty,
+
                 has_edits=record.has_edits,
+
+                approval_authority=record.approval_authority,
+
+                vehicle_number=record.vehicle_number,
+
+                transporter_name=record.transporter_name,
+
+                lr_number=record.lr_number,
+
+                challan_number=record.challan_number,
+
+                grn_number=record.grn_number,
+
+                grn_quantity=float(record.grn_quantity) if record.grn_quantity is not None else None,
+
+                system_grn_date=format_date_for_frontend(record.system_grn_date),
+
+                source_location=record.source_location,
+
+                destination_location=record.destination_location,
+
+                remark=record.remark,
+
+                net_weight=float(record.net_weight) if record.net_weight is not None else None,
+
+                total_weight=float(record.total_weight) if record.total_weight is not None else None,
+
+                box_count=int(record.box_count) if record.box_count is not None else None,
 
             )
 
@@ -2454,7 +2570,7 @@ def update_inward(
 
 
 
-def delete_inward(company: Company, transaction_no: str, db: Session) -> dict:
+def delete_inward(company: Company, transaction_no: str, db: Session, deleted_by: str | None = None) -> dict:
     from shared.email_notifier import notify_inward_deleted
 
     tables = table_names(company)
@@ -2467,7 +2583,7 @@ def delete_inward(company: Company, transaction_no: str, db: Session) -> dict:
     if existing:
         # Snapshot details for email before deleting
         tx_row = db.execute(
-            text(f"SELECT entry_date, vendor_supplier_name, warehouse FROM {tables['tx']} WHERE transaction_no = :txno"),
+            text(f"SELECT entry_date, vendor_supplier_name, warehouse, purchased_by FROM {tables['tx']} WHERE transaction_no = :txno"),
             {"txno": transaction_no},
         ).fetchone()
         art_count = db.execute(
@@ -2478,6 +2594,22 @@ def delete_inward(company: Company, transaction_no: str, db: Session) -> dict:
             text(f"SELECT COUNT(*) FROM {tables['box']} WHERE transaction_no = :txno"),
             {"txno": transaction_no},
         ).scalar() or 0
+        art_rows = db.execute(
+            text(
+                f"SELECT a.item_description, a.lot_number, a.net_weight, "
+                f"COALESCE(b_agg.gross_weight, 0) AS gross_weight "
+                f"FROM {tables['art']} a "
+                f"LEFT JOIN (SELECT article_description, lot_number, SUM(gross_weight) AS gross_weight "
+                f"  FROM {tables['box']} WHERE transaction_no = :txno GROUP BY article_description, lot_number) b_agg "
+                f"ON b_agg.article_description = a.item_description AND b_agg.lot_number = a.lot_number "
+                f"WHERE a.transaction_no = :txno ORDER BY a.item_description"
+            ),
+            {"txno": transaction_no},
+        ).fetchall()
+        items_snapshot = [
+            {"item_description": r.item_description, "lot_number": r.lot_number, "net_weight": r.net_weight, "gross_weight": float(r.gross_weight or 0)}
+            for r in art_rows
+        ]
 
         boxes_deleted = db.execute(
             text(f"DELETE FROM {tables['box']} WHERE transaction_no = :txno"),
@@ -2502,6 +2634,9 @@ def delete_inward(company: Company, transaction_no: str, db: Session) -> dict:
             articles_count=int(art_count),
             boxes_count=int(box_count),
             source="inward (v2)",
+            items=items_snapshot,
+            deleted_by=deleted_by,
+            created_by=tx_row.purchased_by if tx_row else None,
         )
         return {
             "status": "deleted",
@@ -2533,7 +2668,7 @@ def delete_inward(company: Company, transaction_no: str, db: Session) -> dict:
 
     # Snapshot details for email before deleting
     tx_row = db.execute(
-        text(f"SELECT entry_date, vendor_supplier_name, warehouse FROM {_be['tx']} WHERE transaction_no = :txno"),
+        text(f"SELECT entry_date, vendor_supplier_name, warehouse, purchased_by FROM {_be['tx']} WHERE transaction_no = :txno"),
         {"txno": transaction_no},
     ).fetchone()
     art_count = db.execute(
@@ -2544,6 +2679,22 @@ def delete_inward(company: Company, transaction_no: str, db: Session) -> dict:
         text(f"SELECT COUNT(*) FROM {_be['box']} WHERE transaction_no = :txno"),
         {"txno": transaction_no},
     ).scalar() or 0
+    art_rows = db.execute(
+        text(
+            f"SELECT a.item_description, a.lot_number, a.net_weight, "
+            f"COALESCE(b_agg.gross_weight, 0) AS gross_weight "
+            f"FROM {_be['art']} a "
+            f"LEFT JOIN (SELECT article_description, lot_number, SUM(gross_weight) AS gross_weight "
+            f"  FROM {_be['box']} WHERE transaction_no = :txno GROUP BY article_description, lot_number) b_agg "
+            f"ON b_agg.article_description = a.item_description AND b_agg.lot_number = a.lot_number "
+            f"WHERE a.transaction_no = :txno ORDER BY a.item_description"
+        ),
+        {"txno": transaction_no},
+    ).fetchall()
+    items_snapshot = [
+        {"item_description": r.item_description, "lot_number": r.lot_number, "net_weight": r.net_weight, "gross_weight": float(r.gross_weight or 0)}
+        for r in art_rows
+    ]
 
     cold_deleted = db.execute(
         text(f"DELETE FROM {_be['cold']} WHERE inward_transaction_no = :txno AND auto_created_from_inward = true"),
@@ -2572,6 +2723,9 @@ def delete_inward(company: Company, transaction_no: str, db: Session) -> dict:
         articles_count=int(art_count),
         boxes_count=int(box_count),
         source="bulk inward (cold storage)",
+        items=items_snapshot,
+        deleted_by=deleted_by,
+        created_by=tx_row.purchased_by if tx_row else None,
     )
     return {
         "status": "deleted",

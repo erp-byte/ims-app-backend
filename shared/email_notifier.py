@@ -706,7 +706,6 @@ def notify_job_work_material_in_created(
                   for all IRs of this challan including the current one
     """
     items = payload.get("items", []) or []
-    boxes = payload.get("boxes", []) or []
     receipt_type = payload.get("receipt_type", "partial")
     original_challan_no = payload.get("original_challan_no", "") or str(inward_receipt_id)
     is_partial = receipt_type.lower() == "partial"
@@ -886,25 +885,6 @@ def notify_job_work_material_in_created(
         for h in ["Item Description", "Sent Kgs", "Total Accounted", "Pending"]
     )
 
-    # ── Boxes section ─────────────────────────────────────────────────────
-    boxes_section = ""
-    if boxes:
-        box_columns = [
-            ("Box ID", "box_id"), ("Box #", "box_number"), ("Item", "item_description"),
-            ("Net Wt", "net_weight"), ("Lot No", "lot_no"), ("Location", "storage_location"),
-        ]
-        box_rows = _jw_lines_html(boxes, box_columns)
-        box_headers = "".join(
-            f'<th style="padding:8px 10px;text-align:left;">{label}</th>'
-            for label, _ in box_columns
-        )
-        boxes_section = f"""
-      <h3 style="color:#29417A;margin:24px 0 8px;">Boxes</h3>
-      <table style="border-collapse:collapse;width:100%;font-size:13px;">
-        <thead><tr style="background:#29417A;color:#fff;">{box_headers}</tr></thead>
-        <tbody>{box_rows}</tbody>
-      </table>"""
-
     # ── Assemble HTML ─────────────────────────────────────────────────────
     body = f"""
       <h3 style="color:#29417A;margin:0 0 8px;">Header Details</h3>
@@ -930,8 +910,6 @@ def notify_job_work_material_in_created(
         <tbody>{pendency_rows}</tbody>
       </table>
       {pendency_note}
-
-      {boxes_section}
     """
 
     html = _jw_wrap(
@@ -1498,8 +1476,12 @@ def notify_inward_deleted(
     articles_count: int = 0,
     boxes_count: int = 0,
     source: str = "inward",
+    deleted_by: str | None = None,
+    created_by: str | None = None,
+    items: list | None = None,
 ) -> None:
     """Send notification to b.hrithik when an inward transaction is deleted."""
+    deleted_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
     rows = [
         ("Transaction No", transaction_no),
         ("Company", company),
@@ -1509,7 +1491,7 @@ def notify_inward_deleted(
         ("Articles", str(articles_count)),
         ("Boxes", str(boxes_count)),
         ("Source", source),
-        ("Deleted At", datetime.now().strftime("%d %b %Y, %I:%M %p")),
+        ("Deleted At", deleted_at),
     ]
     header_rows = ""
     for label, value in rows:
@@ -1520,6 +1502,41 @@ def notify_inward_deleted(
             f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{value}</td>'
             f'</tr>'
         )
+    # Deleted By / Created By rows
+    header_rows += (
+        f'<tr style="background:#f8fafc;">'
+        f'<td style="padding:6px 12px;color:#6b7280;font-size:13px;font-weight:bold;border:1px solid #e0e0e0;width:180px;">Deleted By</td>'
+        f'<td style="padding:6px 12px;font-size:13px;font-weight:500;border:1px solid #e0e0e0;">{deleted_by or "—"}</td>'
+        f'</tr>'
+        f'<tr>'
+        f'<td style="padding:6px 12px;color:#6b7280;font-size:13px;font-weight:bold;border:1px solid #e0e0e0;width:180px;">Created By</td>'
+        f'<td style="padding:6px 12px;font-size:13px;font-weight:500;border:1px solid #e0e0e0;">{created_by or "—"}</td>'
+        f'</tr>'
+    )
+
+    # Item details section
+    items_rows = "".join([
+        f"""<tr style="border-bottom:1px solid #f1f5f9;">
+          <td style="padding:5px 12px;font-size:12px;">{i + 1}</td>
+          <td style="padding:5px 12px;font-size:12px;">{it.get('item_description') or '—'}</td>
+          <td style="padding:5px 12px;font-size:12px;">{it.get('lot_number') or it.get('lot_no') or '—'}</td>
+          <td style="padding:5px 12px;font-size:12px;text-align:right;">{float(it.get('net_weight') or 0):.2f}</td>
+          <td style="padding:5px 12px;font-size:12px;text-align:right;">{float(it.get('gross_weight') or 0):.2f}</td>
+        </tr>"""
+        for i, it in enumerate(items or [])
+    ])
+    items_section = f"""
+    <h3 style="font-size:14px;font-weight:600;margin:20px 0 8px;">Item Details</h3>
+    <table style="width:100%;border-collapse:collapse;">
+      <thead><tr style="background:#f8fafc;">
+        <th style="padding:6px 12px;text-align:left;font-size:12px;">#</th>
+        <th style="padding:6px 12px;text-align:left;font-size:12px;">Item</th>
+        <th style="padding:6px 12px;text-align:left;font-size:12px;">Lot</th>
+        <th style="padding:6px 12px;text-align:right;font-size:12px;">Net Wt (Kg)</th>
+        <th style="padding:6px 12px;text-align:right;font-size:12px;">Gross Wt (Kg)</th>
+      </tr></thead>
+      <tbody>{items_rows}</tbody>
+    </table>""" if items else ""
 
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
@@ -1540,6 +1557,7 @@ def notify_inward_deleted(
       <table style="border-collapse:collapse;width:100%;font-size:13px;">
         <tbody>{header_rows}</tbody>
       </table>
+      {items_section}
     </td></tr>
     <tr><td style="background:#f8f9fa;padding:12px 24px;text-align:center;font-size:12px;color:#888;">
       Candor Foods &mdash; IMS Inward Notification
@@ -1554,7 +1572,9 @@ def notify_inward_deleted(
         f"Warehouse: {warehouse or '-'}\n"
         f"Articles: {articles_count} | Boxes: {boxes_count}\n"
         f"Source: {source}\n"
-        f"Deleted At: {datetime.now().strftime('%d %b %Y, %I:%M %p')}"
+        f"Deleted At: {deleted_at}\n"
+        f"Deleted By: {deleted_by or '-'}\n"
+        f"Created By: {created_by or '-'}"
     )
 
     _send_email_background(

@@ -12,12 +12,91 @@ from services.ims_service.interunit_models import (
     PendingTransferInCreate, PendingBoxAcknowledge, FinalizeTransferIn,
     CategorialSearchItem, CategorialSearchResponse,
     CategorialDropdownOptions, CategorialDropdownMeta, CategorialDropdownResponse,
+    BoxCreate,
 )
 from services.ims_service.pending_stock_tools import (
-    park_in_pending, pick_from_pending, unpick_to_pending, restore_to_source,
+    park_in_pending, park_lines_in_pending, pick_from_pending, unpick_to_pending,
+    restore_to_source, _is_cold_site,
 )
 
 logger = get_logger("ims.interunit")
+
+
+# -- Cold sub-warehouse mapping --
+#
+# Cold-source transfers always store from_site='Cold Storage' on the header; the
+# actual sub-cold (D-39 / D-514 / Rishi / Supreme) is only knowable from the
+# source cold_stocks row (or its JSONB snapshot in pending_transfer_stock). We
+# persist a canonical sub-cold value on interunit_transfers_header.from_cold_unit
+# at create-transfer time so the Transfer Out Records filter can drill in.
+#
+# The canonical names are the ones the frontend chips display:
+#   Savla D-39, Savla D-514, Rishi, Supreme Cold.
+
+_COLD_UNIT_ALIASES: dict[str, set[str]] = {
+    "Savla D-39":  {"d-39", "d39", "savla d-39", "savla d39", "savla-d-39"},
+    "Savla D-514": {"d-514", "d514", "savla d-514", "savla d514", "savla-d-514"},
+    "Rishi":       {"rishi", "rishi cold"},
+    "Supreme Cold":{"supreme", "supreme cold"},
+}
+
+# Reverse lookup: alias-key (lowercased, stripped) → canonical
+_COLD_UNIT_BY_ALIAS: dict[str, str] = {
+    a: canon for canon, aliases in _COLD_UNIT_ALIASES.items() for a in aliases
+}
+
+
+def _normalize_cold_unit(raw: Optional[str]) -> Optional[str]:
+    """Map a free-form cold-unit value to its canonical sub-cold name, or None."""
+    if not raw:
+        return None
+    return _COLD_UNIT_BY_ALIAS.get(raw.strip().lower())
+
+
+_interunit_schema_ensured = False
+
+def _ensure_interunit_schema(db: Session) -> None:
+    """Lazy idempotent ALTERs for interunit-side schema add-ons."""
+    global _interunit_schema_ensured
+    if _interunit_schema_ensured:
+        return
+    try:
+        db.execute(text(
+            "ALTER TABLE interunit_transfers_header "
+            "ADD COLUMN IF NOT EXISTS from_cold_unit VARCHAR(50)"
+        ))
+        db.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_interunit_header_from_cold_unit "
+            "ON interunit_transfers_header(from_cold_unit) WHERE from_cold_unit IS NOT NULL"
+        ))
+        db.execute(text(
+            "ALTER TABLE interunit_transfer_in_header "
+            "ADD COLUMN IF NOT EXISTS inward_transaction_no VARCHAR(50)"
+        ))
+        db.execute(text(
+            "ALTER TABLE interunit_transfer_in_boxes "
+            "ADD COLUMN IF NOT EXISTS inward_box_id VARCHAR(50)"
+        ))
+        db.execute(text(
+            "ALTER TABLE interunit_transfer_in_boxes "
+            "ADD COLUMN IF NOT EXISTS original_box_id VARCHAR(100)"
+        ))
+        db.execute(text(
+            "ALTER TABLE interunit_transfer_in_boxes "
+            "ADD COLUMN IF NOT EXISTS reconciled BOOLEAN DEFAULT FALSE"
+        ))
+        db.execute(text(
+            "ALTER TABLE interunit_transfer_in_boxes "
+            "ADD COLUMN IF NOT EXISTS reconciliation_id VARCHAR(100)"
+        ))
+        db.execute(text(
+            "ALTER TABLE interunit_transfer_in_boxes "
+            "ADD COLUMN IF NOT EXISTS scan_source VARCHAR(50)"
+        ))
+        db.commit()
+    except Exception as e:
+        logger.warning("Interunit schema ensure failed: %s", e)
+    _interunit_schema_ensured = True
 
 
 # -- Helpers --
@@ -445,6 +524,7 @@ def _map_transfer_header(row, request_no: Optional[str] = None) -> dict:
         "created_ts": row.created_ts,
         "approved_ts": getattr(row, "approved_ts", None),
         "has_variance": getattr(row, "has_variance", False) or False,
+        "from_cold_unit": getattr(row, "from_cold_unit", None) or None,
     }
 
 
@@ -469,6 +549,8 @@ def _map_box_row(row) -> dict:
         "gross_weight": str(row.gross_weight) if row.gross_weight is not None else "0",
         "created_at": row.created_at,
         "updated_at": row.updated_at,
+        "source_storage": getattr(row, "source_storage", None) or None,
+        "source_unit": getattr(row, "source_unit", None) or None,
     }
 
 
@@ -489,14 +571,30 @@ def _fetch_transfer_lines(db: Session, header_id: int) -> list:
 
 
 def _fetch_boxes(db: Session, header_id: int) -> list:
+    # source_unit is normalized to the canonical chip name (Savla D-39 / Savla
+    # D-514 / Rishi / Supreme Cold) so per-box attribution is comparable to
+    # the header's from_cold_unit and the frontend chip values. Raw
+    # cold_storage_data->>'unit' values like 'D-39' / 'RISHI COLD' are mapped
+    # in-SQL; unrecognized values pass through unchanged (so we never lie).
     rows = db.execute(
         text("""
-            SELECT id, header_id, transfer_line_id, box_number, box_id, article,
-                   lot_number, batch_number, transaction_no,
-                   net_weight, gross_weight, created_at, updated_at
-            FROM interunit_transfer_boxes
-            WHERE header_id = :hid
-            ORDER BY box_number
+            SELECT itb.id, itb.header_id, itb.transfer_line_id, itb.box_number,
+                   itb.box_id, itb.article, itb.lot_number, itb.batch_number,
+                   itb.transaction_no, itb.net_weight, itb.gross_weight,
+                   itb.created_at, itb.updated_at,
+                   pts.cold_storage_data->>'storage_location' AS source_storage,
+                   CASE
+                     WHEN LOWER(pts.cold_storage_data->>'unit') IN ('d-39','d39','savla d-39','savla d39','savla-d-39') THEN 'Savla D-39'
+                     WHEN LOWER(pts.cold_storage_data->>'unit') IN ('d-514','d514','savla d-514','savla d514','savla-d-514') THEN 'Savla D-514'
+                     WHEN LOWER(pts.cold_storage_data->>'unit') IN ('rishi','rishi cold') THEN 'Rishi'
+                     WHEN LOWER(pts.cold_storage_data->>'unit') IN ('supreme','supreme cold') THEN 'Supreme Cold'
+                     ELSE pts.cold_storage_data->>'unit'
+                   END AS source_unit
+            FROM interunit_transfer_boxes itb
+            LEFT JOIN pending_transfer_stock pts
+                ON pts.box_id = itb.box_id AND pts.status = 'In Transit'
+            WHERE itb.header_id = :hid
+            ORDER BY itb.box_number
         """),
         {"hid": header_id},
     ).fetchall()
@@ -506,6 +604,162 @@ def _fetch_boxes(db: Session, header_id: int) -> list:
     result = [_map_box_row(r) for r in rows]
     logger.info("FETCH_BOXES_DEBUG: mapped result box_ids=%s", [b["box_id"] for b in result])
     return result
+
+
+# -- Auto-derive warehouse boxes (Plan C: hybrid) --
+#
+# When a Transfer-Out is submitted from a warehouse source (W202 / A185 / A101 / A68 /
+# F53 / etc.) and the frontend sent no `boxes` array, derive box rows server-side
+# by joining boxes ⨝ transactions on transaction_no and filtering
+# transactions.warehouse = from_site. Picks FIFO by created_at, id.
+#
+# Inventory location precedence (matches _find_in_bulk_entry in pending_stock_tools):
+#   1. {company}_boxes_v2   ⨝ {company}_transactions_v2   (current target — no status col)
+#   2. {company}_bulk_entry_boxes ⨝ {company}_bulk_entry_transactions  (legacy fallback,
+#      filtered by status='available'; being decommissioned)
+#
+# Boxes already in pending_transfer_stock ('In Transit') are excluded. Raises
+# HTTPException(400) on ambiguity (both companies match, multiple lots when none
+# specified) or insufficient stock.
+
+_AVAILABLE_BOX_SQL_V2 = """
+    SELECT b.id, b.box_id, b.transaction_no, b.article_description, b.lot_number,
+           b.net_weight, b.gross_weight, b.box_number, b.created_at
+    FROM {tbl_boxes} b
+    JOIN {tbl_txns}  t ON t.transaction_no = b.transaction_no
+    WHERE UPPER(TRIM(t.warehouse)) = UPPER(TRIM(:wh))
+      AND COALESCE(b.box_id, '') <> ''
+      AND COALESCE(b.transaction_no, '') <> ''
+      AND UPPER(TRIM(b.article_description)) = UPPER(TRIM(:art))
+      {lot_clause}
+      AND b.box_id NOT IN (
+          SELECT box_id FROM pending_transfer_stock WHERE status = 'In Transit'
+      )
+    ORDER BY b.created_at ASC NULLS LAST, b.id ASC
+"""
+
+_AVAILABLE_BOX_SQL_LEGACY = """
+    SELECT b.id, b.box_id, b.transaction_no, b.article_description, b.lot_number,
+           b.net_weight, b.gross_weight, b.box_number, b.created_at
+    FROM {tbl_boxes} b
+    JOIN {tbl_txns}  t ON t.transaction_no = b.transaction_no
+    WHERE UPPER(TRIM(t.warehouse)) = UPPER(TRIM(:wh))
+      AND b.status = 'available'
+      AND COALESCE(b.box_id, '') <> ''
+      AND COALESCE(b.transaction_no, '') <> ''
+      AND UPPER(TRIM(b.article_description)) = UPPER(TRIM(:art))
+      {lot_clause}
+      AND b.box_id NOT IN (
+          SELECT box_id FROM pending_transfer_stock WHERE status = 'In Transit'
+      )
+    ORDER BY b.created_at ASC NULLS LAST, b.id ASC
+"""
+
+
+def _auto_derive_warehouse_boxes(db: Session, from_site: str, lines: list) -> list:
+    """Server-side FIFO box picker for warehouse-source transfers when the
+    frontend submitted no boxes. Returns a list of BoxCreate, sequentially
+    numbered. Raises HTTPException(400) on ambiguity / insufficient stock so
+    the operator is prompted to scan/pick manually."""
+    derived: list = []
+    used_box_ids: set = set()
+    box_number_counter = 1
+
+    for line in lines:
+        article = (getattr(line, "item_desc_raw", "") or "").strip()
+        lot     = (getattr(line, "lot_number", "") or "").strip()
+        qty     = int(getattr(line, "qty", 0) or 0)
+        if not article or qty <= 0:
+            continue
+
+        company_rows: dict[str, list] = {}
+        lot_clause = "AND UPPER(TRIM(b.lot_number)) = UPPER(TRIM(:lot))" if lot else ""
+        params = {"wh": from_site, "art": article}
+        if lot:
+            params["lot"] = lot
+        for company in ("cfpl", "cdpl"):
+            # v2 first (live inventory target); legacy bulk_entry_boxes fallback.
+            attempts = (
+                (_AVAILABLE_BOX_SQL_V2,     f"{company}_boxes_v2",          f"{company}_transactions_v2"),
+                (_AVAILABLE_BOX_SQL_LEGACY, f"{company}_bulk_entry_boxes",  f"{company}_bulk_entry_transactions"),
+            )
+            rows: list = []
+            for sql_tmpl, tbl_boxes, tbl_txns in attempts:
+                sql = sql_tmpl.format(tbl_boxes=tbl_boxes, tbl_txns=tbl_txns, lot_clause=lot_clause)
+                try:
+                    fetched = db.execute(text(sql), params).fetchall()
+                except Exception as e:
+                    logger.warning("AUTO_BOX_DERIVE: query failed on %s: %s", tbl_boxes, e)
+                    continue
+                fetched = [r for r in fetched if r.box_id not in used_box_ids]
+                if fetched:
+                    rows = fetched
+                    break
+            if rows:
+                company_rows[company] = rows
+
+        if not company_rows:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No available bulk-entry boxes found for '{article}'"
+                    + (f" (lot='{lot}')" if lot else "")
+                    + f" at warehouse '{from_site}'. Scan/pick boxes manually or check stock."
+                ),
+            )
+        if len(company_rows) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Ambiguous source for '{article}' at '{from_site}': "
+                    f"matching boxes exist in BOTH cfpl and cdpl bulk-entry tables. "
+                    f"Open the box picker and select specific boxes."
+                ),
+            )
+
+        company, rows = next(iter(company_rows.items()))
+
+        if not lot:
+            lots_in_first_qty = {(r.lot_number or "").strip() for r in rows[:qty]}
+            if len(lots_in_first_qty) > 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Multiple lots ({sorted(lots_in_first_qty)}) available for '{article}' "
+                        f"at '{from_site}'. Specify a lot_number on the line or scan/pick boxes."
+                    ),
+                )
+
+        if len(rows) < qty:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Insufficient stock at '{from_site}' for '{article}'"
+                    + (f" lot='{lot}'" if lot else "")
+                    + f": need {qty}, only {len(rows)} available. Scan/pick boxes manually "
+                      f"or adjust the line qty."
+                ),
+            )
+
+        for r in rows[:qty]:
+            used_box_ids.add(r.box_id)
+            derived.append(BoxCreate(
+                box_number=box_number_counter,
+                box_id=r.box_id,
+                article=r.article_description or article,
+                lot_number=(r.lot_number or lot or ""),
+                batch_number="",
+                transaction_no=r.transaction_no,
+                net_weight=str(r.net_weight) if r.net_weight is not None else "0",
+                gross_weight=str(r.gross_weight) if r.gross_weight is not None else "0",
+            ))
+            box_number_counter += 1
+
+    logger.info(
+        "AUTO_BOX_DERIVE: derived %d boxes for warehouse-source transfer from %s "
+        "(across %d line(s))", len(derived), from_site, len(lines),
+    )
+    return derived
 
 
 # -- Create transfer --
@@ -604,6 +858,20 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
         ).fetchone()
         lines.append(row)
 
+    # Plan C: auto-derive boxes for warehouse-source transfers when the frontend
+    # didn't scan any. Best-effort — if the stock is not box-tracked (no matching
+    # boxes), ambiguous, or insufficient, we DO NOT block the save: the transfer
+    # falls through to line-level pending below so every transfer is still tracked.
+    if (not data.boxes) and lines and not _is_cold_site(data.header.from_warehouse):
+        try:
+            data.boxes = _auto_derive_warehouse_boxes(db, data.header.from_warehouse, lines)
+        except HTTPException as e:
+            logger.info(
+                "TRANSFER: box auto-derive skipped (%s) — falling back to line-level pending",
+                getattr(e, "detail", e),
+            )
+            data.boxes = []
+
     # Insert boxes (if provided)
     boxes = []
     if data.boxes:
@@ -683,6 +951,48 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
             db=db,
         )
 
+        # For cold-source transfers, persist the canonical sub-cold(s) (D-39/D-514/
+        # Rishi/Supreme Cold) on the header so the Transfer Out Records chip
+        # filter can drill in. A single transfer can span multiple sub-units
+        # (e.g. boxes from both D-39 and Rishi) — those land as a comma-separated
+        # canonical list ("Rishi, Savla D-39"), which the chip filter matches via
+        # ILIKE. Pulled from the JSONB snapshots park_in_pending just wrote into
+        # pending_transfer_stock.
+        if _is_cold_site(data.header.from_warehouse):
+            _ensure_interunit_schema(db)
+            raw_units = db.execute(
+                text(
+                    "SELECT DISTINCT cold_storage_data->>'unit' AS u "
+                    "FROM pending_transfer_stock "
+                    "WHERE transfer_out_id = :id AND cold_storage_data IS NOT NULL "
+                    "  AND cold_storage_data->>'unit' IS NOT NULL"
+                ),
+                {"id": header_id},
+            ).fetchall()
+            canonical_set = {_normalize_cold_unit(r.u) for r in raw_units}
+            canonical_set.discard(None)
+            if canonical_set:
+                joined = ", ".join(sorted(canonical_set))
+                db.execute(
+                    text("UPDATE interunit_transfers_header SET from_cold_unit = :u WHERE id = :id"),
+                    {"u": joined, "id": header_id},
+                )
+
+    elif lines:
+        # No box-level rows — article/quantity-only transfer, or the source stock is
+        # not box-tracked so Plan C couldn't derive boxes. Park line-level pending rows
+        # so EVERY transfer is represented in the in-transit ledger. Tracking-only:
+        # deducts/inserts no inventory (see park_lines_in_pending).
+        park_lines_in_pending(
+            transfer_out_id=header_id,
+            challan_no=header.challan_no,
+            from_site=data.header.from_warehouse,
+            to_site=data.header.to_warehouse,
+            lines=lines,
+            dispatched_by=getattr(header, "created_by", "system") or "system",
+            db=db,
+        )
+
     # Determine status based on box count vs expected qty
     if boxes:
         total_expected = sum(int(l.qty) for l in lines)
@@ -743,6 +1053,8 @@ def list_transfers(
     sort_order: str,
     db: Session,
 ) -> dict:
+    _ensure_interunit_schema(db)
+
     clauses = ["1=1"]
     params: dict = {}
 
@@ -750,8 +1062,19 @@ def list_transfers(
         clauses.append("h.status = :status")
         params["status"] = status
     if from_site:
-        clauses.append("h.from_site = :from_site")
-        params["from_site"] = from_site
+        # Cold sub-warehouse chips (Savla D-39 / Savla D-514 / Rishi / Supreme
+        # Cold) need to be translated: the header's from_site is always
+        # 'Cold Storage' for these — the sub-cold(s) are on from_cold_unit.
+        # Multi-unit transfers store a comma-separated list ("Rishi, Savla D-39")
+        # so we match via ILIKE — the canonical names don't share substrings
+        # so this stays unambiguous (D-39 won't match Savla D-514, etc.).
+        cu_canon = _normalize_cold_unit(from_site)
+        if cu_canon:
+            clauses.append("h.from_site ILIKE 'cold%' AND h.from_cold_unit ILIKE :from_cold_unit")
+            params["from_cold_unit"] = f"%{cu_canon}%"
+        else:
+            clauses.append("h.from_site = :from_site")
+            params["from_site"] = from_site
     if to_site:
         clauses.append("h.to_site = :to_site")
         params["to_site"] = to_site
@@ -789,10 +1112,12 @@ def list_transfers(
                 h.vehicle_no, h.driver_name, h.remark, h.reason_code,
                 h.status, h.request_id, h.created_by, h.created_ts,
                 h.approved_by, h.approved_ts, h.has_variance,
+                h.from_cold_unit,
                 r.request_no,
                 COALESCE(lc.items_count, 0) AS items_count,
                 COALESCE(bc.boxes_count, 0) AS boxes_count,
-                COALESCE(lc.total_qty, 0) AS total_qty
+                COALESCE(lc.total_qty, 0) AS total_qty,
+                COALESCE(lt.lot_numbers_text, '') AS lot_numbers_text
             FROM interunit_transfers_header h
             LEFT JOIN interunit_transfer_requests r ON h.request_id = r.id
             LEFT JOIN (
@@ -808,6 +1133,13 @@ def list_transfers(
                 FROM interunit_transfer_boxes
                 GROUP BY header_id
             ) bc ON h.id = bc.header_id
+            LEFT JOIN (
+                SELECT header_id,
+                       STRING_AGG(DISTINCT lot_number, ' ') AS lot_numbers_text
+                FROM interunit_transfer_boxes
+                WHERE lot_number IS NOT NULL AND lot_number <> ''
+                GROUP BY header_id
+            ) lt ON h.id = lt.header_id
             WHERE {where}
             ORDER BY h.{sort_by} {direction}
             LIMIT :limit OFFSET :offset
@@ -822,6 +1154,7 @@ def list_transfers(
         item["boxes_count"] = row.boxes_count or 0
         item["total_qty"] = row.total_qty or 0
         item["pending_items"] = max(0, int(row.total_qty or 0) - int(row.boxes_count or 0))
+        item["lot_numbers_text"] = getattr(row, "lot_numbers_text", None) or ""
         records.append(item)
 
     return {
@@ -895,6 +1228,7 @@ def get_transfer(transfer_id: int, db: Session) -> dict:
                    h.vehicle_no, h.driver_name, h.approved_by, h.remark,
                    h.reason_code, h.status, h.request_id, h.created_by,
                    h.created_ts, h.approved_ts, h.has_variance,
+                   h.from_cold_unit,
                    r.request_no
             FROM interunit_transfers_header h
             LEFT JOIN interunit_transfer_requests r ON h.request_id = r.id
@@ -909,6 +1243,90 @@ def get_transfer(transfer_id: int, db: Session) -> dict:
     result = _map_transfer_header(row)
     result["lines"] = _fetch_transfer_lines(db, transfer_id)
     result["boxes"] = _fetch_boxes(db, transfer_id)
+
+    # Per-lot dominant sub-cold attribution: each lot's authoritative source is
+    # the master cold_stocks table (where it was originally inwarded). We pick
+    # the most-rows unit per lot across cfpl_cold_stocks + cdpl_cold_stocks +
+    # pending_transfer_stock JSONB. The result is a single canonical value per
+    # lot — clean and unambiguous, unlike the per-box JSONB which can carry
+    # noise from prior transfers that shared the same box_id.
+    try:
+        lot_numbers = sorted({(b.get("lot_number") or "").strip() for b in result["boxes"]} - {""})
+        lot_origin_unit: dict[str, str] = {}
+        if lot_numbers:
+            rows = db.execute(
+                text("""
+                    WITH lot_sources AS (
+                        SELECT lot_no, unit AS raw_u FROM cfpl_cold_stocks WHERE lot_no = ANY(:lots)
+                        UNION ALL
+                        SELECT lot_no, unit AS raw_u FROM cdpl_cold_stocks WHERE lot_no = ANY(:lots)
+                        UNION ALL
+                        SELECT lot_no, cold_storage_data->>'unit' AS raw_u
+                        FROM pending_transfer_stock
+                        WHERE lot_no = ANY(:lots) AND cold_storage_data IS NOT NULL
+                    ),
+                    normalized AS (
+                        SELECT lot_no,
+                            CASE
+                                WHEN LOWER(raw_u) IN ('d-39','d39','savla d-39','savla d39','savla-d-39') THEN 'Savla D-39'
+                                WHEN LOWER(raw_u) IN ('d-514','d514','savla d-514','savla d514','savla-d-514') THEN 'Savla D-514'
+                                WHEN LOWER(raw_u) IN ('rishi','rishi cold') THEN 'Rishi'
+                                WHEN LOWER(raw_u) IN ('supreme','supreme cold') THEN 'Supreme Cold'
+                                ELSE NULL
+                            END AS unit
+                        FROM lot_sources
+                        WHERE raw_u IS NOT NULL
+                    ),
+                    counted AS (
+                        SELECT lot_no, unit, COUNT(*) AS n,
+                               ROW_NUMBER() OVER (PARTITION BY lot_no ORDER BY COUNT(*) DESC, unit) AS rk
+                        FROM normalized
+                        WHERE unit IS NOT NULL
+                        GROUP BY lot_no, unit
+                    )
+                    SELECT lot_no, unit FROM counted WHERE rk = 1
+                """),
+                {"lots": lot_numbers},
+            ).fetchall()
+            for r in rows:
+                lot_origin_unit[r.lot_no] = r.unit
+        # Attach to each box so the frontend can group by (article, lot) and
+        # render a single per-lot chip without further aggregation.
+        for b in result["boxes"]:
+            lot = (b.get("lot_number") or "").strip()
+            b["lot_origin_unit"] = lot_origin_unit.get(lot)
+    except Exception as e:
+        logger.warning("LOT_ORIGIN: per-lot dominant unit lookup failed (transfer_id=%s): %s", transfer_id, e)
+
+    # Attach any GRN (Transfer-In) records so the pending-transfer hover card
+    # can show whether a receipt has already been started or completed.
+    try:
+        grn_rows = db.execute(
+            text("""
+                SELECT tih.id, tih.grn_number, tih.status, tih.received_by, tih.received_at,
+                       COUNT(tib.id) AS received_boxes
+                FROM interunit_transfer_in_header tih
+                LEFT JOIN interunit_transfer_in_boxes tib ON tib.header_id = tih.id
+                WHERE tih.transfer_out_id = :tid
+                GROUP BY tih.id, tih.grn_number, tih.status, tih.received_by, tih.received_at
+                ORDER BY tih.created_at DESC
+            """),
+            {"tid": transfer_id},
+        ).fetchall()
+        result["grn_records"] = [
+            {
+                "id": g.id,
+                "grn_number": g.grn_number or "",
+                "status": g.status or "",
+                "received_by": g.received_by or "",
+                "received_at": g.received_at.isoformat() if g.received_at else None,
+                "received_boxes": int(g.received_boxes or 0),
+            }
+            for g in grn_rows
+        ]
+    except Exception:
+        result["grn_records"] = []
+
     logger.info(
         "GET_TRANSFER_DEBUG: transfer_id=%s, boxes_count=%d, box_ids_in_response=%s",
         transfer_id, len(result["boxes"]),
@@ -1036,6 +1454,20 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
         ).fetchone()
         lines.append(row)
 
+    # Plan C: auto-derive boxes for warehouse-source transfers when the frontend
+    # didn't scan any. Best-effort — if the stock is not box-tracked (no matching
+    # boxes), ambiguous, or insufficient, we DO NOT block the save: the transfer
+    # falls through to line-level pending below so every transfer is still tracked.
+    if (not data.boxes) and lines and not _is_cold_site(data.header.from_warehouse):
+        try:
+            data.boxes = _auto_derive_warehouse_boxes(db, data.header.from_warehouse, lines)
+        except HTTPException as e:
+            logger.info(
+                "TRANSFER: box auto-derive skipped (%s) — falling back to line-level pending",
+                getattr(e, "detail", e),
+            )
+            data.boxes = []
+
     # Insert boxes (if provided)
     boxes = []
     if data.boxes:
@@ -1111,6 +1543,48 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
             from_site=data.header.from_warehouse,
             to_site=data.header.to_warehouse,
             boxes=data.boxes or [],
+            dispatched_by=getattr(header, "created_by", "system") or "system",
+            db=db,
+        )
+
+        # For cold-source transfers, persist the canonical sub-cold(s) (D-39/D-514/
+        # Rishi/Supreme Cold) on the header so the Transfer Out Records chip
+        # filter can drill in. A single transfer can span multiple sub-units
+        # (e.g. boxes from both D-39 and Rishi) — those land as a comma-separated
+        # canonical list ("Rishi, Savla D-39"), which the chip filter matches via
+        # ILIKE. Pulled from the JSONB snapshots park_in_pending just wrote into
+        # pending_transfer_stock.
+        if _is_cold_site(data.header.from_warehouse):
+            _ensure_interunit_schema(db)
+            raw_units = db.execute(
+                text(
+                    "SELECT DISTINCT cold_storage_data->>'unit' AS u "
+                    "FROM pending_transfer_stock "
+                    "WHERE transfer_out_id = :id AND cold_storage_data IS NOT NULL "
+                    "  AND cold_storage_data->>'unit' IS NOT NULL"
+                ),
+                {"id": header_id},
+            ).fetchall()
+            canonical_set = {_normalize_cold_unit(r.u) for r in raw_units}
+            canonical_set.discard(None)
+            if canonical_set:
+                joined = ", ".join(sorted(canonical_set))
+                db.execute(
+                    text("UPDATE interunit_transfers_header SET from_cold_unit = :u WHERE id = :id"),
+                    {"u": joined, "id": header_id},
+                )
+
+    elif lines:
+        # No box-level rows — article/quantity-only transfer, or the source stock is
+        # not box-tracked so Plan C couldn't derive boxes. Park line-level pending rows
+        # so EVERY transfer is represented in the in-transit ledger. Tracking-only:
+        # deducts/inserts no inventory (see park_lines_in_pending).
+        park_lines_in_pending(
+            transfer_out_id=header_id,
+            challan_no=header.challan_no,
+            from_site=data.header.from_warehouse,
+            to_site=data.header.to_warehouse,
+            lines=lines,
             dispatched_by=getattr(header, "created_by", "system") or "system",
             db=db,
         )
@@ -1232,6 +1706,7 @@ def _map_transfer_in_header(row) -> dict:
         "status": row.status or "Received",
         "created_at": row.created_at,
         "updated_at": row.updated_at,
+        "inward_transaction_no": getattr(row, "inward_transaction_no", None) or None,
     }
     # Include from_warehouse if available (from JOIN with transfers header)
     if hasattr(row, "from_warehouse") and row.from_warehouse:
@@ -1255,6 +1730,7 @@ def _map_transfer_in_box(row) -> dict:
         "is_matched": row.is_matched if row.is_matched is not None else True,
         "issue": getattr(row, "issue", None),
         "line_index": getattr(row, "line_index", None),
+        "inward_box_id": getattr(row, "inward_box_id", None) or None,
     }
 
 
@@ -1263,7 +1739,8 @@ def _fetch_transfer_in_boxes(db: Session, header_id: int) -> list:
         text("""
             SELECT id, header_id, box_id, article, batch_number,
                    lot_number, transaction_no, net_weight, gross_weight,
-                   scanned_at, is_matched, transfer_out_box_id, issue, line_index
+                   scanned_at, is_matched, transfer_out_box_id, issue, line_index,
+                   inward_box_id
             FROM interunit_transfer_in_boxes
             WHERE header_id = :hid
             ORDER BY scanned_at
@@ -1582,10 +2059,25 @@ def create_pending_transfer_in(data: PendingTransferInCreate, db: Session) -> di
 
 
 def acknowledge_pending_box(header_id: int, data: PendingBoxAcknowledge, db: Session) -> dict:
-    """UPSERT a single box/article into a pending transfer-in."""
+    """UPSERT a single box/article into a pending transfer-in.
+
+    Transparently runs STBR (Scan-Time Box ID Reconciliation) before the
+    UPSERT. If the scanned box_id differs from the placeholder IMS picked
+    at dispatch, the pending row is remapped — the wrongly-picked box is
+    restored to source inventory and the actually-shipped box is
+    re-deducted. A series offset detected on the first scan also
+    propagates the same swap to all remaining siblings in the same
+    (transfer_out_id, transaction_no, lot_no) batch.
+
+    See docs/conventions.md#pending-transfer-stock-middleware for the
+    full flow.
+    """
     # Verify header exists and is Pending
     header = db.execute(
-        text("SELECT id, status FROM interunit_transfer_in_header WHERE id = :hid"),
+        text("""
+            SELECT id, status, transfer_out_id
+            FROM interunit_transfer_in_header WHERE id = :hid
+        """),
         {"hid": header_id},
     ).fetchone()
     if not header:
@@ -1595,26 +2087,83 @@ def acknowledge_pending_box(header_id: int, data: PendingBoxAcknowledge, db: Ses
 
     issue_json = json.dumps(data.issue) if data.issue else None
 
-    # Atomic upsert   safe against concurrent clients acknowledging the same box
-    # First ensure a unique constraint exists (idempotent)
+    # Atomic upsert — safe against concurrent clients acknowledging the same box
     try:
         db.execute(text("""
             CREATE UNIQUE INDEX IF NOT EXISTS uq_transfer_in_boxes_header_box
             ON interunit_transfer_in_boxes (header_id, box_id)
         """))
     except Exception:
-        pass  # Index may already exist or table doesn't support it
+        pass
+
+    # ── STBR: reconcile placeholder ↔ scanned box BEFORE the UPSERT ──
+    stbr_result: dict = {
+        "status": "noop", "reconciliation_id": None,
+        "original_box_id": None, "propagated_count": 0, "siblings": [],
+    }
+    scanned_box_id = (data.box_id or "").strip()
+    scanned_txn = (data.transaction_no or "").strip()
+    # Only run STBR when pending_transfer_stock has placeholder rows for this
+    # specific (transfer_out_id, transaction_no) pair. Transfers that dispatch
+    # items as plain lines (no per-box QR on the outward side) have no slots to
+    # reconcile against — STBR would always return "conflict" and block acknowledge.
+    _outward_slot_count = 0
+    if scanned_box_id and scanned_txn and scanned_txn != "DIRECT" and header.transfer_out_id:
+        _outward_slot_count = db.execute(
+            text("""
+                SELECT COUNT(*) FROM pending_transfer_stock
+                WHERE transfer_out_id = :tid AND transaction_no = :txn
+            """),
+            {"tid": header.transfer_out_id, "txn": scanned_txn},
+        ).scalar() or 0
+
+    if scanned_box_id and scanned_txn and scanned_txn != "DIRECT" and header.transfer_out_id and _outward_slot_count > 0:
+        try:
+            from services.ims_service.pending_stock_tools import reconcile_box_in_pending
+            scan_source = getattr(data, "scan_source", None) or "manual"
+            scanned_by = getattr(data, "scanned_by", None)
+            stbr_result = reconcile_box_in_pending(
+                db,
+                scanned_box_id=scanned_box_id,
+                scanned_transaction_no=scanned_txn,
+                transfer_in_header_id=header_id,
+                transfer_out_id=header.transfer_out_id,
+                scan_source=scan_source,
+                scanned_by=scanned_by,
+            ) or stbr_result
+            if stbr_result.get("status") == "duplicate":
+                raise HTTPException(
+                    409,
+                    f"Box {scanned_box_id} is already acknowledged elsewhere — "
+                    f"{stbr_result.get('reason') or 'duplicate scan'}",
+                )
+            if stbr_result.get("status") == "conflict":
+                # 422 lets the frontend show a Conflict banner without losing
+                # the rest of the batch.
+                raise HTTPException(
+                    422,
+                    f"Reconciliation conflict for box {scanned_box_id}: "
+                    f"{stbr_result.get('reason') or 'no matching slot'}",
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            # STBR failure must not block the UPSERT — log and continue.
+            logger.warning("STBR reconciliation skipped for %s/%s: %s",
+                           scanned_box_id, scanned_txn, e)
 
     row = db.execute(
         text("""
             INSERT INTO interunit_transfer_in_boxes
                 (header_id, box_id, article, batch_number, lot_number,
                  transaction_no, net_weight, gross_weight,
-                 scanned_at, is_matched, transfer_out_box_id, issue, line_index)
+                 scanned_at, is_matched, transfer_out_box_id, issue, line_index,
+                 original_box_id, reconciled, reconciliation_id, scan_source)
             VALUES
                 (:header_id, :box_id, :article, :batch_number, :lot_number,
                  :transaction_no, :net_weight, :gross_weight,
-                 CURRENT_TIMESTAMP, :is_matched, :transfer_out_box_id, :issue, :line_index)
+                 CURRENT_TIMESTAMP, :is_matched, :transfer_out_box_id, :issue, :line_index,
+                 :original_box_id, :reconciled, :reconciliation_id, :scan_source)
             ON CONFLICT (header_id, box_id) DO UPDATE SET
                 article = EXCLUDED.article,
                 batch_number = EXCLUDED.batch_number,
@@ -1626,7 +2175,11 @@ def acknowledge_pending_box(header_id: int, data: PendingBoxAcknowledge, db: Ses
                 transfer_out_box_id = EXCLUDED.transfer_out_box_id,
                 issue = EXCLUDED.issue,
                 line_index = EXCLUDED.line_index,
-                scanned_at = CURRENT_TIMESTAMP
+                scanned_at = CURRENT_TIMESTAMP,
+                original_box_id = COALESCE(interunit_transfer_in_boxes.original_box_id, EXCLUDED.original_box_id),
+                reconciled = EXCLUDED.reconciled OR interunit_transfer_in_boxes.reconciled,
+                reconciliation_id = COALESCE(EXCLUDED.reconciliation_id, interunit_transfer_in_boxes.reconciliation_id),
+                scan_source = EXCLUDED.scan_source
             RETURNING id, header_id, box_id, article, batch_number,
                       lot_number, transaction_no, net_weight, gross_weight,
                       scanned_at, is_matched, transfer_out_box_id, issue, line_index
@@ -1644,10 +2197,24 @@ def acknowledge_pending_box(header_id: int, data: PendingBoxAcknowledge, db: Ses
             "transfer_out_box_id": data.transfer_out_box_id,
             "issue": issue_json,
             "line_index": data.line_index,
+            "original_box_id": stbr_result.get("original_box_id"),
+            "reconciled": stbr_result.get("status") in ("matched", "overridden", "propagated"),
+            "reconciliation_id": stbr_result.get("reconciliation_id"),
+            "scan_source": getattr(data, "scan_source", None) or "manual",
         },
     ).fetchone()
 
-    return _map_transfer_in_box(row)
+    result = _map_transfer_in_box(row)
+    # Surface STBR outcome to the frontend (live UI updates: audit tooltip,
+    # propagation count, conflict banner). Existing callers ignore extra keys.
+    result["reconciliation"] = {
+        "status": stbr_result.get("status"),
+        "original_box_id": stbr_result.get("original_box_id"),
+        "propagated_count": stbr_result.get("propagated_count", 0),
+        "siblings": stbr_result.get("siblings", []),
+        "reconciliation_id": stbr_result.get("reconciliation_id"),
+    }
+    return result
 
 
 def unacknowledge_pending_box(header_id: int, box_id: str, db: Session) -> dict:
@@ -1673,65 +2240,34 @@ def unacknowledge_pending_box(header_id: int, box_id: str, db: Session) -> dict:
 
 
 def acknowledge_pending_boxes_batch(header_id: int, boxes: list, db: Session) -> dict:
-    """Batch acknowledge multiple boxes in a pending transfer-in."""
-    header = db.execute(
-        text("SELECT id, status FROM interunit_transfer_in_header WHERE id = :hid"),
-        {"hid": header_id},
-    ).fetchone()
-    if not header:
-        raise HTTPException(404, "Transfer IN header not found")
-    if header.status != "Pending":
-        raise HTTPException(400, "Transfer IN is not in Pending status")
+    """Batch acknowledge multiple boxes in a pending transfer-in.
 
+    Each box runs the same STBR reconciliation as the single-box endpoint —
+    so a series-offset detected on the first box propagates to its siblings
+    automatically before the loop even reaches them.
+    """
+    # Delegate to acknowledge_pending_box per-box so STBR + audit columns
+    # apply uniformly. Conflicts on individual boxes are surfaced per row
+    # instead of failing the entire batch.
     results = []
+    conflicts = []
     for box_data in boxes:
-        issue_json = json.dumps(box_data.issue) if box_data.issue else None
-
-        row = db.execute(
-            text("""
-                INSERT INTO interunit_transfer_in_boxes
-                    (header_id, box_id, article, batch_number, lot_number,
-                     transaction_no, net_weight, gross_weight,
-                     scanned_at, is_matched, transfer_out_box_id, issue, line_index)
-                VALUES
-                    (:header_id, :box_id, :article, :batch_number, :lot_number,
-                     :transaction_no, :net_weight, :gross_weight,
-                     CURRENT_TIMESTAMP, :is_matched, :transfer_out_box_id, :issue, :line_index)
-                ON CONFLICT (header_id, box_id) DO UPDATE SET
-                    article = EXCLUDED.article,
-                    batch_number = EXCLUDED.batch_number,
-                    lot_number = EXCLUDED.lot_number,
-                    transaction_no = EXCLUDED.transaction_no,
-                    net_weight = EXCLUDED.net_weight,
-                    gross_weight = EXCLUDED.gross_weight,
-                    is_matched = EXCLUDED.is_matched,
-                    transfer_out_box_id = EXCLUDED.transfer_out_box_id,
-                    issue = EXCLUDED.issue,
-                    line_index = EXCLUDED.line_index,
-                    scanned_at = CURRENT_TIMESTAMP
-                RETURNING id, header_id, box_id, article, batch_number,
-                          lot_number, transaction_no, net_weight, gross_weight,
-                          scanned_at, is_matched, transfer_out_box_id, issue, line_index
-            """),
-            {
-                "header_id": header_id,
-                "box_id": box_data.box_id,
-                "article": box_data.article,
-                "batch_number": box_data.batch_number,
-                "lot_number": box_data.lot_number,
-                "transaction_no": box_data.transaction_no,
-                "net_weight": box_data.net_weight,
-                "gross_weight": box_data.gross_weight,
-                "is_matched": box_data.is_matched,
-                "transfer_out_box_id": box_data.transfer_out_box_id,
-                "issue": issue_json,
-                "line_index": box_data.line_index,
-            },
-        ).fetchone()
-
-        results.append(_map_transfer_in_box(row))
-
-    return {"success": True, "count": len(results), "boxes": results}
+        try:
+            ack = acknowledge_pending_box(header_id, box_data, db)
+            results.append(ack)
+        except HTTPException as e:
+            conflicts.append({
+                "box_id": getattr(box_data, "box_id", None),
+                "transaction_no": getattr(box_data, "transaction_no", None),
+                "status_code": e.status_code,
+                "detail": e.detail,
+            })
+    return {
+        "success": len(conflicts) == 0,
+        "count": len(results),
+        "boxes": results,
+        "conflicts": conflicts,
+    }
 
 
 def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) -> dict:
@@ -1809,6 +2345,7 @@ def get_pending_by_transfer_out(transfer_out_id: int, db: Session) -> dict:
             SELECT id, transfer_out_id, transfer_out_no, grn_number,
                    grn_date, receiving_warehouse, received_by, received_at,
                    box_condition, condition_remarks, status,
+                   inward_transaction_no,
                    created_at, updated_at
             FROM interunit_transfer_in_header
             WHERE transfer_out_id = :toid AND status = 'Pending'
@@ -1902,6 +2439,76 @@ def list_transfer_ins(
     }
 
 
+# -- Generate QR codes for a Transfer-IN --
+
+
+def generate_transfer_in_qrs(transfer_in_id: int, db: Session) -> dict:
+    """Generate inward_transaction_no + inward_box_id for every acknowledged box.
+
+    Idempotent guard: returns 409 if QRs were already generated.
+    Uses the same epoch-based box_id format as generate_box_ids() in inward_tools.
+    """
+    _ensure_interunit_schema(db)
+
+    header = db.execute(
+        text("""
+            SELECT id, inward_transaction_no
+            FROM interunit_transfer_in_header
+            WHERE id = :id
+        """),
+        {"id": transfer_in_id},
+    ).fetchone()
+
+    if not header:
+        raise HTTPException(404, "Transfer-IN not found")
+
+    if header.inward_transaction_no:
+        raise HTTPException(409, f"QRs already generated: {header.inward_transaction_no}")
+
+    boxes = db.execute(
+        text("""
+            SELECT id, article, lot_number, batch_number, net_weight, gross_weight, line_index
+            FROM interunit_transfer_in_boxes
+            WHERE header_id = :hid
+            ORDER BY scanned_at, id
+        """),
+        {"hid": transfer_in_id},
+    ).fetchall()
+
+    if not boxes:
+        raise HTTPException(400, "No acknowledged boxes found for this Transfer-IN")
+
+    inward_txn_no = f"TR-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    base = str(int(time.time() * 1000))[-8:]
+
+    result_boxes = []
+    for i, box in enumerate(boxes, start=1):
+        inward_box_id = f"{base}-{i}"
+        db.execute(
+            text("UPDATE interunit_transfer_in_boxes SET inward_box_id = :bid WHERE id = :id"),
+            {"bid": inward_box_id, "id": box.id},
+        )
+        result_boxes.append({
+            "id": box.id,
+            "box_number": i,
+            "line_index": box.line_index,
+            "article": box.article or "",
+            "lot_number": box.lot_number or "",
+            "batch_number": box.batch_number or "",
+            "net_weight": float(box.net_weight) if box.net_weight is not None else 0.0,
+            "gross_weight": float(box.gross_weight) if box.gross_weight is not None else 0.0,
+            "inward_box_id": inward_box_id,
+        })
+
+    db.execute(
+        text("UPDATE interunit_transfer_in_header SET inward_transaction_no = :txn WHERE id = :id"),
+        {"txn": inward_txn_no, "id": transfer_in_id},
+    )
+    db.commit()
+
+    return {"inward_transaction_no": inward_txn_no, "boxes": result_boxes}
+
+
 # -- Get single transfer IN --
 
 
@@ -1911,6 +2518,7 @@ def get_transfer_in(transfer_in_id: int, db: Session) -> dict:
             SELECT h.id, h.transfer_out_id, h.transfer_out_no, h.grn_number,
                    h.grn_date, h.receiving_warehouse, h.received_by, h.received_at,
                    h.box_condition, h.condition_remarks, h.status,
+                   h.inward_transaction_no,
                    h.created_at, h.updated_at,
                    t.from_site AS from_warehouse
             FROM interunit_transfer_in_header h

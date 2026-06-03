@@ -7,6 +7,10 @@ from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
 from services.bulk_entry_service.models import Company
+from services.ims_service.inward_tools import (
+    recalc_article_aggregates,
+    overlay_box_derived_aggregates,
+)
 
 logger = get_logger("bulk_entry")
 
@@ -387,9 +391,24 @@ def get_bulk_entry(company: Company, transaction_no: str, db: Session) -> dict:
         {"txno": transaction_no},
     ).fetchall()
 
+    mapped_articles = [_map_art_row(a) for a in articles]
+
+    # Item 1B: compute-on-read safety net. Overlay box-derived aggregates onto the article rows so
+    # the cold-storage/bulk-entry UI is correct even before the one-time backfill runs. All boxes
+    # are already loaded here (no pagination), so summing them in memory is exact.
+    box_sums: dict = {}
+    for b in boxes:
+        s = box_sums.setdefault(b.article_description, {"cnt": 0, "net": 0, "gross": 0})
+        s["cnt"] += 1
+        if b.net_weight is not None:
+            s["net"] += float(b.net_weight)
+        if b.gross_weight is not None:
+            s["gross"] += float(b.gross_weight)
+    overlay_box_derived_aggregates(mapped_articles, box_sums)
+
     return {
         "transaction": _map_tx_row(tx),
-        "articles": [_map_art_row(a) for a in articles],
+        "articles": mapped_articles,
         "boxes": [_map_box_row(b) for b in boxes],
     }
 
@@ -588,6 +607,13 @@ def update_bulk_entry(company: Company, transaction_no: str, payload, db: Sessio
                 )
                 has_changes = True
 
+    # Item 1A: recompute every article touched by the box upserts above so aggregates stay
+    # authoritative on the bulk-entry / cold-storage path (each distinct article recomputed once).
+    if payload.boxes:
+        for _art_desc in {b.model_dump(exclude_none=True)["article_description"] for b in payload.boxes}:
+            recalc_article_aggregates(db, tables, transaction_no, _art_desc)
+        has_changes = True
+
     if has_changes:
         db.commit()
 
@@ -742,6 +768,10 @@ def upsert_box(company: Company, transaction_no: str, data: dict, db: Session) -
                     "status": new_status,
                 },
             )
+
+    # Item 1A: boxes are the source of truth — recompute the parent article (bulk-entry / cold-
+    # storage path) so its aggregates can never drift from the boxes. Same transaction as the write.
+    recalc_article_aggregates(db, tables, transaction_no, article_desc)
 
     db.commit()
     logger.info("Box upsert [%s] (%s) txno=%s art=%s box=%s id=%s", company, status, transaction_no, article_desc, box_number, box_id)

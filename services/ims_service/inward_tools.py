@@ -1160,6 +1160,30 @@ def list_inward_records(
 
                 td.warehouse,
 
+                td.approval_authority,
+
+                td.vehicle_number,
+
+                td.transporter_name,
+
+                td.lr_number,
+
+                td.challan_number,
+
+                td.grn_number,
+
+                td.grn_quantity,
+
+                td.system_grn_date,
+
+                td.source_location,
+
+                td.destination_location,
+
+                td.remark,
+
+                td.box_count,
+
                 COALESCE(td.article_descriptions, td.box_descriptions) AS item_descriptions_text,
 
                 CASE
@@ -2268,6 +2292,27 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
 
 
 
+    # Item 1B: compute-on-read safety net. Boxes are the source of truth — overlay box-derived
+    # aggregates onto existing article rows so the UI is correct even before the one-time backfill
+    # runs. The sums come from a full grouped query, so they are correct regardless of the box
+    # pagination applied above.
+    if articles:
+        _box_tbl = _be['box'] if _using_bulk_entry else tables['box']
+        _sum_rows = db.execute(
+            text(f"""
+                SELECT article_description AS art_desc,
+                       COUNT(*) AS cnt,
+                       COALESCE(SUM(net_weight), 0) AS net,
+                       COALESCE(SUM(gross_weight), 0) AS gross
+                FROM {_box_tbl}
+                WHERE transaction_no = :txno
+                GROUP BY article_description
+            """),
+            {"txno": transaction_no},
+        ).fetchall()
+        _box_sums = {r.art_desc: {"cnt": r.cnt, "net": r.net, "gross": r.gross} for r in _sum_rows}
+        overlay_box_derived_aggregates(articles, _box_sums)
+
     # Synthesize articles from boxes if none exist
 
     if not articles and boxes:
@@ -2394,6 +2439,111 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
 
 
 
+
+
+def recalc_article_aggregates(db, tables: dict, transaction_no: str, article_description: str) -> dict:
+    """Recompute an article's aggregates from its current box rows and persist them.
+
+    The box rows are the source of truth (locked decision): quantity_units is strictly the box
+    count. Called after every box mutation so the article-level totals can never drift again.
+
+        quantity_units = COUNT(boxes)
+        net_weight     = SUM(box.net_weight)
+        total_weight   = SUM(box.gross_weight)
+
+    for the (transaction_no, article_description) pair. ``tables`` is a resolved ``table_names()``
+    dict, so this works against both the main ``_v2`` tables and the ``_bulk_entry_*`` fallback that
+    ``upsert_box`` may select. Note the column split: boxes key on ``article_description``, articles
+    on ``item_description`` (both filter by the same value). Returns the recomputed aggregates.
+    """
+    agg = db.execute(
+        text(f"""
+            SELECT COUNT(*) AS cnt,
+                   COALESCE(SUM(net_weight), 0) AS net,
+                   COALESCE(SUM(gross_weight), 0) AS gross
+            FROM {tables['box']}
+            WHERE transaction_no = :txno AND article_description = :art_desc
+        """),
+        {"txno": transaction_no, "art_desc": article_description},
+    ).fetchone()
+
+    qty = (agg.cnt if agg else 0) or 0
+    net = (agg.net if agg else 0) or 0
+    total = (agg.gross if agg else 0) or 0
+
+    db.execute(
+        text(f"""
+            UPDATE {tables['art']}
+            SET quantity_units = :quantity_units,
+                net_weight = :net_weight,
+                total_weight = :total_weight
+            WHERE transaction_no = :txno AND item_description = :art_desc
+        """),
+        {
+            "quantity_units": qty,
+            "net_weight": net,
+            "total_weight": total,
+            "txno": transaction_no,
+            "art_desc": article_description,
+        },
+    )
+
+    return {"quantity_units": qty, "net_weight": net, "total_weight": total}
+
+
+def backfill_article_aggregates(db, tables: dict, *, apply: bool = False) -> dict:
+    """One-shot repair: recompute aggregates for every article that has boxes in ``tables``.
+
+    The runtime recalc only fires on future box mutations, so already-desynced rows (e.g. the
+    article stuck at 1000 while it now has 1720 boxes) need this backfill once. Scans the distinct
+    (transaction_no, article_description) pairs that actually have box rows and recomputes each via
+    :func:`recalc_article_aggregates`. Articles with no boxes are left untouched (they were never
+    the drift). Safe-by-default: dry-run unless ``apply=True``. Returns a summary.
+    """
+    pairs = db.execute(
+        text(f"""
+            SELECT DISTINCT transaction_no, article_description
+            FROM {tables['box']}
+            ORDER BY transaction_no, article_description
+        """)
+    ).fetchall()
+
+    fixed = []
+    if apply:
+        for p in pairs:
+            agg = recalc_article_aggregates(db, tables, p.transaction_no, p.article_description)
+            fixed.append({
+                "transaction_no": p.transaction_no,
+                "article_description": p.article_description,
+                **agg,
+            })
+        db.commit()
+
+    return {
+        "articles_with_boxes": len(pairs),
+        "articles_recomputed": len(fixed),
+        "applied": apply,
+        "fixed": fixed,
+    }
+
+
+def overlay_box_derived_aggregates(articles: list, box_sums: dict) -> list:
+    """Compute-on-read overlay (Item 1B): make article aggregates reflect the boxes on read.
+
+    For every article that has boxes, overwrite ``quantity_units`` / ``net_weight`` /
+    ``total_weight`` with the box-derived sums so the UI is correct even before the one-time
+    backfill runs. ``box_sums`` is ``{article_description: {"cnt", "net", "gross"}}``; articles are
+    matched by ``item_description`` (the same string the boxes carry as ``article_description``).
+    Articles with no boxes are left untouched — we don't zero a legacy boxless article on read.
+    Mutates and returns ``articles``.
+    """
+    for a in articles:
+        s = box_sums.get(a.get("item_description"))
+        if s:
+            a["quantity_units"] = s["cnt"]
+            a["net_weight"] = s["net"]
+            a["total_weight"] = s["gross"]
+    return articles
 
 
 def update_inward(
@@ -2555,6 +2705,14 @@ def update_inward(
             text(f"SELECT COUNT(*) FROM {tables['box']} WHERE transaction_no = :txno"),
             {"txno": transaction_no},
         ).scalar()
+
+    # Item 1A: every article touched by the box upserts above must have its aggregates recomputed
+    # from the box rows, so quantity_units / net_weight / total_weight stay authoritative. Each
+    # distinct article is recomputed once, in the same transaction as the box writes.
+    if payload.boxes:
+        touched_articles = {b.model_dump()["article_description"] for b in payload.boxes}
+        for art_desc in touched_articles:
+            recalc_article_aggregates(db, tables, transaction_no, art_desc)
 
     db.commit()
 
@@ -3177,6 +3335,11 @@ def upsert_box(
         status = "inserted"
 
 
+
+    # Item 1A: the box rows are the source of truth — recompute the parent article so its
+    # quantity_units / net_weight / total_weight can never drift from the boxes again. Uses the
+    # resolved `tables` (handles the _bulk_entry_* fallback above) and runs in the same transaction.
+    recalc_article_aggregates(db, tables, transaction_no, payload.article_description)
 
     db.commit()
 

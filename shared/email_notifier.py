@@ -38,6 +38,7 @@ RTV_CC_CONSTANT = [
     "b.hrithik@candorfoods.in",
     "billing@candorfoods.in",
     "satyendra@candorfoods.in",
+    "dipesh.sharma@ofbusiness.in",
 ]
 
 
@@ -313,6 +314,43 @@ def _rtv_email_html(
     return html, "\n".join(plain_lines)
 
 
+def _action_buttons_html(rtv_detail: dict, head_email: str) -> str:
+    """Render the Approve / Reject / Hold button row for the action-required email."""
+    from services.ims_service.rtv_approval_token import action_url
+
+    rtv_id = rtv_detail.get("rtv_id", "") or ""
+    rtv_db_id = int(rtv_detail.get("id") or 0)
+    # Company isn't on the header row; derive from rtv_id table prefix is unsafe.
+    # Caller injects via the detail dict (set explicitly before send).
+    company = rtv_detail.get("_company") or rtv_detail.get("company") or ""
+    if not company or not rtv_db_id:
+        return ""
+
+    approve = action_url(rtv_id, rtv_db_id, company, head_email, "approve")
+    reject = action_url(rtv_id, rtv_db_id, company, head_email, "reject")
+    hold = action_url(rtv_id, rtv_db_id, company, head_email, "hold")
+
+    btn_style = (
+        "display:inline-block;padding:12px 28px;margin:0 6px;border-radius:6px;"
+        "color:#fff;text-decoration:none;font-weight:bold;font-size:14px;"
+        "font-family:Arial,sans-serif;"
+    )
+    return f"""
+    <table style="margin:18px 0;width:100%;border-collapse:collapse;">
+      <tr><td style="text-align:center;padding:18px;background:#f8f9fa;border-radius:8px;">
+        <p style="margin:0 0 12px;font-size:13px;color:#555;">
+          Action required by <strong>{head_email}</strong>
+        </p>
+        <a href="{approve}" style="{btn_style}background:#16a34a;">&#10003; Approve</a>
+        <a href="{reject}" style="{btn_style}background:#dc2626;">&#10007; Reject</a>
+        <a href="{hold}" style="{btn_style}background:#f59e0b;">&#9208; Hold</a>
+        <p style="margin:12px 0 0;font-size:11px;color:#888;">
+          Links are signed and expire in {getattr(__import__('shared.config_loader', fromlist=['settings']).settings, 'RTV_ACTION_TOKEN_TTL_DAYS', 14)} days.
+        </p>
+      </td></tr>
+    </table>"""
+
+
 def notify_rtv_created(rtv_detail: dict) -> None:
     """Send notification email when an RTV is created.
 
@@ -414,6 +452,100 @@ def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: st
         to=to_list,
         cc=cc,
     )
+    # Action-required email goes separately to the assigned business head only.
+    notify_rtv_action_required(rtv_detail)
+
+
+def notify_rtv_action_required(rtv_detail: dict) -> None:
+    """Send an action-required email with Approve/Reject/Hold buttons to the assigned business head only."""
+    head_email = _lookup_business_head_email(rtv_detail.get("business_head"))
+    if not head_email:
+        logger.info(
+            "Skipping action-required email for %s: business_head %r is not mapped",
+            rtv_detail.get("rtv_id"), rtv_detail.get("business_head"),
+        )
+        return
+
+    rtv_db_id = rtv_detail.get("id")
+    company = rtv_detail.get("_company") or rtv_detail.get("company")
+    if not rtv_db_id or not company:
+        logger.warning(
+            "Skipping action-required email for %s: missing id/company in detail",
+            rtv_detail.get("rtv_id"),
+        )
+        return
+
+    status = rtv_detail.get("status", "Pending")
+    action_html = _action_buttons_html(rtv_detail, head_email)
+    base_html, base_plain = _rtv_email_html(
+        action=f"Action Required ({status})",
+        header=rtv_detail,
+        lines=rtv_detail.get("lines", []),
+        boxes=rtv_detail.get("boxes", []),
+        extra_info=(
+            "Please choose an action below. Approve to confirm; Reject to deny; "
+            "Hold to defer (you'll receive another action email so you can finalize later)."
+        ),
+    )
+    # Inject the buttons right after the opening content cell.
+    html = base_html.replace(
+        '<tr><td style="padding:20px 24px;">',
+        f'<tr><td style="padding:20px 24px;">{action_html}',
+        1,
+    )
+    plain = (
+        f"{base_plain}\n\n"
+        f"--- ACTION LINKS (valid for {settings.RTV_ACTION_TOKEN_TTL_DAYS} days) ---\n"
+    )
+    from services.ims_service.rtv_approval_token import action_url
+    plain += f"Approve: {action_url(rtv_detail.get('rtv_id', ''), int(rtv_db_id), company, head_email, 'approve')}\n"
+    plain += f"Reject:  {action_url(rtv_detail.get('rtv_id', ''), int(rtv_db_id), company, head_email, 'reject')}\n"
+    plain += f"Hold:    {action_url(rtv_detail.get('rtv_id', ''), int(rtv_db_id), company, head_email, 'hold')}\n"
+
+    _send_email_background(
+        subject=f"ACTION REQUIRED — RTV {rtv_detail.get('rtv_id', '')} [{status}]",
+        html_body=html,
+        plain_body=plain,
+        to=head_email,
+    )
+
+
+def notify_rtv_rejected(rtv_detail: dict, rejected_by: str) -> None:
+    """Send notification email when an RTV is rejected via the magic-link action."""
+    html, plain = _rtv_email_html(
+        action="Rejected",
+        header=rtv_detail,
+        lines=rtv_detail.get("lines", []),
+        boxes=rtv_detail.get("boxes", []),
+        extra_info=f"Rejected by: {rejected_by}",
+    )
+    cc = _build_rtv_cc(rtv_detail.get("business_head"), rtv_detail.get("created_by"), rejected_by)
+    _send_email_background(
+        subject=f"RTV Rejected: {rtv_detail.get('rtv_id', '')}",
+        html_body=html,
+        plain_body=plain,
+        cc=cc,
+    )
+
+
+def notify_rtv_held(rtv_detail: dict, held_by: str) -> None:
+    """Notify everyone the RTV was placed on Hold; resend action email to business head."""
+    html, plain = _rtv_email_html(
+        action="On Hold",
+        header=rtv_detail,
+        lines=rtv_detail.get("lines", []),
+        boxes=rtv_detail.get("boxes", []),
+        extra_info=f"Placed on hold by: {held_by}. The business head can still approve or reject later.",
+    )
+    cc = _build_rtv_cc(rtv_detail.get("business_head"), rtv_detail.get("created_by"), held_by)
+    _send_email_background(
+        subject=f"RTV On Hold: {rtv_detail.get('rtv_id', '')}",
+        html_body=html,
+        plain_body=plain,
+        cc=cc,
+    )
+    # Resend action-required email so BH still has the buttons.
+    notify_rtv_action_required(rtv_detail)
 
 
 def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:

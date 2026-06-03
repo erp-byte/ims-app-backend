@@ -1,7 +1,9 @@
 """
 Inward Dashboard API v2 — All data loaded once, client-side filtering.
 Uses warehouse field (not destination_location) for warehouse grouping.
-Only transactions with articles (actual entries) are included.
+By default ALL transactions are returned (pending, PO-only and header-only
+entries included) so every entry can be reconciled; pass only_entries=true for
+the legacy "transactions with actual article entries only" behavior.
 """
 
 from typing import Optional
@@ -29,6 +31,19 @@ def _tbl(company: str):
     }
 
 
+def _sources(company: str):
+    """Every inward source the dashboard must read: the main v2 tables AND the bulk-entry tables
+    (cold-storage / bulk-sticker path). An inward lives in exactly one set, so the feed has to read
+    both — otherwise bulk-entry inwards (pending ones included) are invisible on the dashboard."""
+    p = company.strip().lower()
+    if p not in ("cfpl", "cdpl"):
+        raise HTTPException(400, f"Unknown company: {company}")
+    return [
+        {"tx": f"{p}_transactions_v2", "art": f"{p}_articles_v2"},
+        {"tx": f"{p}_bulk_entry_transactions", "art": f"{p}_bulk_entry_articles"},
+    ]
+
+
 def _f(v):
     return round(float(v), 2) if v else 0.0
 
@@ -50,17 +65,30 @@ ENTRY_FILTER = """(
 @router.get("/all-data")
 async def get_all_data(
     company: str = Query(...),
+    only_entries: bool = Query(
+        False,
+        description="Legacy filter. When true, only article rows with non-zero "
+                    "weight/qty/amount are returned. Default false returns ALL "
+                    "transactions (incl. pending / PO-only / header-only) so every "
+                    "entry can be reconciled.",
+    ),
     db: Session = Depends(get_db),
 ):
     """
     Returns all inward transactions joined with articles.
-    Only transactions that have at least one article entry are included.
+    By default ALL transactions are included — pending, PO-only and header-only
+    entries too — so the dashboard can reconcile every transaction. A transaction
+    with no article rows still appears (LEFT JOIN) as a header-only row. Pass
+    only_entries=true for the legacy "rows with actual entry data only" behavior.
     Warehouse = t.warehouse field (W202, A185, A68 etc.), NOT destination_location.
     """
-    tbl = _tbl(company)
+    join_kw = "INNER JOIN" if only_entries else "LEFT JOIN"
+    where_clause = f"WHERE {ENTRY_FILTER}" if only_entries else ""
 
-    try:
-        sql = text(f"""
+    # One identical SELECT per source (v2 + bulk-entry), UNION ALL'd so bulk-entry inwards (incl.
+    # pending) show up on the dashboard. ORDER BY references the output column (no `t.` after UNION).
+    def _arm(src):
+        return f"""
             SELECT
                 t.transaction_no,
                 COALESCE(t.entry_date, t.system_grn_date)::text AS entry_date,
@@ -86,11 +114,16 @@ async def get_all_data(
                 COALESCE(a.total_weight, 0) AS total_weight,
                 COALESCE(a.unit_rate, 0) AS unit_rate,
                 COALESCE(a.total_amount, 0) AS total_amount
-            FROM {tbl['tx']} t
-            INNER JOIN {tbl['art']} a ON t.transaction_no = a.transaction_no
-            WHERE {ENTRY_FILTER}
-            ORDER BY COALESCE(t.entry_date, t.system_grn_date) DESC NULLS LAST
-        """)
+            FROM {src['tx']} t
+            {join_kw} {src['art']} a ON t.transaction_no = a.transaction_no
+            {where_clause}
+        """
+
+    try:
+        sql = text(
+            " UNION ALL ".join(_arm(s) for s in _sources(company))
+            + " ORDER BY entry_date DESC NULLS LAST"
+        )
         rows = db.execute(sql).fetchall()
         cols = rows[0]._fields if rows else []
 
@@ -128,68 +161,59 @@ async def get_all_data(
 @router.get("/filter-options")
 async def get_filter_options(
     company: str = Query(...),
+    only_entries: bool = Query(False),
     db: Session = Depends(get_db),
 ):
-    tbl = _tbl(company)
+    join_kw = "INNER JOIN" if only_entries else "LEFT JOIN"
+    entry_cond = f" AND {ENTRY_FILTER}" if only_entries else ""
+    sources = _sources(company)
+
+    def _union(arms):
+        return " UNION ALL ".join(arms)
+
     try:
         result: dict = {}
 
-        # All filter queries use ENTRY_FILTER to skip PO-only rows
-        wh = db.execute(text(f"""
-            SELECT DISTINCT t.warehouse AS wh, COUNT(DISTINCT t.transaction_no) AS cnt
-            FROM {tbl['tx']} t INNER JOIN {tbl['art']} a ON t.transaction_no = a.transaction_no
-            WHERE t.warehouse IS NOT NULL AND t.warehouse != '' AND {ENTRY_FILTER}
-            GROUP BY t.warehouse ORDER BY cnt DESC
-        """)).fetchall()
-        result["warehouses"] = [{"name": r.wh, "count": int(r.cnt)} for r in wh]
+        # Every count/distinct below spans BOTH sources (v2 + bulk-entry) via UNION ALL, so the
+        # chips and their counts reconcile with get_all_data (which now includes bulk-entry too).
+        def _count_by(field):
+            arms = [f"""SELECT t.{field} AS k, t.transaction_no AS txn
+                        FROM {s['tx']} t {join_kw} {s['art']} a ON t.transaction_no = a.transaction_no
+                        WHERE t.{field} IS NOT NULL AND t.{field} != '' {entry_cond}"""
+                    for s in sources]
+            return db.execute(text(
+                f"SELECT k, COUNT(DISTINCT txn) AS cnt FROM ( {_union(arms)} ) u "
+                f"GROUP BY k ORDER BY cnt DESC"
+            )).fetchall()
 
-        vnd = db.execute(text(f"""
-            SELECT DISTINCT t.vendor_supplier_name AS v, COUNT(DISTINCT t.transaction_no) AS cnt
-            FROM {tbl['tx']} t INNER JOIN {tbl['art']} a ON t.transaction_no = a.transaction_no
-            WHERE t.vendor_supplier_name IS NOT NULL AND t.vendor_supplier_name != '' AND {ENTRY_FILTER}
-            GROUP BY t.vendor_supplier_name ORDER BY cnt DESC
-        """)).fetchall()
-        result["vendors"] = [{"name": r.v, "count": int(r.cnt)} for r in vnd]
+        result["warehouses"] = [{"name": r.k, "count": int(r.cnt)} for r in _count_by("warehouse")]
+        result["vendors"] = [{"name": r.k, "count": int(r.cnt)} for r in _count_by("vendor_supplier_name")]
+        result["customers"] = [{"name": r.k, "count": int(r.cnt)} for r in _count_by("customer_party_name")]
 
-        cst = db.execute(text(f"""
-            SELECT DISTINCT t.customer_party_name AS c, COUNT(DISTINCT t.transaction_no) AS cnt
-            FROM {tbl['tx']} t INNER JOIN {tbl['art']} a ON t.transaction_no = a.transaction_no
-            WHERE t.customer_party_name IS NOT NULL AND t.customer_party_name != '' AND {ENTRY_FILTER}
-            GROUP BY t.customer_party_name ORDER BY cnt DESC
-        """)).fetchall()
-        result["customers"] = [{"name": r.c, "count": int(r.cnt)} for r in cst]
+        def _distinct_art(field):
+            arms = [f"""SELECT DISTINCT a.{field} AS k FROM {s['art']} a
+                        WHERE a.{field} IS NOT NULL AND a.{field} != '' {entry_cond}"""
+                    for s in sources]
+            return [r.k for r in db.execute(text(
+                f"SELECT DISTINCT k FROM ( {_union(arms)} ) u ORDER BY k"
+            )).fetchall()]
 
-        result["item_categories"] = [r[0] for r in db.execute(text(f"""
-            SELECT DISTINCT a.item_category FROM {tbl['art']} a
-            WHERE a.item_category IS NOT NULL AND a.item_category != '' AND {ENTRY_FILTER}
-            ORDER BY a.item_category
-        """)).fetchall()]
+        result["item_categories"] = _distinct_art("item_category")
+        result["sub_categories"] = _distinct_art("sub_category")
+        result["material_types"] = _distinct_art("material_type")
 
-        result["sub_categories"] = [r[0] for r in db.execute(text(f"""
-            SELECT DISTINCT a.sub_category FROM {tbl['art']} a
-            WHERE a.sub_category IS NOT NULL AND a.sub_category != '' AND {ENTRY_FILTER}
-            ORDER BY a.sub_category
-        """)).fetchall()]
+        def _distinct_tx(field, nonblank):
+            blank = f"AND t.{field} != ''" if nonblank else ""
+            arms = [f"""SELECT DISTINCT t.{field} AS k
+                        FROM {s['tx']} t {join_kw} {s['art']} a ON t.transaction_no = a.transaction_no
+                        WHERE t.{field} IS NOT NULL {blank} {entry_cond}"""
+                    for s in sources]
+            return [r.k for r in db.execute(text(
+                f"SELECT DISTINCT k FROM ( {_union(arms)} ) u ORDER BY k"
+            )).fetchall()]
 
-        result["material_types"] = [r[0] for r in db.execute(text(f"""
-            SELECT DISTINCT a.material_type FROM {tbl['art']} a
-            WHERE a.material_type IS NOT NULL AND a.material_type != '' AND {ENTRY_FILTER}
-            ORDER BY a.material_type
-        """)).fetchall()]
-
-        result["statuses"] = [r[0] for r in db.execute(text(f"""
-            SELECT DISTINCT t.status FROM {tbl['tx']} t
-            INNER JOIN {tbl['art']} a ON t.transaction_no = a.transaction_no
-            WHERE t.status IS NOT NULL AND {ENTRY_FILTER}
-            ORDER BY t.status
-        """)).fetchall()]
-
-        result["purchased_by"] = [r[0] for r in db.execute(text(f"""
-            SELECT DISTINCT t.purchased_by FROM {tbl['tx']} t
-            INNER JOIN {tbl['art']} a ON t.transaction_no = a.transaction_no
-            WHERE t.purchased_by IS NOT NULL AND t.purchased_by != '' AND {ENTRY_FILTER}
-            ORDER BY t.purchased_by
-        """)).fetchall()]
+        result["statuses"] = _distinct_tx("status", nonblank=False)
+        result["purchased_by"] = _distinct_tx("purchased_by", nonblank=True)
 
         return result
 

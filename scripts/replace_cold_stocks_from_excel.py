@@ -39,7 +39,7 @@ import openpyxl
 import psycopg
 
 EXCEL_PATH = Path(__file__).resolve().parents[1] / "updated cfpl and cdpl cold data.xlsx"
-DSN = "postgresql://wmsadmin:Candorfoods@wms-postgres-db.cpis084golp7.ap-south-1.rds.amazonaws.com:5432/warehouse_db"
+DSN = os.environ["DATABASE_URL"]  # from .env — never hardcode credentials
 
 # Excel column indices (0-based) for sheet "Final Cold Stocks Master"
 COL = {

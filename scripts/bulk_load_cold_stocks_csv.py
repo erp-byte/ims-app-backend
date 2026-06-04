@@ -12,6 +12,7 @@ After insert, resets the SERIAL sequence to max(id) + 1.
 from __future__ import annotations
 import argparse
 import csv
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,7 @@ from pathlib import Path
 import psycopg
 
 ROOT = Path(__file__).resolve().parents[1]
-DSN = "postgresql://wmsadmin:Candorfoods@wms-postgres-db.cpis084golp7.ap-south-1.rds.amazonaws.com:5432/warehouse_db"
+DSN = os.environ["DATABASE_URL"]  # from .env — never hardcode credentials
 
 JOBS = [
     ("cfpl_cold_stocks", ROOT / "cfpl_cold_stocks.csv"),

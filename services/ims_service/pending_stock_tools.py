@@ -55,53 +55,93 @@ def _table_exists(db: Session, table: str) -> bool:
     )
 
 
-def _find_in_cold_stocks(db: Session, box_id: str, transaction_no: str):
-    """Look up a cold-stock row by (box_id, transaction_no). Returns (table, row) or (None, None)."""
+def _find_in_cold_stocks(db: Session, box_id: str, transaction_no: str, lot_no: Optional[str] = None):
+    """Look up a cold-stock row by (box_id, transaction_no), disambiguated by lot.
+
+    `box_id` is unique only *within* a transaction_no, and some legacy txns carry the
+    same box_id for two different lots/items. So we match on (box_id, transaction_no);
+    if that resolves to multiple rows, the one whose lot matches `lot_no` is chosen.
+    The old box_id-only (no transaction_no) fallback is removed — it grabbed a
+    same-labelled box from a DIFFERENT batch (the root cause of wrong-item parking).
+    Returns (table, row) or (None, None).
+    """
+    lot = (lot_no or "").strip().upper()
+    candidates = []  # [(table, row)] across BOTH companies for (box_id, transaction_no)
     for table in ("cfpl_cold_stocks", "cdpl_cold_stocks"):
         if not _table_exists(db, table):
             continue
-        row = db.execute(
-            text(f"SELECT * FROM {table} WHERE box_id = :bid AND transaction_no = :tno LIMIT 1"),
+        rows = db.execute(
+            text(f"SELECT * FROM {table} WHERE box_id = :bid AND transaction_no = :tno"),
             {"bid": box_id, "tno": transaction_no},
-        ).fetchone()
-        if not row:
-            row = db.execute(
-                text(f"SELECT * FROM {table} WHERE box_id = :bid LIMIT 1"),
-                {"bid": box_id},
-            ).fetchone()
-        if row:
-            return table, row
+        ).fetchall()
+        candidates.extend((table, r) for r in rows)
+    if not candidates:
+        return None, None
+    if len(candidates) == 1:
+        return candidates[0]
+    # Multiple (box_id, transaction_no) rows (incl. the same id in both companies)
+    # → disambiguate by lot; never guess when lot can't resolve it (prevents the
+    # wrong-batch grab that mis-parked items, e.g. raisins booked as wet-dates).
+    if lot:
+        for table, r in candidates:
+            if ((getattr(r, "lot_no", "") or "").strip().upper()) == lot:
+                return table, r
     return None, None
 
 
-def _find_in_bulk_entry(db: Session, box_id: str, transaction_no: str):
-    """Look up a warehouse-source box row by (box_id, transaction_no).
+def _find_available_cold_by_lot(db: Session, company: str, lot_no: str,
+                                item_description: Optional[str], limit: int):
+    """FIFO-pick up to `limit` available cold_stocks rows for (company, lot_no,
+    item_description). Used to rescue the shortfall between ordered qty and parked
+    boxes BY LOT NUMBER when strict box_id matching failed (re-inwarded stock,
+    box-id drift). Returns [(table, row), ...]."""
+    if limit <= 0:
+        return []
+    table = f"{company}_cold_stocks"
+    if not _table_exists(db, table):
+        return []
+    item_clause = "AND item_description = :item" if item_description else ""
+    rows = db.execute(
+        text(f"""
+            SELECT * FROM {table}
+            WHERE lot_no = :lot {item_clause}
+            ORDER BY inward_dt ASC NULLS LAST, id ASC
+            LIMIT :n
+        """),
+        {"lot": lot_no, "item": item_description, "n": limit},
+    ).fetchall()
+    return [(table, r) for r in rows]
 
-    Search order (per user spec May 2026): *_boxes_v2 first (current
-    inward target), then legacy *_bulk_entry_boxes fallback. Returns
-    (table, row) or (None, None).
+
+def _find_in_bulk_entry(db: Session, box_id: str, transaction_no: str, lot_no: Optional[str] = None):
+    """Look up a warehouse-source box row by (box_id, transaction_no), disambiguated by lot.
+
+    Search order (per user spec May 2026): *_boxes_v2 first (current inward target),
+    then legacy *_bulk_entry_boxes. Match on (box_id, transaction_no); if a table
+    returns multiple rows, the one whose `lot_number` matches `lot_no` is chosen.
+    Returns (table, row) or (None, None).
     """
-    # boxes_v2 first
-    for table in ("cfpl_boxes_v2", "cdpl_boxes_v2"):
+    lot = (lot_no or "").strip().upper()
+    candidates = []  # [(table, row)] in search order (boxes_v2 first, then legacy)
+    for table in ("cfpl_boxes_v2", "cdpl_boxes_v2", "cfpl_bulk_entry_boxes", "cdpl_bulk_entry_boxes"):
         if not _table_exists(db, table):
             continue
-        row = db.execute(
-            text(f"SELECT * FROM {table} WHERE box_id = :bid AND transaction_no = :tno LIMIT 1"),
+        rows = db.execute(
+            text(f"SELECT * FROM {table} WHERE box_id = :bid AND transaction_no = :tno"),
             {"bid": box_id, "tno": transaction_no},
-        ).fetchone()
-        if row:
-            return table, row
-    # legacy bulk_entry_boxes fallback
-    for table in ("cfpl_bulk_entry_boxes", "cdpl_bulk_entry_boxes"):
-        if not _table_exists(db, table):
-            continue
-        row = db.execute(
-            text(f"SELECT * FROM {table} WHERE box_id = :bid AND transaction_no = :tno LIMIT 1"),
-            {"bid": box_id, "tno": transaction_no},
-        ).fetchone()
-        if row:
-            return table, row
-    return None, None
+        ).fetchall()
+        candidates.extend((table, r) for r in rows)
+    if not candidates:
+        return None, None
+    if len(candidates) == 1:
+        return candidates[0]
+    if lot:
+        for table, r in candidates:
+            if ((getattr(r, "lot_number", "") or "").strip().upper()) == lot:
+                return table, r
+    # No lot disambiguation possible — preserve original behaviour (first match,
+    # boxes_v2 before legacy). Warehouse box_ids rarely collide within a txn.
+    return candidates[0]
 
 
 def _company_from_table(table: str) -> str:
@@ -273,6 +313,13 @@ def _ensure_reconciliation_schema(db: Session) -> None:
             "ALTER TABLE pending_transfer_stock ADD COLUMN IF NOT EXISTS original_box_id VARCHAR(100)",
             "ALTER TABLE pending_transfer_stock ADD COLUMN IF NOT EXISTS reconciled BOOLEAN DEFAULT FALSE",
             "ALTER TABLE pending_transfer_stock ADD COLUMN IF NOT EXISTS item_description VARCHAR(255)",
+            "ALTER TABLE interunit_transfers_header ADD COLUMN IF NOT EXISTS unallocated_boxes INTEGER DEFAULT 0",
+            "ALTER TABLE interunit_transfers_header ADD COLUMN IF NOT EXISTS updated_ts TIMESTAMP",
+            # edited_at = a GENUINE user-edit marker. updated_ts is auto-managed
+            # (column default CURRENT_TIMESTAMP + a BEFORE-UPDATE trigger), so it moves
+            # on every create-reconcile / receive / sync and CANNOT mark a real edit.
+            # edited_at is written ONLY by update_transfer, so the "Edited" badge is honest.
+            "ALTER TABLE interunit_transfers_header ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP",
         ):
             try:
                 db.execute(text(col_sql))
@@ -673,7 +720,7 @@ def _swap_pending_row(
     disposition_hint: Optional[dict] = None
 
     if pending_row.from_storage_type == "cold":
-        tbl, row = _find_in_cold_stocks(db, new_box_id, pending_row.transaction_no)
+        tbl, row = _find_in_cold_stocks(db, new_box_id, pending_row.transaction_no, pending_row.lot_no)
         if row is not None:
             new_source_table = tbl
             new_cold_data = _cold_row_to_json(row)
@@ -682,7 +729,7 @@ def _swap_pending_row(
             new_weight_kg = float(getattr(row, "weight_kg", 0) or new_weight_kg or 0)
             new_no_of_cartons = int(getattr(row, "no_of_cartons", 1) or 1)
     else:
-        tbl, row = _find_in_bulk_entry(db, new_box_id, pending_row.transaction_no)
+        tbl, row = _find_in_bulk_entry(db, new_box_id, pending_row.transaction_no, pending_row.lot_no)
         if row is not None:
             new_source_table = tbl
             new_gross = float(getattr(row, "gross_weight", 0) or 0)
@@ -1011,9 +1058,9 @@ def reconcile_box_in_pending(
                 continue
             # Verify the predicted box actually exists in source — otherwise skip
             if sib.from_storage_type == "cold":
-                _, src_row = _find_in_cold_stocks(db, predicted, sib.transaction_no)
+                _, src_row = _find_in_cold_stocks(db, predicted, sib.transaction_no, sib.lot_no)
             else:
-                _, src_row = _find_in_bulk_entry(db, predicted, sib.transaction_no)
+                _, src_row = _find_in_bulk_entry(db, predicted, sib.transaction_no, sib.lot_no)
             if src_row is None:
                 continue
             # Skip if predicted box is already locked elsewhere
@@ -1062,6 +1109,13 @@ def park_in_pending(
     to_storage_type = "cold" if _is_cold_site(to_site) else "warehouse"
     parked = 0
     now = datetime.now()
+    # Stamp rows with the transfer-out's actual initiation date (header
+    # stock_trf_date), not the park/sync time, so the stored ledger is faithful.
+    _hdr_row = db.execute(
+        text("SELECT stock_trf_date, created_ts FROM interunit_transfers_header WHERE id = :id"),
+        {"id": transfer_out_id},
+    ).fetchone()
+    dispatched_at = (_hdr_row[0] or _hdr_row[1] or now) if _hdr_row else now
 
     for box in boxes:
         box_id = (getattr(box, "box_id", "") or "").strip()
@@ -1075,7 +1129,7 @@ def park_in_pending(
         warehouse_data = {}
 
         if from_storage_type == "cold":
-            source_table, source_row = _find_in_cold_stocks(db, box_id, transaction_no)
+            source_table, source_row = _find_in_cold_stocks(db, box_id, transaction_no, getattr(box, "lot_number", None))
             if source_row is None:
                 logger.warning("PARK_PENDING: no cold_stocks match for box_id=%s tno=%s", box_id, transaction_no)
                 continue
@@ -1084,8 +1138,14 @@ def park_in_pending(
             lot_no = getattr(source_row, "lot_no", None) or getattr(box, "lot_number", None)
             weight_kg = float(getattr(source_row, "weight_kg", 0) or getattr(box, "net_weight", 0) or 0)
             no_of_cartons = int(getattr(source_row, "no_of_cartons", 1) or 1)
+            # Cold-source rows previously left these flat columns NULL — carry them
+            # so the pending row stands alone without parsing cold_storage_data.
+            art = item_description
+            net_w = weight_kg or None
+            gross_w = float(getattr(source_row, "gross_weight", 0) or 0) or None
+            batch_no = getattr(source_row, "batch_number", None) or getattr(box, "batch_number", None)
         else:
-            source_table, source_row = _find_in_bulk_entry(db, box_id, transaction_no)
+            source_table, source_row = _find_in_bulk_entry(db, box_id, transaction_no, getattr(box, "lot_number", None))
             if source_row is None:
                 logger.warning("PARK_PENDING: no bulk_entry_boxes match for box_id=%s tno=%s", box_id, transaction_no)
                 continue
@@ -1098,6 +1158,10 @@ def park_in_pending(
                 "net_weight": weight_kg,
                 "article": getattr(source_row, "article_description", None),
             }
+            art = warehouse_data["article"]
+            net_w = warehouse_data["net_weight"]
+            gross_w = warehouse_data["gross_weight"]
+            batch_no = getattr(source_row, "batch_number", None) or getattr(box, "batch_number", None)
 
         from_company = _company_from_table(source_table)
         to_company = from_company  # default; may be overridden by destination table later
@@ -1111,7 +1175,7 @@ def park_in_pending(
                      from_company, to_company, from_site, to_site,
                      from_storage_type, to_storage_type,
                      source_table, source_row_id, destination_table,
-                     item_description, lot_no, weight_kg, no_of_cartons,
+                     item_description, lot_no, batch_number, weight_kg, no_of_cartons,
                      cold_storage_data,
                      gross_weight, net_weight, article,
                      status, dispatched_at, dispatched_by)
@@ -1121,7 +1185,7 @@ def park_in_pending(
                      :from_company, :to_company, :from_site, :to_site,
                      :from_storage_type, :to_storage_type,
                      :source_table, :source_row_id, :destination_table,
-                     :item_description, :lot_no, :weight_kg, :no_of_cartons,
+                     :item_description, :lot_no, :batch_number, :weight_kg, :no_of_cartons,
                      CAST(:cold_storage_data AS JSONB),
                      :gross_weight, :net_weight, :article,
                      'In Transit', :dispatched_at, :dispatched_by)
@@ -1144,13 +1208,14 @@ def park_in_pending(
                 "destination_table": destination_table,
                 "item_description": item_description,
                 "lot_no": lot_no,
+                "batch_number": batch_no,
                 "weight_kg": weight_kg,
                 "no_of_cartons": no_of_cartons,
                 "cold_storage_data": json.dumps(cold_data) if cold_data else None,
-                "gross_weight": warehouse_data.get("gross_weight"),
-                "net_weight": warehouse_data.get("net_weight"),
-                "article": warehouse_data.get("article"),
-                "dispatched_at": now,
+                "gross_weight": gross_w,
+                "net_weight": net_w,
+                "article": art,
+                "dispatched_at": dispatched_at,
                 "dispatched_by": dispatched_by,
             },
         )
@@ -1225,6 +1290,13 @@ def park_lines_in_pending(
     from_storage_type = "cold" if _is_cold_site(from_site) else "warehouse"
     to_storage_type = "cold" if _is_cold_site(to_site) else "warehouse"
     now = datetime.now()
+    # Use the transfer-out's actual initiation date (header stock_trf_date),
+    # not the park/sync time, so the stored ledger is faithful.
+    _hdr_row = db.execute(
+        text("SELECT stock_trf_date, created_ts FROM interunit_transfers_header WHERE id = :id"),
+        {"id": transfer_out_id},
+    ).fetchone()
+    dispatched_at = (_hdr_row[0] or _hdr_row[1] or now) if _hdr_row else now
     parked = 0
 
     for line in lines:
@@ -1239,6 +1311,7 @@ def park_lines_in_pending(
         per_unit_net = round(total_net / qty, 3) if qty else total_net
         per_unit_gross = round(total_gross / qty, 3) if qty else total_gross
         lot_no = (getattr(line, "lot_number", "") or "") or None
+        batch_no = (getattr(line, "batch_number", "") or "") or None
 
         for n in range(1, qty + 1):
             db.execute(
@@ -1249,7 +1322,7 @@ def park_lines_in_pending(
                          from_company, to_company, from_site, to_site,
                          from_storage_type, to_storage_type,
                          source_table, source_row_id, destination_table,
-                         item_description, lot_no, weight_kg, no_of_cartons,
+                         item_description, lot_no, batch_number, weight_kg, no_of_cartons,
                          rm_pm_fg_type, item_category, sub_category,
                          pack_size, unit_pack_size, qty, uom,
                          net_weight, gross_weight, total_weight, article,
@@ -1260,7 +1333,7 @@ def park_lines_in_pending(
                          '', '', :from_site, :to_site,
                          :from_storage_type, :to_storage_type,
                          '', NULL, '',
-                         :item_description, :lot_no, :weight_kg, 1,
+                         :item_description, :lot_no, :batch_number, :weight_kg, 1,
                          :rm_pm_fg_type, :item_category, :sub_category,
                          :pack_size, :unit_pack_size, 1, :uom,
                          :net_weight, :gross_weight, :total_weight, :article,
@@ -1279,6 +1352,7 @@ def park_lines_in_pending(
                     "to_storage_type": to_storage_type,
                     "item_description": article,
                     "lot_no": lot_no,
+                    "batch_number": batch_no,
                     "weight_kg": per_unit_net,
                     "rm_pm_fg_type": getattr(line, "rm_pm_fg_type", None),
                     "item_category": getattr(line, "item_category", None),
@@ -1290,7 +1364,7 @@ def park_lines_in_pending(
                     "gross_weight": per_unit_gross,
                     "total_weight": per_unit_net,
                     "article": article,
-                    "dispatched_at": now,
+                    "dispatched_at": dispatched_at,
                     "dispatched_by": dispatched_by,
                 },
             )
@@ -1303,12 +1377,292 @@ def park_lines_in_pending(
     return parked
 
 
+def _guess_company_from_site(site: Optional[str]) -> str:
+    """Same heuristic as backfill: Rishi/CDPL sites → cdpl, else cfpl."""
+    s = (site or "").strip().lower()
+    return "cdpl" if ("rishi" in s or "cdpl" in s) else "cfpl"
+
+
+def _park_cold_row(db: Session, hdr, transfer_out_id: int, source_table: str, src,
+                   box_id: str, from_storage_type: str, to_storage_type: str, now) -> None:
+    """Insert one In-Transit pending row for a by-lot-matched cold_stocks row and
+    deduct (DELETE) it from source. Mirrors park_in_pending's cold-source path."""
+    cold_data = _cold_row_to_json(src)
+    from_company = _company_from_table(source_table)
+    to_company = from_company
+    db.execute(
+        text("""
+            INSERT INTO pending_transfer_stock
+                (transfer_type, transfer_out_id, transfer_out_challan_no, box_id, transaction_no,
+                 from_company, to_company, from_site, to_site, from_storage_type, to_storage_type,
+                 source_table, source_row_id, destination_table, item_description, lot_no,
+                 batch_number, weight_kg, no_of_cartons, net_weight, article,
+                 cold_storage_data, status, dispatched_at, dispatched_by)
+            VALUES
+                (:tt, :toid, :chal, :bid, :tno, :fc, :tc, :fs, :ts, :fst, :tst,
+                 :src, :srid, :dst, :item, :lot, :batch, :wt, :noc, :netw, :art,
+                 CAST(:cd AS JSONB), 'In Transit', :da, :db_)
+            ON CONFLICT (box_id, transaction_no) DO NOTHING
+        """),
+        {
+            "tt": "INTERUNIT", "toid": transfer_out_id, "chal": hdr.challan_no,
+            "bid": box_id, "tno": hdr.challan_no, "fc": from_company, "tc": to_company,
+            "fs": hdr.from_site, "ts": hdr.to_site, "fst": from_storage_type,
+            "tst": to_storage_type, "src": source_table,
+            "srid": getattr(src, "id", None),
+            "dst": _destination_table(to_storage_type, to_company),
+            "item": getattr(src, "item_description", None) or "",
+            "lot": getattr(src, "lot_no", None),
+            "batch": getattr(src, "batch_number", None),
+            "wt": float(getattr(src, "weight_kg", 0) or 0),
+            "noc": int(getattr(src, "no_of_cartons", 1) or 1),
+            "netw": float(getattr(src, "weight_kg", 0) or 0) or None,
+            "art": getattr(src, "item_description", None) or None,
+            "cd": json.dumps(cold_data) if cold_data else None,
+            "da": getattr(hdr, "stock_trf_date", None) or getattr(hdr, "created_ts", None) or now,
+            "db_": getattr(hdr, "created_by", None) or "reconcile",
+        },
+    )
+    db.execute(text(f"DELETE FROM {source_table} WHERE id = :rid"),
+               {"rid": getattr(src, "id")})
+
+    # Audit trail (parity with park_in_pending) so the deduction is traceable and
+    # restore_to_source can close the disposition loop on cancel/edit.
+    _ensure_reconciliation_schema(db)
+    _write_disposition(
+        db,
+        box_id=box_id,
+        transaction_no=hdr.challan_no,
+        lot_no=getattr(src, "lot_no", None),
+        item_description=getattr(src, "item_description", None) or "",
+        from_company=from_company,
+        unit=getattr(src, "unit", None),
+        from_site=hdr.from_site,
+        source_table=source_table,
+        disposition_type="transfer_out_pending",
+        disposition_ref_table="pending_transfer_stock",
+        disposition_ref_id=None,
+        disposition_ref_no=hdr.challan_no,
+        disposed_by=getattr(hdr, "created_by", None) or "reconcile",
+        snapshot_data=cold_data,
+        notes=f"transfer_out_id={transfer_out_id} (reconcile by-lot)",
+    )
+
+
+def _restore_pending_row(db: Session, p, dry_run: bool = False) -> None:
+    """Restore ONE pending_transfer_stock row to its source cold_stocks and delete the
+    pending row. Used by reconcile to undo wrong-lot / excess parks (cold sources).
+    Mirrors restore_to_source's cold branch for a single row."""
+    src = getattr(p, "source_table", None)
+    if dry_run:
+        return
+    if not src or not _table_exists(db, src):
+        db.execute(text("DELETE FROM pending_transfer_stock WHERE id = :id"), {"id": p.id})
+        return
+    if src.endswith("_cold_stocks"):
+        cold_json = getattr(p, "cold_storage_data", None) or {}
+        db.execute(
+            text(f"""
+                INSERT INTO {src}
+                    (inward_dt, unit, inward_no, item_description, item_mark, vakkal, lot_no,
+                     no_of_cartons, weight_kg, total_inventory_kgs, group_name, item_subgroup,
+                     storage_location, exporter, last_purchase_rate, value,
+                     box_id, transaction_no, spl_remarks)
+                VALUES
+                    (:inward_dt, :unit, :inward_no, :item_description, :item_mark, :vakkal, :lot_no,
+                     :no_of_cartons, :weight_kg, :total_inventory_kgs, :group_name, :item_subgroup,
+                     :storage_location, :exporter, :last_purchase_rate, :value,
+                     :box_id, :transaction_no, :spl_remarks)
+                ON CONFLICT DO NOTHING
+            """),
+            {
+                "inward_dt": cold_json.get("inward_dt"), "unit": cold_json.get("unit") or p.from_site,
+                "inward_no": cold_json.get("inward_no"), "item_description": p.item_description,
+                "item_mark": cold_json.get("item_mark"), "vakkal": cold_json.get("vakkal"),
+                "lot_no": p.lot_no, "no_of_cartons": p.no_of_cartons or 1, "weight_kg": p.weight_kg,
+                "total_inventory_kgs": cold_json.get("total_inventory_kgs") or float(p.weight_kg or 0),
+                "group_name": cold_json.get("group_name"), "item_subgroup": cold_json.get("item_subgroup"),
+                "storage_location": cold_json.get("storage_location") or p.from_site,
+                "exporter": cold_json.get("exporter"), "last_purchase_rate": cold_json.get("last_purchase_rate"),
+                "value": cold_json.get("value"), "box_id": p.box_id,
+                "transaction_no": p.transaction_no, "spl_remarks": cold_json.get("spl_remarks"),
+            },
+        )
+    _revert_disposition(db, box_id=p.box_id, transaction_no=p.transaction_no,
+                        disposition_type="transfer_out_pending",
+                        reverted_reason="reconcile: wrong-lot/excess restore to source")
+    db.execute(text("DELETE FROM pending_transfer_stock WHERE id = :id"), {"id": p.id})
+
+
+def reconcile_transfer_to_order(transfer_out_id: int, db: Session,
+                                dry_run: bool = False) -> dict:
+    """FLAG-ONLY accounting reconcile for one transfer.
+
+    Clean-accounting policy (per ops decision): the parked rows in pending_transfer_stock
+    ARE the physical in-transit truth. We do NOT move/pull cold_stocks to make the count
+    match the order — that would mark physically-present boxes as shipped and corrupt the
+    available count. Instead we compare the order (lines) to what actually shipped (parked)
+    and record the net gap on the header (unallocated_boxes) for review. Future over-orders
+    are blocked at dispatch (see the over-order guard in create/update_transfer).
+
+    Returns: {transfer_out_id, allocated(=0), unallocated(=net gap), total_ordered,
+              total_parked, groups:[{lot, item, ordered, parked, shortfall}]}.
+    Writes nothing except the unallocated_boxes flag (skipped when dry_run=True)."""
+    report = {"transfer_out_id": transfer_out_id, "allocated": 0,
+              "unallocated": 0, "groups": []}
+    if not _table_exists(db, "pending_transfer_stock"):
+        return report
+
+    hdr = db.execute(
+        text("""SELECT id, challan_no, from_site, to_site, created_by, created_ts
+                FROM interunit_transfers_header WHERE id = :tid"""),
+        {"tid": transfer_out_id},
+    ).fetchone()
+    if not hdr:
+        return report
+
+    # Receiving-aware safety: once any box has been received (GRN started), the parked
+    # In-Transit count legitimately drops below ordered as boxes move to destination.
+    # Topping up here would re-deduct already-received stock (double count), so skip the
+    # by-lot fill for transfers whose receipt has begun. The receive path keeps its own
+    # tables in sync via pick_from_pending; reconcile only owns the pre-receipt invariant.
+    received = db.execute(
+        text("""SELECT COUNT(tib.id)
+                FROM interunit_transfer_in_header tih
+                JOIN interunit_transfer_in_boxes tib ON tib.header_id = tih.id
+                WHERE tih.transfer_out_id = :tid"""),
+        {"tid": transfer_out_id},
+    ).scalar() or 0
+    if received:
+        report["skipped_receiving_in_progress"] = True
+        report["received"] = int(received)
+        logger.info("RECONCILE: transfer_out_id=%s skipped — %s box(es) already received",
+                    transfer_out_id, received)
+        return report
+
+    from_storage_type = "cold" if _is_cold_site(hdr.from_site) else "warehouse"
+    to_storage_type = "cold" if _is_cold_site(hdr.to_site) else "warehouse"
+
+    # Ordered lots/qtys — the authoritative truth (cold->warehouse: ordered == shipped).
+    ordered_rows = db.execute(
+        text("""SELECT lot_number AS lot_no, MIN(item_desc_raw) AS item_description,
+                       COALESCE(SUM(qty),0) AS ordered
+                FROM interunit_transfers_lines WHERE header_id = :tid
+                GROUP BY lot_number"""),
+        {"tid": transfer_out_id},
+    ).fetchall()
+    ordered = {(o.lot_no or ""): int(o.ordered or 0) for o in ordered_rows if int(o.ordered or 0) > 0}
+    item_by_lot = {(o.lot_no or ""): (o.item_description or "") for o in ordered_rows}
+
+    # Current parked rows (full rows so wrong-lot / excess ones can be restored).
+    parked_all = db.execute(
+        text("""SELECT * FROM pending_transfer_stock
+                WHERE transfer_out_id = :tid AND status = 'In Transit'"""),
+        {"tid": transfer_out_id},
+    ).fetchall()
+    parked_by_lot: dict = {}
+    for p in parked_all:
+        parked_by_lot.setdefault((p.lot_no or ""), []).append(p)
+
+    total_ordered = sum(ordered.values())
+    total_parked = len(parked_all)
+    report["total_ordered"] = total_ordered
+    report["total_parked"] = total_parked
+    report["restored_wrong_lot"] = 0
+    report["pulled_ordered"] = 0
+    report["trimmed_excess"] = 0
+
+    # WAREHOUSE source: each order LINE is one box and `qty` is the PACK count (units per
+    # box), so SUM(qty) is NOT the box count (that caused false shortages, e.g. 75 boxes
+    # parked vs SUM(qty)=1963 → bogus 1888 short). The reliable "expected boxes" is the
+    # number of box rows the dispatch recorded. Flag the genuine gap only; no stock moved
+    # (warehouse is box-tracked, not lot-pulled).
+    if from_storage_type != "cold":
+        box_count = db.execute(
+            text("SELECT COUNT(*) FROM interunit_transfer_boxes WHERE header_id = :tid"),
+            {"tid": transfer_out_id},
+        ).scalar() or 0
+        report["total_ordered"] = box_count
+        report["groups"].append({"lot": "", "item": "(warehouse: 1 line = 1 box; qty=pack)",
+                                  "ordered": box_count, "parked": total_parked,
+                                  "shortfall": max(box_count - total_parked, 0)})
+        report["allocated"] = 0
+        report["unallocated"] = max(box_count - total_parked, 0)
+        if not dry_run:
+            _ensure_reconciliation_schema(db)
+            db.execute(text("UPDATE interunit_transfers_header SET unallocated_boxes = :u WHERE id = :tid"),
+                       {"u": report["unallocated"], "tid": transfer_out_id})
+        logger.info("RECONCILE(warehouse,flag): tid=%s box_count=%s parked=%s short=%s dry_run=%s",
+                    transfer_out_id, box_count, total_parked, report["unallocated"], dry_run)
+        return report
+
+    # COLD source: CORRECT pending to the order. The ORDER LOT is truth (no real scanning).
+    now = datetime.now()
+    shortage = 0
+
+    # 1) Restore parked rows whose lot is NOT in the order (wrong-lot corruption).
+    for lot, rows in list(parked_by_lot.items()):
+        if lot not in ordered:
+            for p in rows:
+                _restore_pending_row(db, p, dry_run=dry_run)
+                report["restored_wrong_lot"] += 1
+            parked_by_lot[lot] = []
+
+    # 2) Per ordered lot: make parked count == ordered qty (top up from THAT lot, or trim).
+    guessed = _guess_company_from_site(hdr.from_site)
+    for lot, qty in ordered.items():
+        rows = parked_by_lot.get(lot, [])
+        have = len(rows)
+        pulled = 0
+        if have < qty:
+            need = qty - have
+            for company in (guessed, "cdpl" if guessed == "cfpl" else "cfpl"):
+                if need <= 0:
+                    break
+                for table, src in _find_available_cold_by_lot(db, company, lot, None, need):
+                    box_id = f"RC-{transfer_out_id}-{getattr(src, 'id')}"
+                    if not dry_run:
+                        _park_cold_row(db, hdr, transfer_out_id, table, src, box_id,
+                                       from_storage_type, to_storage_type, now)
+                    pulled += 1
+                    need -= 1
+            report["pulled_ordered"] += pulled
+            shortage += need  # ordered lot genuinely not available in the sheet
+        elif have > qty:
+            for p in rows[:have - qty]:
+                _restore_pending_row(db, p, dry_run=dry_run)
+                report["trimmed_excess"] += 1
+        report["groups"].append({"lot": lot, "item": item_by_lot.get(lot, ""),
+                                 "ordered": qty, "parked": have, "pulled": pulled,
+                                 "shortfall": max(qty - have - pulled, 0)})
+
+    report["allocated"] = report["pulled_ordered"]
+    report["unallocated"] = shortage
+
+    if not dry_run:
+        _ensure_reconciliation_schema(db)
+        db.execute(text("UPDATE interunit_transfers_header SET unallocated_boxes = :u WHERE id = :tid"),
+                   {"u": shortage, "tid": transfer_out_id})
+    logger.info("RECONCILE(cold,correct): tid=%s ordered=%s parked0=%s restored_wrong=%s "
+                "pulled=%s trimmed=%s short=%s dry_run=%s",
+                transfer_out_id, total_ordered, total_parked, report["restored_wrong_lot"],
+                report["pulled_ordered"], report["trimmed_excess"], shortage, dry_run)
+    return report
+
+
 # ----------------------------------------------------------------------------
 #  pick_from_pending — called from create_transfer_in / finalize_transfer_in
 # ----------------------------------------------------------------------------
-def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: Optional[str] = None) -> int:
-    """Move every 'In Transit' row tied to this transfer_out into its destination
-    table, then delete the pending row. Returns count picked."""
+def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: Optional[str] = None,
+                      acknowledged_keys: Optional[set] = None) -> int:
+    """Move 'In Transit' rows tied to this transfer_out into their destination table,
+    then delete the pending row. Returns count picked.
+
+    acknowledged_keys: set of (box_id, transaction_no) actually received. When given,
+    only those real boxes are picked (the rest stay In Transit so a partial receipt
+    can't leak them); 'LINE-%' tracking rows are always picked. None = legacy full
+    pick (every in-transit row), kept for callers that intend a complete receipt.
+    """
     pending_rows = db.execute(
         text("""
             SELECT * FROM pending_transfer_stock
@@ -1317,8 +1671,18 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
         {"tid": transfer_out_id},
     ).fetchall()
 
+    ack = None
+    if acknowledged_keys is not None:
+        ack = {((b or "").strip(), (t or "").strip()) for (b, t) in acknowledged_keys}
+
     picked = 0
     for p in pending_rows:
+        # Scope to acknowledged boxes when provided: only pick boxes actually received
+        # (by (box_id, transaction_no)); 'LINE-%' tracking rows are always picked.
+        if ack is not None:
+            _bid = (p.box_id or "").strip()
+            if not _bid.startswith("LINE-") and (_bid, (p.transaction_no or "").strip()) not in ack:
+                continue
         dest = p.destination_table
 
         # Transfer-in only stores in interunit_transfer_in tables.
@@ -1375,11 +1739,28 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
             {"id": p.id},
         )
         picked += 1
-        logger.info("PICK_PENDING: box_id=%s tno=%s → %s (transfer_out_id=%s)",
+        logger.info("PICK_PENDING: box_id=%s tno=%s -> %s (transfer_out_id=%s)",
                     p.box_id, p.transaction_no, dest, transfer_out_id)
 
     logger.info("PICK_PENDING: picked %d rows for transfer_out_id=%s", picked, transfer_out_id)
     return picked
+
+
+def count_remaining_in_transit(transfer_out_id: int, db: Session) -> int:
+    """Count REAL (non-'LINE-%') boxes still 'In Transit' for this transfer_out.
+
+    This is the completion gate for the bridge invariant: a transfer may only flip to
+    'Received' when this returns 0. It counts pending rows (unique on (box_id, txn)),
+    so it is immune to duplicate OUT-box rows.
+    """
+    return db.execute(
+        text("""
+            SELECT COUNT(*) FROM pending_transfer_stock
+            WHERE transfer_out_id = :tid AND status = 'In Transit'
+              AND COALESCE(box_id, '') NOT LIKE 'LINE-%'
+        """),
+        {"tid": transfer_out_id},
+    ).scalar() or 0
 
 
 # ----------------------------------------------------------------------------
@@ -1487,7 +1868,7 @@ def unpick_to_pending(transfer_in_id: int, transfer_out_id: int, db: Session) ->
                      from_company, to_company, from_site, to_site,
                      from_storage_type, to_storage_type,
                      source_table, source_row_id, destination_table,
-                     item_description, lot_no, weight_kg, no_of_cartons,
+                     item_description, lot_no, batch_number, weight_kg, no_of_cartons,
                      cold_storage_data,
                      gross_weight, net_weight, article,
                      status, dispatched_at, dispatched_by)
@@ -1497,7 +1878,7 @@ def unpick_to_pending(transfer_in_id: int, transfer_out_id: int, db: Session) ->
                      :from_company, :to_company, :from_site, :to_site,
                      :from_storage_type, :to_storage_type,
                      :source_table, NULL, :destination_table,
-                     :item_description, :lot_no, :weight_kg, :no_of_cartons,
+                     :item_description, :lot_no, :batch_number, :weight_kg, :no_of_cartons,
                      CAST(:cold_storage_data AS JSONB),
                      :gross_weight, :net_weight, :article,
                      'In Transit', :dispatched_at, :dispatched_by)
@@ -1518,18 +1899,22 @@ def unpick_to_pending(transfer_in_id: int, transfer_out_id: int, db: Session) ->
                 "destination_table": destination_table_keep,
                 "item_description": item_description,
                 "lot_no": lot_no,
+                "batch_number": getattr(b, "batch_number", None),
                 "weight_kg": weight_kg,
                 "no_of_cartons": no_of_cartons,
                 "cold_storage_data": json.dumps(cold_data) if cold_data else None,
                 "gross_weight": float(b.gross_weight) if b.gross_weight is not None else None,
                 "net_weight": float(b.net_weight) if b.net_weight is not None else None,
                 "article": b.article,
-                "dispatched_at": now,
+                # Preserve the ORIGINAL transfer-out date on re-park (not the re-open
+                # time), so an unpicked box keeps its true dispatch date.
+                "dispatched_at": getattr(transfer_out, "stock_trf_date", None)
+                                 or getattr(transfer_out, "created_ts", None) or now,
                 "dispatched_by": transfer_out.created_by or "system",
             },
         )
         restored += 1
-        logger.info("UNPICK_PENDING: box_id=%s tno=%s removed from %s → back to pending",
+        logger.info("UNPICK_PENDING: box_id=%s tno=%s removed from %s -> back to pending",
                     b.box_id, b.transaction_no, dest_table)
 
     logger.info("UNPICK_PENDING: restored %d boxes to pending for transfer_in_id=%s", restored, transfer_in_id)
@@ -1691,7 +2076,7 @@ def restore_to_source(transfer_out_id: int, db: Session) -> int:
 
         db.execute(text("DELETE FROM pending_transfer_stock WHERE id = :id"), {"id": p.id})
         restored += 1
-        logger.info("RESTORE_SOURCE: box_id=%s tno=%s → %s (transfer_out_id=%s)",
+        logger.info("RESTORE_SOURCE: box_id=%s tno=%s -> %s (transfer_out_id=%s)",
                     p.box_id, p.transaction_no, src, transfer_out_id)
 
     logger.info("RESTORE_SOURCE: restored %d rows for transfer_out_id=%s", restored, transfer_out_id)
@@ -1720,6 +2105,10 @@ def list_pending_transfers(
     """
     if not _table_exists(db, "pending_transfer_stock"):
         return {"records": [], "total": 0, "filter_options": {"from_sites": [], "to_sites": []}}
+
+    # Ensure the unallocated_boxes column exists before we select it (idempotent,
+    # globally short-circuited after first call) so the shortfall indicator is safe.
+    _ensure_reconciliation_schema(db)
 
     # Outer filters applied to the combined CTE (no table prefix)
     outer_clauses: list = []
@@ -1757,26 +2146,52 @@ def list_pending_transfers(
                 SELECT
                     pts.transfer_out_id,
                     pts.transfer_out_challan_no,
-                    MIN(pts.dispatched_at)                AS dispatched_at,
-                    pts.from_site,
-                    pts.to_site,
-                    pts.from_company,
-                    pts.to_company,
-                    pts.from_storage_type,
-                    pts.to_storage_type,
+                    -- DATE = the transfer-out's actual initiation date from the live
+                    -- header (stock_trf_date), NOT pts.dispatched_at which stores the
+                    -- park/sync time. Fall back to created_ts if the date is unset.
+                    MIN(COALESCE(ith.stock_trf_date, ith.created_ts)) AS dispatched_at,
+                    MIN(pts.from_site)                    AS from_site,
+                    MIN(pts.to_site)                      AS to_site,
+                    -- A single dispatch can pull lots from BOTH cold companies, which
+                    -- previously split one challan into two rows. Group by the dispatch
+                    -- only (transfer_out_id + challan) and surface a representative or
+                    -- 'mixed' company so each dispatch is exactly one row.
+                    CASE WHEN COUNT(DISTINCT pts.from_company) > 1 THEN 'mixed'
+                         ELSE MIN(pts.from_company) END   AS from_company,
+                    CASE WHEN COUNT(DISTINCT pts.to_company) > 1 THEN 'mixed'
+                         ELSE MIN(pts.to_company) END     AS to_company,
+                    MIN(pts.from_storage_type)            AS from_storage_type,
+                    MIN(pts.to_storage_type)              AS to_storage_type,
                     COUNT(*)                              AS total_boxes,
                     COALESCE(SUM(pts.no_of_cartons), 0)   AS total_cartons,
                     COALESCE(SUM(pts.weight_kg), 0)       AS total_kg,
-                    MIN(pts.dispatched_by)                AS dispatched_by,
-                    MIN(ith.status)                       AS header_status
+                    -- Read the creator from the live header (single source of truth)
+                    -- so a corrected created_by shows immediately without re-parking,
+                    -- and a stale/placeholder parked snapshot can't mismatch it.
+                    MIN(ith.created_by)                   AS dispatched_by,
+                    MIN(ith.status)                       AS header_status,
+                    -- LIVE shortfall (never stale): ordered boxes not accounted for
+                    -- = ordered - parked(In-Transit, real) - received. Computing it live
+                    -- (instead of the stored unallocated_boxes flag) means a corrected
+                    -- pending set self-heals the badge, and it nets out received boxes.
+                    GREATEST(
+                        (CASE WHEN (SELECT COUNT(*) FROM interunit_transfer_boxes b WHERE b.header_id = pts.transfer_out_id) > 0
+                              THEN (SELECT COUNT(*) FROM interunit_transfer_boxes b WHERE b.header_id = pts.transfer_out_id)
+                              ELSE COALESCE((SELECT SUM(l.qty)::int FROM interunit_transfers_lines l WHERE l.header_id = pts.transfer_out_id), 0) END)
+                        - COUNT(*) FILTER (WHERE COALESCE(pts.box_id, '') NOT LIKE 'LINE-%')
+                        - COALESCE((SELECT COUNT(*) FROM interunit_transfer_in_boxes tib
+                                    JOIN interunit_transfer_in_header tih ON tih.id = tib.header_id
+                                    WHERE tih.transfer_out_id = pts.transfer_out_id), 0),
+                        0
+                    ) AS unallocated_boxes,
+                    -- "Edited" badge source: the genuine edit marker (edited_at),
+                    -- NOT updated_ts (auto-bumped by trigger on every row change).
+                    MAX(ith.edited_at)                    AS updated_ts
                 FROM pending_transfer_stock pts
                 JOIN interunit_transfers_header ith
                     ON ith.id = pts.transfer_out_id AND ith.status != 'Received'
                 WHERE pts.status = 'In Transit'
-                GROUP BY pts.transfer_out_id, pts.transfer_out_challan_no,
-                         pts.from_site, pts.to_site,
-                         pts.from_company, pts.to_company,
-                         pts.from_storage_type, pts.to_storage_type
+                GROUP BY pts.transfer_out_id, pts.transfer_out_challan_no
 
                 UNION ALL
 
@@ -1788,7 +2203,7 @@ def list_pending_transfers(
                 SELECT
                     h.id                                  AS transfer_out_id,
                     h.challan_no                          AS transfer_out_challan_no,
-                    h.created_ts                          AS dispatched_at,
+                    COALESCE(h.stock_trf_date, h.created_ts) AS dispatched_at,
                     h.from_site,
                     h.to_site,
                     NULL                                  AS from_company,
@@ -1812,7 +2227,18 @@ def list_pending_transfers(
                          ELSE COALESCE((SELECT SUM(CAST(l.net_weight AS NUMERIC)) FROM interunit_transfers_lines l WHERE l.header_id = h.id), 0)
                     END                                   AS total_kg,
                     COALESCE(h.created_by, '')            AS dispatched_by,
-                    h.status                              AS header_status
+                    h.status                              AS header_status,
+                    -- LIVE shortfall (orphan branch: no pending rows, so parked = 0).
+                    GREATEST(
+                        (CASE WHEN (SELECT COUNT(*) FROM interunit_transfer_boxes b WHERE b.header_id = h.id) > 0
+                              THEN (SELECT COUNT(*) FROM interunit_transfer_boxes b WHERE b.header_id = h.id)
+                              ELSE COALESCE((SELECT SUM(l.qty)::int FROM interunit_transfers_lines l WHERE l.header_id = h.id), 0) END)
+                        - COALESCE((SELECT COUNT(*) FROM interunit_transfer_in_boxes tib
+                                    JOIN interunit_transfer_in_header tih ON tih.id = tib.header_id
+                                    WHERE tih.transfer_out_id = h.id), 0),
+                        0
+                    )                                     AS unallocated_boxes,
+                    h.edited_at                           AS updated_ts
                 FROM interunit_transfers_header h
                 WHERE h.status IN ('Dispatch', 'Partial')
                   AND NOT EXISTS (
@@ -1844,6 +2270,8 @@ def list_pending_transfers(
             "dispatched_by": r.dispatched_by or "",
             "status": "In Transit",
             "header_status": getattr(r, "header_status", None) or "Dispatch",
+            "unallocated_boxes": int(getattr(r, "unallocated_boxes", 0) or 0),
+            "updated_ts": r.updated_ts.isoformat() if getattr(r, "updated_ts", None) else None,
         }
         for r in rows
     ]
@@ -1920,6 +2348,8 @@ def pending_by_lot(
     if not _table_exists(db, "pending_transfer_stock"):
         return {"pending_cartons": 0, "pending_kg": 0, "transfers": [], "boxes": []}
 
+    _ensure_reconciliation_schema(db)  # guarantees updated_ts exists before we select it
+
     clauses = ["pts.status = 'In Transit'"]
     params: dict = {}
 
@@ -1964,7 +2394,8 @@ def pending_by_lot(
         "\n                   MIN(h.remark)        AS remark,"
         "\n                   MIN(h.reason_code)   AS reason_code,"
         "\n                   MIN(h.status)        AS transfer_status,"
-        "\n                   BOOL_OR(COALESCE(h.has_variance, false)) AS has_variance"
+        "\n                   BOOL_OR(COALESCE(h.has_variance, false)) AS has_variance,"
+        "\n                   MIN(h.updated_ts)    AS updated_ts"
     ) if header_join_ok else (
         ",\n                   NULL::text AS vehicle_no,"
         "\n                   NULL::text AS driver_name,"
@@ -1972,7 +2403,8 @@ def pending_by_lot(
         "\n                   NULL::text AS remark,"
         "\n                   NULL::text AS reason_code,"
         "\n                   NULL::text AS transfer_status,"
-        "\n                   false      AS has_variance"
+        "\n                   false      AS has_variance,"
+        "\n                   NULL::timestamp AS updated_ts"
     )
 
     transfer_rows = db.execute(
@@ -2024,11 +2456,49 @@ def pending_by_lot(
                 "reason_code": getattr(r, "reason_code", None) or "",
                 "transfer_status": getattr(r, "transfer_status", None) or "",
                 "has_variance": bool(getattr(r, "has_variance", False)),
+                "updated_ts": r.updated_ts.isoformat() if getattr(r, "updated_ts", None) else None,
             }
             for r in transfer_rows
         ],
         # legacy alias retained briefly for any callers expecting `boxes`
         "boxes": [],
+    }
+
+
+def in_transit_by_lot(db: Session, company: Optional[str] = None) -> dict:
+    """One batched query: In-Transit pending cartons/kg/boxes per lot, for dashboard
+    overlays (so the cold-storage dashboard can show an 'in transit' context badge per
+    lot without N per-lot calls). Returns {lot_no: {cartons, kg, box_count}}.
+
+    NOTE: these boxes are already deducted from cold_stocks at dispatch — this map is
+    for DISPLAY context only; do NOT subtract it from displayed stock (double count)."""
+    if not _table_exists(db, "pending_transfer_stock"):
+        return {}
+    clauses = ["status = 'In Transit'", "lot_no IS NOT NULL", "lot_no <> ''"]
+    params: dict = {}
+    if company:
+        clauses.append("LOWER(from_company) = :co")
+        params["co"] = company.lower()
+    where = " AND ".join(clauses)
+    rows = db.execute(
+        text(f"""
+            SELECT lot_no,
+                   COALESCE(SUM(no_of_cartons), 0) AS cartons,
+                   COALESCE(SUM(weight_kg), 0)     AS kg,
+                   COUNT(*)                         AS box_count
+            FROM pending_transfer_stock
+            WHERE {where}
+            GROUP BY lot_no
+        """),
+        params,
+    ).fetchall()
+    return {
+        r.lot_no: {
+            "cartons": float(r.cartons or 0),
+            "kg": float(r.kg or 0),
+            "box_count": int(r.box_count or 0),
+        }
+        for r in rows if r.lot_no
     }
 
 
@@ -2041,14 +2511,14 @@ def pending_by_lot(
 #  existed at dispatch time. Safe to re-run — already-parked transfers are
 #  skipped via the unique (box_id, transaction_no) constraint.
 # ----------------------------------------------------------------------------
-def backfill_pending_from_existing_transfers(db: Session) -> dict:
+def backfill_pending_from_existing_transfers(db: Session, dry_run: bool = False) -> dict:
     if not _table_exists(db, "pending_transfer_stock"):
         return {"error": "pending_transfer_stock table missing"}
 
     candidates = db.execute(
         text("""
             SELECT h.id, h.challan_no, h.from_site, h.to_site,
-                   h.status, h.created_by, h.created_ts
+                   h.status, h.created_by, h.created_ts, h.stock_trf_date
             FROM interunit_transfers_header h
             WHERE LOWER(COALESCE(h.status, '')) IN ('dispatch', 'partial', 'completed', 'in transit')
               AND NOT EXISTS (
@@ -2068,17 +2538,26 @@ def backfill_pending_from_existing_transfers(db: Session) -> dict:
         "boxes_parked_without_source": 0,
         "boxes_skipped_already_parked": 0,
         "boxes_with_missing_id": 0,
+        "boxes_topped_up_by_lot": 0,
+        "boxes_unallocatable": 0,
+        "reconciled": [],
     }
 
+    # Write router: in dry-run, every write is a no-op so the function is read-only
+    # and can preview what an apply would do. Reads still go through db.execute.
+    _w = (lambda *a, **k: None) if dry_run else db.execute
+
     for t in candidates:
-        # Skip transfers that already have at least one pending row (avoid double-park)
+        # Count (no longer SKIP) transfers that already have pending rows: we now
+        # reconcile EVERY in-transit transfer up to its ordered qty. The per-box dup
+        # check below and ON CONFLICT prevent double-parking; reconcile_transfer_to_order
+        # then fills the remaining shortfall BY LOT from the main stock sheet.
         existing = db.execute(
             text("SELECT COUNT(*) FROM pending_transfer_stock WHERE transfer_out_id = :tid"),
             {"tid": t.id},
         ).scalar()
         if existing and existing > 0:
             summary["transfers_with_existing_pending"] += 1
-            continue
 
         boxes = db.execute(
             text("""
@@ -2092,7 +2571,7 @@ def backfill_pending_from_existing_transfers(db: Session) -> dict:
 
         from_storage_type = "cold" if _is_cold_site(t.from_site) else "warehouse"
         to_storage_type = "cold" if _is_cold_site(t.to_site) else "warehouse"
-        dispatched_at = t.created_ts or datetime.now()
+        dispatched_at = getattr(t, "stock_trf_date", None) or getattr(t, "created_ts", None) or datetime.now()
         dispatched_by = t.created_by or "backfill"
 
         for b in boxes:
@@ -2118,13 +2597,13 @@ def backfill_pending_from_existing_transfers(db: Session) -> dict:
             warehouse_data = {}
 
             if from_storage_type == "cold":
-                source_table, source_row = _find_in_cold_stocks(db, box_id, tno)
+                source_table, source_row = _find_in_cold_stocks(db, box_id, tno, getattr(b, "lot_number", None))
                 if source_row is not None:
                     cold_data = _cold_row_to_json(source_row)
 
             if source_row is None:
                 # Try warehouse tables (whether or not from_storage_type said warehouse)
-                wh_table, wh_row = _find_in_bulk_entry(db, box_id, tno)
+                wh_table, wh_row = _find_in_bulk_entry(db, box_id, tno, getattr(b, "lot_number", None))
                 if wh_row is not None:
                     source_table = wh_table
                     source_row = wh_row
@@ -2164,7 +2643,7 @@ def backfill_pending_from_existing_transfers(db: Session) -> dict:
             to_company = from_company
             destination_table = _destination_table(to_storage_type, to_company)
 
-            db.execute(
+            _w(
                 text("""
                     INSERT INTO pending_transfer_stock
                         (transfer_type, transfer_out_id, transfer_out_challan_no,
@@ -2172,7 +2651,7 @@ def backfill_pending_from_existing_transfers(db: Session) -> dict:
                          from_company, to_company, from_site, to_site,
                          from_storage_type, to_storage_type,
                          source_table, source_row_id, destination_table,
-                         item_description, lot_no, weight_kg, no_of_cartons,
+                         item_description, lot_no, batch_number, weight_kg, no_of_cartons,
                          cold_storage_data,
                          gross_weight, net_weight, article,
                          status, dispatched_at, dispatched_by)
@@ -2182,7 +2661,7 @@ def backfill_pending_from_existing_transfers(db: Session) -> dict:
                          :from_company, :to_company, :from_site, :to_site,
                          :from_storage_type, :to_storage_type,
                          :source_table, :source_row_id, :destination_table,
-                         :item_description, :lot_no, :weight_kg, :no_of_cartons,
+                         :item_description, :lot_no, :batch_number, :weight_kg, :no_of_cartons,
                          CAST(:cold_storage_data AS JSONB),
                          :gross_weight, :net_weight, :article,
                          'In Transit', :dispatched_at, :dispatched_by)
@@ -2204,6 +2683,7 @@ def backfill_pending_from_existing_transfers(db: Session) -> dict:
                     "destination_table": destination_table,
                     "item_description": item_description,
                     "lot_no": lot_no,
+                    "batch_number": getattr(source_row, "batch_number", None) if source_row is not None else None,
                     "weight_kg": weight_kg,
                     "no_of_cartons": no_of_cartons,
                     "cold_storage_data": json.dumps(cold_data) if cold_data else None,
@@ -2217,7 +2697,7 @@ def backfill_pending_from_existing_transfers(db: Session) -> dict:
 
             # Delete source row (only if it actually exists — keeps idempotency)
             if source_row is not None and getattr(source_row, "id", None) is not None and source_table:
-                db.execute(
+                _w(
                     text(f"DELETE FROM {source_table} WHERE id = :rid"),
                     {"rid": source_row.id},
                 )
@@ -2229,6 +2709,16 @@ def backfill_pending_from_existing_transfers(db: Session) -> dict:
             else:
                 summary["boxes_parked_without_source"] += 1
 
-    db.commit()
-    logger.info("BACKFILL_PENDING: %s", summary)
+        # Reconcile this transfer up to its ordered qty: fills any remaining shortfall
+        # BY LOT from the main sheet (the fix for 600-ordered-but-407-parked), and
+        # flags genuinely unallocatable units on the header.
+        rec = reconcile_transfer_to_order(t.id, db, dry_run=dry_run)
+        summary["boxes_topped_up_by_lot"] += rec["allocated"]
+        summary["boxes_unallocatable"] += rec["unallocated"]
+        summary["reconciled"].append(rec)
+
+    if not dry_run:
+        db.commit()
+    logger.info("BACKFILL_PENDING(dry_run=%s): %s", dry_run,
+                {k: v for k, v in summary.items() if k != "reconciled"})
     return summary

@@ -1,0 +1,1003 @@
+{
+ "columns": {
+  "cfpl_cold_stocks": [
+   {
+    "col": "id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "inward_dt",
+    "type": "date",
+    "null": "YES"
+   },
+   {
+    "col": "unit",
+    "type": "character varying(50)",
+    "null": "YES"
+   },
+   {
+    "col": "inward_no",
+    "type": "character varying(50)",
+    "null": "YES"
+   },
+   {
+    "col": "cold_item_mark",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "vakkal",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "lot_no",
+    "type": "character varying(50)",
+    "null": "YES"
+   },
+   {
+    "col": "no_of_cartons",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "weight_kg",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "total_inventory_kgs",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "group_name",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "item_description",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "storage_location",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "exporter",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "last_purchase_rate",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "created_at",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "updated_at",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "box_id",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "transaction_no",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "item_subgroup",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "item_mark",
+    "type": "text",
+    "null": "YES"
+   },
+   {
+    "col": "value",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "inward_transaction_no",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "auto_created_from_inward",
+    "type": "boolean",
+    "null": "YES"
+   },
+   {
+    "col": "spl_remarks",
+    "type": "text",
+    "null": "YES"
+   },
+   {
+    "col": "canonical_warehouse",
+    "type": "text",
+    "null": "YES"
+   },
+   {
+    "col": "canonical_group",
+    "type": "text",
+    "null": "YES"
+   },
+   {
+    "col": "canonical_subgroup",
+    "type": "text",
+    "null": "YES"
+   }
+  ],
+  "interunit_transfer_boxes": [
+   {
+    "col": "id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "transfer_line_id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "header_id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "box_number",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "article",
+    "type": "character varying(500)",
+    "null": "NO"
+   },
+   {
+    "col": "lot_number",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "net_weight",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "gross_weight",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "created_at",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "updated_at",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "batch_number",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "transaction_no",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "box_id",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "qr_data",
+    "type": "jsonb",
+    "null": "YES"
+   },
+   {
+    "col": "storage_location",
+    "type": "character varying(255)",
+    "null": "YES"
+   }
+  ],
+  "interunit_transfer_in_boxes": [
+   {
+    "col": "id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "header_id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "transfer_out_box_id",
+    "type": "integer",
+    "null": "YES"
+   },
+   {
+    "col": "box_id",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "article",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "batch_number",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "lot_number",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "transaction_no",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "net_weight",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "gross_weight",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "scanned_at",
+    "type": "timestamp without time zone",
+    "null": "NO"
+   },
+   {
+    "col": "is_matched",
+    "type": "boolean",
+    "null": "NO"
+   },
+   {
+    "col": "created_at",
+    "type": "timestamp without time zone",
+    "null": "NO"
+   },
+   {
+    "col": "updated_at",
+    "type": "timestamp without time zone",
+    "null": "NO"
+   },
+   {
+    "col": "issue",
+    "type": "jsonb",
+    "null": "YES"
+   },
+   {
+    "col": "line_index",
+    "type": "integer",
+    "null": "YES"
+   },
+   {
+    "col": "inward_box_id",
+    "type": "character varying(50)",
+    "null": "YES"
+   },
+   {
+    "col": "original_box_id",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "reconciled",
+    "type": "boolean",
+    "null": "YES"
+   },
+   {
+    "col": "reconciliation_id",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "scan_source",
+    "type": "character varying(50)",
+    "null": "YES"
+   }
+  ],
+  "interunit_transfer_in_header": [
+   {
+    "col": "id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "transfer_out_id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "transfer_out_no",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "grn_number",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "grn_date",
+    "type": "timestamp without time zone",
+    "null": "NO"
+   },
+   {
+    "col": "receiving_warehouse",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "received_by",
+    "type": "character varying(255)",
+    "null": "NO"
+   },
+   {
+    "col": "received_at",
+    "type": "timestamp without time zone",
+    "null": "NO"
+   },
+   {
+    "col": "box_condition",
+    "type": "character varying(50)",
+    "null": "YES"
+   },
+   {
+    "col": "condition_remarks",
+    "type": "text",
+    "null": "YES"
+   },
+   {
+    "col": "status",
+    "type": "character varying(50)",
+    "null": "NO"
+   },
+   {
+    "col": "created_at",
+    "type": "timestamp without time zone",
+    "null": "NO"
+   },
+   {
+    "col": "updated_at",
+    "type": "timestamp without time zone",
+    "null": "NO"
+   },
+   {
+    "col": "inward_transaction_no",
+    "type": "character varying(50)",
+    "null": "YES"
+   }
+  ],
+  "interunit_transfer_requests": [
+   {
+    "col": "id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "request_no",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "request_date",
+    "type": "date",
+    "null": "NO"
+   },
+   {
+    "col": "from_site",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "to_site",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "reason_code",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "remarks",
+    "type": "text",
+    "null": "NO"
+   },
+   {
+    "col": "status",
+    "type": "character varying(20)",
+    "null": "YES"
+   },
+   {
+    "col": "reject_reason",
+    "type": "text",
+    "null": "YES"
+   },
+   {
+    "col": "created_by",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "created_ts",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "rejected_ts",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "updated_at",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "reason_description",
+    "type": "text",
+    "null": "YES"
+   }
+  ],
+  "interunit_transfers_header": [
+   {
+    "col": "id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "challan_no",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "stock_trf_date",
+    "type": "date",
+    "null": "NO"
+   },
+   {
+    "col": "from_site",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "to_site",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "vehicle_no",
+    "type": "character varying(50)",
+    "null": "NO"
+   },
+   {
+    "col": "remark",
+    "type": "text",
+    "null": "NO"
+   },
+   {
+    "col": "reason_code",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "status",
+    "type": "character varying(20)",
+    "null": "YES"
+   },
+   {
+    "col": "request_id",
+    "type": "integer",
+    "null": "YES"
+   },
+   {
+    "col": "created_by",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "created_ts",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "approved_by",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "approved_ts",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "updated_ts",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "has_variance",
+    "type": "boolean",
+    "null": "YES"
+   },
+   {
+    "col": "driver_name",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "from_cold_unit",
+    "type": "character varying(50)",
+    "null": "YES"
+   },
+   {
+    "col": "unallocated_boxes",
+    "type": "integer",
+    "null": "YES"
+   }
+  ],
+  "interunit_transfers_lines": [
+   {
+    "col": "id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "header_id",
+    "type": "integer",
+    "null": "NO"
+   },
+   {
+    "col": "rm_pm_fg_type",
+    "type": "character varying(10)",
+    "null": "NO"
+   },
+   {
+    "col": "item_category",
+    "type": "character varying(255)",
+    "null": "NO"
+   },
+   {
+    "col": "sub_category",
+    "type": "character varying(255)",
+    "null": "NO"
+   },
+   {
+    "col": "item_desc_raw",
+    "type": "character varying(500)",
+    "null": "NO"
+   },
+   {
+    "col": "item_id",
+    "type": "integer",
+    "null": "YES"
+   },
+   {
+    "col": "hsn_code",
+    "type": "character varying(50)",
+    "null": "YES"
+   },
+   {
+    "col": "pack_size",
+    "type": "numeric",
+    "null": "NO"
+   },
+   {
+    "col": "unit_pack_size",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "qty",
+    "type": "integer",
+    "null": "YES"
+   },
+   {
+    "col": "uom",
+    "type": "character varying(20)",
+    "null": "YES"
+   },
+   {
+    "col": "net_weight",
+    "type": "numeric",
+    "null": "NO"
+   },
+   {
+    "col": "total_weight",
+    "type": "numeric",
+    "null": "NO"
+   },
+   {
+    "col": "batch_number",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "lot_number",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "created_at",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "updated_at",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "storage_location",
+    "type": "character varying(255)",
+    "null": "YES"
+   }
+  ],
+  "pending_transfer_stock": [
+   {
+    "col": "id",
+    "type": "bigint",
+    "null": "NO"
+   },
+   {
+    "col": "transfer_type",
+    "type": "character varying(20)",
+    "null": "NO"
+   },
+   {
+    "col": "transfer_out_id",
+    "type": "bigint",
+    "null": "NO"
+   },
+   {
+    "col": "transfer_out_challan_no",
+    "type": "character varying(50)",
+    "null": "NO"
+   },
+   {
+    "col": "box_id",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "transaction_no",
+    "type": "character varying(50)",
+    "null": "NO"
+   },
+   {
+    "col": "from_company",
+    "type": "character varying(10)",
+    "null": "NO"
+   },
+   {
+    "col": "to_company",
+    "type": "character varying(10)",
+    "null": "NO"
+   },
+   {
+    "col": "from_site",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "to_site",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "from_storage_type",
+    "type": "character varying(20)",
+    "null": "NO"
+   },
+   {
+    "col": "to_storage_type",
+    "type": "character varying(20)",
+    "null": "NO"
+   },
+   {
+    "col": "source_table",
+    "type": "character varying(50)",
+    "null": "NO"
+   },
+   {
+    "col": "source_row_id",
+    "type": "bigint",
+    "null": "YES"
+   },
+   {
+    "col": "destination_table",
+    "type": "character varying(50)",
+    "null": "NO"
+   },
+   {
+    "col": "item_description",
+    "type": "character varying(255)",
+    "null": "NO"
+   },
+   {
+    "col": "lot_no",
+    "type": "character varying(50)",
+    "null": "YES"
+   },
+   {
+    "col": "batch_number",
+    "type": "character varying(50)",
+    "null": "YES"
+   },
+   {
+    "col": "weight_kg",
+    "type": "numeric",
+    "null": "NO"
+   },
+   {
+    "col": "no_of_cartons",
+    "type": "integer",
+    "null": "YES"
+   },
+   {
+    "col": "cold_storage_data",
+    "type": "jsonb",
+    "null": "YES"
+   },
+   {
+    "col": "rm_pm_fg_type",
+    "type": "character varying(10)",
+    "null": "YES"
+   },
+   {
+    "col": "item_category",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "sub_category",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "pack_size",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "unit_pack_size",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "qty",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "uom",
+    "type": "character varying(20)",
+    "null": "YES"
+   },
+   {
+    "col": "net_weight",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "gross_weight",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "total_weight",
+    "type": "numeric",
+    "null": "YES"
+   },
+   {
+    "col": "article",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "status",
+    "type": "character varying(20)",
+    "null": "NO"
+   },
+   {
+    "col": "cancel_reason",
+    "type": "character varying(255)",
+    "null": "YES"
+   },
+   {
+    "col": "cancelled_at",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "dispatched_at",
+    "type": "timestamp without time zone",
+    "null": "NO"
+   },
+   {
+    "col": "dispatched_by",
+    "type": "character varying(100)",
+    "null": "NO"
+   },
+   {
+    "col": "created_at",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "updated_at",
+    "type": "timestamp without time zone",
+    "null": "YES"
+   },
+   {
+    "col": "original_box_id",
+    "type": "character varying(100)",
+    "null": "YES"
+   },
+   {
+    "col": "reconciled",
+    "type": "boolean",
+    "null": "YES"
+   }
+  ]
+ },
+ "constraints": {
+  "cfpl_cold_stocks": [
+   {
+    "type": "PRIMARY KEY",
+    "col": "id",
+    "ref": null
+   }
+  ],
+  "interunit_transfer_boxes": [
+   {
+    "type": "FOREIGN KEY",
+    "col": "transfer_line_id",
+    "ref": "interunit_transfers_lines.id"
+   },
+   {
+    "type": "FOREIGN KEY",
+    "col": "header_id",
+    "ref": "interunit_transfers_header.id"
+   },
+   {
+    "type": "PRIMARY KEY",
+    "col": "id",
+    "ref": null
+   }
+  ],
+  "interunit_transfer_in_boxes": [
+   {
+    "type": "FOREIGN KEY",
+    "col": "header_id",
+    "ref": "interunit_transfer_in_header.id"
+   },
+   {
+    "type": "PRIMARY KEY",
+    "col": "id",
+    "ref": null
+   },
+   {
+    "type": "FOREIGN KEY",
+    "col": "transfer_out_box_id",
+    "ref": "interunit_transfer_boxes.id"
+   }
+  ],
+  "interunit_transfer_in_header": [
+   {
+    "type": "PRIMARY KEY",
+    "col": "id",
+    "ref": null
+   },
+   {
+    "type": "FOREIGN KEY",
+    "col": "transfer_out_id",
+    "ref": "interunit_transfers_header.id"
+   },
+   {
+    "type": "UNIQUE",
+    "col": "grn_number",
+    "ref": null
+   }
+  ],
+  "interunit_transfer_requests": [
+   {
+    "type": "UNIQUE",
+    "col": "request_no",
+    "ref": null
+   },
+   {
+    "type": "PRIMARY KEY",
+    "col": "id",
+    "ref": null
+   }
+  ],
+  "interunit_transfers_header": [
+   {
+    "type": "UNIQUE",
+    "col": "challan_no",
+    "ref": null
+   },
+   {
+    "type": "FOREIGN KEY",
+    "col": "request_id",
+    "ref": "interunit_transfer_requests.id"
+   },
+   {
+    "type": "PRIMARY KEY",
+    "col": "id",
+    "ref": null
+   }
+  ],
+  "interunit_transfers_lines": [
+   {
+    "type": "FOREIGN KEY",
+    "col": "header_id",
+    "ref": "interunit_transfers_header.id"
+   },
+   {
+    "type": "PRIMARY KEY",
+    "col": "id",
+    "ref": null
+   }
+  ],
+  "pending_transfer_stock": [
+   {
+    "type": "UNIQUE",
+    "col": "transaction_no",
+    "ref": null
+   },
+   {
+    "type": "UNIQUE",
+    "col": "box_id",
+    "ref": null
+   },
+   {
+    "type": "PRIMARY KEY",
+    "col": "id",
+    "ref": null
+   }
+  ]
+ },
+ "counts": {
+  "interunit_transfer_requests": 12,
+  "interunit_transfers_header": 452,
+  "interunit_transfers_lines": 35457,
+  "interunit_transfer_boxes": 14362,
+  "pending_transfer_stock": 5422,
+  "interunit_transfer_in_header": 409,
+  "interunit_transfer_in_boxes": 27571,
+  "cfpl_cold_stocks": 34921
+ }
+}

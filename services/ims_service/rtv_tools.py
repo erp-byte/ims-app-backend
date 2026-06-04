@@ -140,6 +140,29 @@ def _fetch_boxes(db: Session, tables: dict, header_id: int) -> list:
 # ══════════════════════════════════════════════
 
 
+def set_rtv_status_via_email_action(
+    company: Company, rtv_db_id: int, new_status: str, actor_email: str, db: Session
+) -> dict:
+    """Set the header status (Hold/Rejected) and record the actor. For magic-link email actions."""
+    tables = rtv_table_names(company)
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    row = db.execute(
+        text(f"""
+            UPDATE {tables['header']}
+            SET status = :status,
+                approved_by = :actor,
+                approved_at = :ts,
+                updated_at = NOW()
+            WHERE id = :hid
+            RETURNING id, rtv_id, status
+        """),
+        {"status": new_status, "actor": actor_email, "ts": now, "hid": rtv_db_id},
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "RTV not found")
+    return {"id": row.id, "rtv_id": row.rtv_id, "status": row.status}
+
+
 def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
     tables = rtv_table_names(data.company)
     rtv_id = _generate_rtv_id()

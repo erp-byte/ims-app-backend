@@ -9,15 +9,22 @@ Rules:
 Run with DRY_RUN=True first to preview, then set DRY_RUN=False to commit.
 """
 
+import os
 import psycopg2
 import json
 from datetime import datetime
 
-DRY_RUN = False  # set to False to actually commit
+# SAFE BY DEFAULT: dry-run unless RECONCILE_APPLY=true is set explicitly in the env.
+DRY_RUN = os.environ.get("RECONCILE_APPLY", "").lower() != "true"
 
+# Credentials come from the environment — never hardcode prod secrets in the repo.
+#   export WMS_DB_HOST=... WMS_DB_NAME=... WMS_DB_USER=... WMS_DB_PASSWORD=...
 conn = psycopg2.connect(
-    host='wms-postgres-db.cpis084golp7.ap-south-1.rds.amazonaws.com',
-    port=5432, dbname='warehouse_db', user='wmsadmin', password='Candorfoods'
+    host=os.environ["WMS_DB_HOST"],
+    port=int(os.environ.get("WMS_DB_PORT", "5432")),
+    dbname=os.environ["WMS_DB_NAME"],
+    user=os.environ["WMS_DB_USER"],
+    password=os.environ["WMS_DB_PASSWORD"],
 )
 cur = conn.cursor()
 

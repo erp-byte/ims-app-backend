@@ -622,6 +622,17 @@ def _ensure_inner_cold_transfer_table(db: Session):
             END IF;
         END $$;
     """))
+    db.execute(text("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'inner_cold_transfer' AND column_name = 'old_storage_location'
+            ) THEN
+                ALTER TABLE inner_cold_transfer ADD COLUMN old_storage_location VARCHAR(255);
+            END IF;
+        END $$;
+    """))
     db.commit()
 
 
@@ -635,6 +646,69 @@ def _resolve_record_table(record_id: int, db: Session) -> Optional[str]:
         if row:
             return tbl
     return None
+
+
+def reverse_inner_transfer_line(challan_no: str, audit_id: int, db: Session,
+                                reverse_location: Optional[str] = None) -> dict:
+    """Reverse one Inner Cold Transfer line: flip the relabeled cold_stocks rows back to
+    the original lot (and original storage_location), then delete the audit row so the
+    freed lot reappears in Search and can be re-added. box_id/transaction_no on the rows
+    are preserved (the relabel never changed them) — except rows produced by an old split,
+    which carry NULL ids (a known legacy gap)."""
+    _ensure_inner_cold_transfer_table(db)
+    audit = db.execute(
+        text("SELECT * FROM inner_cold_transfer WHERE id = :id AND challan_no = :c"),
+        {"id": audit_id, "c": challan_no},
+    ).fetchone()
+    if not audit:
+        return {"status": "already_reversed", "reversed_rows": 0}
+
+    primary = _resolve_record_table(audit.stock_record_id, db)
+    tables = [primary] if primary else ["cfpl_cold_stocks", "cdpl_cold_stocks"]
+    target_loc = reverse_location or getattr(audit, "old_storage_location", None)
+    qty = int(audit.quantity or 0)
+    reversed_rows = 0
+    for tbl in tables:
+        if reversed_rows >= qty:
+            break
+        if not tbl or not db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{tbl}"}).scalar():
+            continue
+        rows = db.execute(
+            text(f"""
+                SELECT id FROM {tbl}
+                WHERE lot_no = :newlot AND item_description = :desc
+                ORDER BY id ASC LIMIT :n
+            """),
+            {"newlot": audit.new_lot_number, "desc": audit.item_description,
+             "n": max(qty - reversed_rows, 0)},
+        ).fetchall()
+        for r in rows:
+            if target_loc:
+                db.execute(text(f"UPDATE {tbl} SET lot_no = :old, storage_location = :loc WHERE id = :rid"),
+                           {"old": audit.old_lot_number, "loc": target_loc, "rid": r.id})
+            else:
+                db.execute(text(f"UPDATE {tbl} SET lot_no = :old WHERE id = :rid"),
+                           {"old": audit.old_lot_number, "rid": r.id})
+            reversed_rows += 1
+
+    db.execute(text("DELETE FROM inner_cold_transfer WHERE id = :id"), {"id": audit_id})
+    db.commit()
+    logger.info("ICT_REVERSE: challan=%s audit=%s lot %s->%s rows=%s loc=%s",
+                challan_no, audit_id, audit.new_lot_number, audit.old_lot_number, reversed_rows, target_loc)
+    return {"status": "reversed", "reversed_rows": reversed_rows,
+            "freed_lot": audit.old_lot_number, "freed_location": target_loc}
+
+
+@router.delete("/inner-transfer/{challan_no}/line/{audit_id}")
+def reverse_inner_transfer_line_endpoint(
+    challan_no: str,
+    audit_id: int,
+    reverse_location: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Reverse (remove) one saved Inner Cold Transfer line — flips its boxes back to the
+    original lot/location so the freed lot reappears in Search."""
+    return reverse_inner_transfer_line(challan_no, audit_id, db, reverse_location=reverse_location)
 
 
 @router.post("/inner-transfer")
@@ -832,11 +906,13 @@ def inner_cold_transfer(payload: InnerTransferPayload, db: Session = Depends(get
                     INSERT INTO inner_cold_transfer
                         (challan_no, transfer_date, from_warehouse, reason_code, remark,
                          stock_record_id, item_category, item_description, net_weight_kg,
-                         quantity, old_lot_number, new_lot_number, new_storage_location, transfer_type)
+                         quantity, old_lot_number, new_lot_number, new_storage_location,
+                         old_storage_location, transfer_type)
                     VALUES
                         (:challan_no, :transfer_date, :from_warehouse, :reason_code, :remark,
                          :stock_record_id, :item_category, :item_description, :net_weight_kg,
-                         :quantity, :old_lot_number, :new_lot_number, :new_storage_location, :transfer_type)
+                         :quantity, :old_lot_number, :new_lot_number, :new_storage_location,
+                         :old_storage_location, :transfer_type)
                 """),
                 {
                     "challan_no": payload.header.challan_no,
@@ -852,6 +928,7 @@ def inner_cold_transfer(payload: InnerTransferPayload, db: Session = Depends(get
                     "old_lot_number": line.old_lot_number,
                     "new_lot_number": line.new_lot_number,
                     "new_storage_location": new_location,
+                    "old_storage_location": ref_row.storage_location,
                     "transfer_type": payload.header.transfer_type or "INNER_COLD",
                 },
             )

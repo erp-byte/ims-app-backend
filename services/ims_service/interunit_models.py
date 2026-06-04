@@ -318,6 +318,25 @@ class TransferInBoxCreate(BaseModel):
     issue: Optional[dict] = None  # JSON: {actual_qty, actual_total_weight, remarks}
 
 
+class TransferInBoxEdit(BaseModel):
+    """One box's editable fields for the privileged 'edit receipt' action."""
+    box_id: str
+    article: Optional[str] = None
+    batch_number: Optional[str] = None
+    lot_number: Optional[str] = None
+    net_weight: Optional[float] = None
+    gross_weight: Optional[float] = None
+
+
+class TransferInEdit(BaseModel):
+    """Full-receipt edit payload (header fields + per-box fields)."""
+    grn_number: Optional[str] = None
+    receiving_warehouse: Optional[str] = None
+    box_condition: Optional[str] = None
+    condition_remarks: Optional[str] = None
+    boxes: List[TransferInBoxEdit] = Field(default_factory=list)
+
+
 class ColdStorageBoxDetail(BaseModel):
     box_id: Optional[str] = None
     transaction_no: Optional[str] = None

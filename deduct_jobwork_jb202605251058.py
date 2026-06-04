@@ -7,14 +7,13 @@ so its 300 boxes are still sitting in cold_stocks and need to be removed.
 Run with DRY_RUN=True first to preview, then set DRY_RUN=False to commit.
 """
 
+import os
 import psycopg2
 
 DRY_RUN = False  # set to False to actually commit
 
-conn = psycopg2.connect(
-    host='wms-postgres-db.cpis084golp7.ap-south-1.rds.amazonaws.com',
-    port=5432, dbname='warehouse_db', user='wmsadmin', password='Candorfoods'
-)
+# DB credentials come from the DATABASE_URL env var (see .env) — never hardcode them.
+conn = psycopg2.connect(os.environ["DATABASE_URL"])
 cur = conn.cursor()
 
 HEADER_ID = 35

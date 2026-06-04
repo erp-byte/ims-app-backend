@@ -14,6 +14,16 @@ class Settings(BaseSettings):
     SMTP_PORT: int = 587
     SMTP_EMAIL: str = ""
     SMTP_APP_PASSWORD: str = ""
+    IMAP_HOST: str = "imap.gmail.com"
+    IMAP_PORT: int = 993
+    RTV_EMAIL_APPROVAL_ENABLED: bool = False
+    RTV_EMAIL_APPROVAL_DRY_RUN: bool = False
+    RTV_EMAIL_POLL_MINUTES: int = 3
+    # Comma-separated emails allowed to approve ANY RTV (admin/test override).
+    RTV_EMAIL_EXTRA_APPROVERS: str = ""
+    # Public base URL used for magic-link approval buttons in emails.
+    APP_BASE_URL: str = "https://new-app-backend-and-ims.onrender.com"
+    RTV_ACTION_TOKEN_TTL_DAYS: int = 14
     IMS_JWT_SECRET: str = ""
     IMS_JWT_ALGORITHM: str = "HS256"
     IMS_JWT_EXPIRATION_HOURS: int = 24

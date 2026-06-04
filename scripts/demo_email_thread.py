@@ -1,6 +1,7 @@
 """Demo: sends 3 threaded JWO emails simulating the full new email design.
 Run from backend/: python scripts/demo_email_thread.py
 """
+import os
 import smtplib
 import time
 from email.message import EmailMessage
@@ -8,8 +9,8 @@ from datetime import datetime
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
-SMTP_EMAIL = "erp@candorfoods.in"
-SMTP_PASSWORD = "ewstvhsyyfimclbj"
+SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "erp@candorfoods.in")
+SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]  # from .env — never hardcode credentials
 
 DEMO_TO = "b.hrithik@candorfoods.in"
 DEMO_CC = ["ai1@candorfoods.in", "ai2@candorfoods.in"]

@@ -12,11 +12,12 @@ from services.ims_service.interunit_models import (
     PendingTransferInCreate, PendingBoxAcknowledge, FinalizeTransferIn,
     CategorialSearchItem, CategorialSearchResponse,
     CategorialDropdownOptions, CategorialDropdownMeta, CategorialDropdownResponse,
-    BoxCreate,
+    BoxCreate, TransferInEdit,
 )
 from services.ims_service.pending_stock_tools import (
     park_in_pending, park_lines_in_pending, pick_from_pending, unpick_to_pending,
-    restore_to_source, _is_cold_site,
+    restore_to_source, reconcile_transfer_to_order, _is_cold_site, _table_exists,
+    count_remaining_in_transit,
 )
 
 logger = get_logger("ims.interunit")
@@ -765,6 +766,55 @@ def _auto_derive_warehouse_boxes(db: Session, from_site: str, lines: list) -> li
 # -- Create transfer --
 
 
+def _validate_cold_boxes_in_stock(db, from_site, boxes):
+    """For COLD-source transfers, reject any box that exists in NEITHER cold_stocks NOR
+    pending_transfer_stock (In Transit) by (box_id, transaction_no) — i.e. an unknown or
+    typo box id. A box already parked In Transit is accepted, so this stays SAFE for
+    edits of an already-dispatched transfer (update_transfer) where the boxes have
+    legitimately left cold. Existence is checked WITHOUT lot to avoid false positives
+    from lot-label drift.
+    """
+    if not _is_cold_site(from_site):
+        return
+    missing = []
+    for box in (boxes or []):
+        bid = (getattr(box, "box_id", None) or "").strip()
+        tno = (getattr(box, "transaction_no", None) or "").strip()
+        if not bid or not tno or tno == "DIRECT":
+            continue
+        found = False
+        for table in ("cfpl_cold_stocks", "cdpl_cold_stocks"):
+            if not _table_exists(db, table):
+                continue
+            if db.execute(
+                text(f"SELECT 1 FROM {table} WHERE box_id = :b AND transaction_no = :t LIMIT 1"),
+                {"b": bid, "t": tno},
+            ).fetchone():
+                found = True
+                break
+        if not found:
+            # Accept a box already parked In Transit (a known dispatched box being
+            # re-validated during an edit of its own transfer). Keeps the guard safe
+            # for update_transfer; truly unknown/typo box ids are still rejected.
+            if db.execute(
+                text("SELECT 1 FROM pending_transfer_stock WHERE box_id = :b AND transaction_no = :t AND status = 'In Transit' LIMIT 1"),
+                {"b": bid, "t": tno},
+            ).fetchone():
+                found = True
+        if not found:
+            missing.append(bid)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{len(missing)} box(es) not found in cold stock or in transit "
+                f"(unknown/typo box id): {', '.join(missing[:10])}"
+                f"{'…' if len(missing) > 10 else ''}. Re-add the cold-storage item so "
+                "live FIFO boxes are picked."
+            ),
+        )
+
+
 def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
     stock_trf_date = _convert_date(data.header.stock_trf_date)
     challan_no = data.header.challan_no or _generate_challan_no()
@@ -858,6 +908,12 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
         ).fetchone()
         lines.append(row)
 
+    # NOTE: cold->warehouse has no real box scanning (the frontend "scanned boxes" are an
+    # artifact), so ordered qty == shipped qty. The order (lot+qty) is authoritative and
+    # reconcile_transfer_to_order corrects pending to match it (deduct the ordered lot,
+    # restore wrong-lot/excess rows). No scan-based block here — there is nothing real to
+    # block against.
+
     # Plan C: auto-derive boxes for warehouse-source transfers when the frontend
     # didn't scan any. Best-effort — if the stock is not box-tracked (no matching
     # boxes), ambiguous, or insufficient, we DO NOT block the save: the transfer
@@ -896,6 +952,9 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
                         ),
                     )
                 seen_keys.add(key)
+
+        # Cold-source guard: reject boxes no longer in cold stock (blocks double-dispatch).
+        _validate_cold_boxes_in_stock(db, data.header.from_warehouse, data.boxes)
 
         # Build article-to-line-id lookup for correct box-to-line association
         line_id_by_article: dict = {}
@@ -1018,6 +1077,10 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
             """),
             {"now": datetime.now(), "rid": data.request_id},
         )
+
+    # Reconcile pending_transfer_stock up to the ordered qty (fills any box shortfall
+    # BY LOT from the main sheet) so every pending surface matches the order.
+    reconcile_transfer_to_order(header_id, db, dry_run=False)
 
     # Re-fetch header for latest status
     header = db.execute(
@@ -1251,7 +1314,7 @@ def get_transfer(transfer_id: int, db: Session) -> dict:
     # lot — clean and unambiguous, unlike the per-box JSONB which can carry
     # noise from prior transfers that shared the same box_id.
     try:
-        lot_numbers = sorted({(b.get("lot_number") or "").strip() for b in result["boxes"]} - {""})
+        lot_numbers = sorted({(x.get("lot_number") or "").strip() for x in (result["boxes"] + result["lines"])} - {""})
         lot_origin_unit: dict[str, str] = {}
         if lot_numbers:
             rows = db.execute(
@@ -1290,11 +1353,12 @@ def get_transfer(transfer_id: int, db: Session) -> dict:
             ).fetchall()
             for r in rows:
                 lot_origin_unit[r.lot_no] = r.unit
-        # Attach to each box so the frontend can group by (article, lot) and
-        # render a single per-lot chip without further aggregation.
-        for b in result["boxes"]:
-            lot = (b.get("lot_number") or "").strip()
-            b["lot_origin_unit"] = lot_origin_unit.get(lot)
+        # Attach to each box AND line so the frontend renders a single per-lot
+        # "From" chip consistently (boxes via groupBoxesByItem, lines via
+        # groupLinesByItem) — the unified hover style.
+        for x in (result["boxes"] + result["lines"]):
+            lot = (x.get("lot_number") or "").strip()
+            x["lot_origin_unit"] = lot_origin_unit.get(lot)
     except Exception as e:
         logger.warning("LOT_ORIGIN: per-lot dominant unit lookup failed (transfer_id=%s): %s", transfer_id, e)
 
@@ -1454,6 +1518,12 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
         ).fetchone()
         lines.append(row)
 
+    # NOTE: cold->warehouse has no real box scanning (the frontend "scanned boxes" are an
+    # artifact), so ordered qty == shipped qty. The order (lot+qty) is authoritative and
+    # reconcile_transfer_to_order corrects pending to match it (deduct the ordered lot,
+    # restore wrong-lot/excess rows). No scan-based block here — there is nothing real to
+    # block against.
+
     # Plan C: auto-derive boxes for warehouse-source transfers when the frontend
     # didn't scan any. Best-effort — if the stock is not box-tracked (no matching
     # boxes), ambiguous, or insufficient, we DO NOT block the save: the transfer
@@ -1492,6 +1562,9 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
                         ),
                     )
                 seen_keys.add(key)
+
+        # Cold-source guard: reject boxes no longer in cold stock (blocks double-dispatch).
+        _validate_cold_boxes_in_stock(db, data.header.from_warehouse, data.boxes)
 
         # Build article-to-line-id lookup for correct box-to-line association
         line_id_by_article: dict = {}
@@ -1603,6 +1676,19 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
             """),
             {"status": transfer_status, "hid": header_id},
         )
+
+    # Reconcile pending_transfer_stock up to the ordered qty after the edit so the
+    # in-transit ledger follows the changed lines/boxes (fills shortfall BY LOT).
+    reconcile_transfer_to_order(header_id, db, dry_run=False)
+
+    # Stamp a GENUINE edit marker (reconcile already ensured the column exists).
+    # updated_ts is auto-managed (default now() + a BEFORE-UPDATE trigger), so it moves
+    # on every create-reconcile / receive / sync and can't distinguish a real edit.
+    # edited_at is written ONLY here, so the pending list's "Edited" badge is honest.
+    db.execute(
+        text("UPDATE interunit_transfers_header SET edited_at = :now WHERE id = :hid"),
+        {"now": datetime.now(), "hid": header_id},
+    )
 
     # Re-fetch header for latest status
     header = db.execute(
@@ -1794,7 +1880,7 @@ def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
             VALUES
                 (:transfer_out_id, :transfer_out_no, :grn_number, CURRENT_TIMESTAMP,
                  :receiving_warehouse, :received_by, CURRENT_TIMESTAMP,
-                 :box_condition, :condition_remarks, 'Received')
+                 :box_condition, :condition_remarks, 'Pending')
             RETURNING id, transfer_out_id, transfer_out_no, grn_number, grn_date,
                       receiving_warehouse, received_by, received_at,
                       box_condition, condition_remarks, status,
@@ -1813,8 +1899,11 @@ def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
 
     header_id = header.id
 
-    # Move pending_transfer_stock rows into destination tables.
-    picked = pick_from_pending(transfer_out_id=data.transfer_out_id, db=db)
+    # Bridge invariant: pick ONLY the boxes scanned/received now; the rest stay
+    # In Transit so a partial receipt can't leak them.
+    acknowledged_keys = {((b.box_id or ""), (b.transaction_no or "")) for b in data.scanned_boxes}
+    picked = pick_from_pending(transfer_out_id=data.transfer_out_id, db=db,
+                               acknowledged_keys=acknowledged_keys)
 
     # Legacy fallback (transfers dispatched before pending_transfer_stock was wired in)
     if picked == 0 and data.cold_storage_items:
@@ -1855,19 +1944,27 @@ def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
         ).fetchone()
         boxes.append(box_row)
 
-    # Update Transfer OUT status to 'Received'
-    db.execute(
-        text("""
-            UPDATE interunit_transfers_header
-            SET status = 'Received'
-            WHERE id = :toid
-        """),
-        {"toid": data.transfer_out_id},
-    )
+    # Bridge invariant completion gate: flip to 'Received' only when no real box
+    # remains In Transit. Otherwise the IN header stays 'Pending' and the Transfer
+    # OUT stays 'Dispatch', so the unreceived boxes keep showing on the bridge.
+    remaining = count_remaining_in_transit(data.transfer_out_id, db)
+    final_status = header.status
+    if remaining == 0:
+        db.execute(
+            text("UPDATE interunit_transfer_in_header SET status = 'Received', received_at = CURRENT_TIMESTAMP WHERE id = :hid"),
+            {"hid": header_id},
+        )
+        db.execute(
+            text("UPDATE interunit_transfers_header SET status = 'Received' WHERE id = :toid"),
+            {"toid": data.transfer_out_id},
+        )
+        final_status = "Received"
 
     result = _map_transfer_in_header(header)
     result["boxes"] = [_map_transfer_in_box(b) for b in boxes]
     result["total_boxes_scanned"] = len(boxes)
+    result["status"] = final_status
+    result["remaining_in_transit"] = remaining
     return result
 
 
@@ -2058,7 +2155,7 @@ def create_pending_transfer_in(data: PendingTransferInCreate, db: Session) -> di
     return result
 
 
-def acknowledge_pending_box(header_id: int, data: PendingBoxAcknowledge, db: Session) -> dict:
+def acknowledge_pending_box(header_id: int, data: PendingBoxAcknowledge, db: Session, autofinalize: bool = True) -> dict:
     """UPSERT a single box/article into a pending transfer-in.
 
     Transparently runs STBR (Scan-Time Box ID Reconciliation) before the
@@ -2214,6 +2311,10 @@ def acknowledge_pending_box(header_id: int, data: PendingBoxAcknowledge, db: Ses
         "siblings": stbr_result.get("siblings", []),
         "reconciliation_id": stbr_result.get("reconciliation_id"),
     }
+    # Auto-finalize once every in-transit box has been acknowledged (single-box callers).
+    # Batch passes autofinalize=False and finalizes once after its whole loop instead.
+    if autofinalize and _autofinalize_if_complete(db, header_id):
+        result["auto_finalized"] = True
     return result
 
 
@@ -2253,7 +2354,7 @@ def acknowledge_pending_boxes_batch(header_id: int, boxes: list, db: Session) ->
     conflicts = []
     for box_data in boxes:
         try:
-            ack = acknowledge_pending_box(header_id, box_data, db)
+            ack = acknowledge_pending_box(header_id, box_data, db, autofinalize=False)
             results.append(ack)
         except HTTPException as e:
             conflicts.append({
@@ -2262,12 +2363,85 @@ def acknowledge_pending_boxes_batch(header_id: int, boxes: list, db: Session) ->
                 "status_code": e.status_code,
                 "detail": e.detail,
             })
+    # Auto-finalize once, after the whole batch, if acknowledgements now cover the
+    # in-transit set (so a completed receipt no longer lingers as 'Partial').
+    auto_finalized = _autofinalize_if_complete(db, header_id)
     return {
         "success": len(conflicts) == 0,
         "count": len(results),
         "boxes": results,
         "conflicts": conflicts,
+        "auto_finalized": auto_finalized,
     }
+
+
+def close_transfer_in_with_shortage(header_id: int, shortage_reason, closed_by, db: Session) -> dict:
+    """Explicitly close a Pending transfer-in that has a genuine shortage.
+
+    Picks the boxes actually acknowledged, then WRITES OFF the remaining in-transit
+    boxes (they won't be received) and marks both headers 'Received' with a shortage
+    note. Use only when the missing boxes are truly not coming — the bridge invariant
+    otherwise correctly keeps the transfer 'Pending'.
+    """
+    header = db.execute(
+        text("SELECT id, status, transfer_out_id, transfer_out_no FROM interunit_transfer_in_header WHERE id = :hid"),
+        {"hid": header_id},
+    ).fetchone()
+    if not header:
+        raise HTTPException(404, "Transfer IN header not found")
+    if header.status == "Received":
+        raise HTTPException(400, "Transfer IN is already Received")
+    if header.status != "Pending":
+        raise HTTPException(400, "Transfer IN is not in Pending status")
+
+    # Pick the boxes actually acknowledged on this GRN.
+    ack_rows = db.execute(
+        text("SELECT box_id, transaction_no FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+        {"hid": header_id},
+    ).fetchall()
+    acknowledged_keys = {((r.box_id or ""), (r.transaction_no or "")) for r in ack_rows}
+    pick_from_pending(transfer_out_id=header.transfer_out_id, db=db, acknowledged_keys=acknowledged_keys)
+
+    # Count the real shortage, then write off ALL remaining in-transit rows for the transfer.
+    shortage = count_remaining_in_transit(header.transfer_out_id, db)
+    written_off = db.execute(
+        text("DELETE FROM pending_transfer_stock WHERE transfer_out_id = :tid AND status = 'In Transit' RETURNING id"),
+        {"tid": header.transfer_out_id},
+    ).fetchall()
+
+    note = f"Closed with shortage: {shortage} box(es) written off by {closed_by or 'unknown'}."
+    if shortage_reason:
+        note += f" Reason: {shortage_reason}"
+    cur = db.execute(
+        text("SELECT condition_remarks FROM interunit_transfer_in_header WHERE id = :hid"),
+        {"hid": header_id},
+    ).scalar()
+    new_remarks = f"{cur} | {note}" if cur else note
+
+    updated = db.execute(
+        text("""
+            UPDATE interunit_transfer_in_header
+            SET status = 'Received', received_at = CURRENT_TIMESTAMP,
+                condition_remarks = :rem, updated_at = CURRENT_TIMESTAMP
+            WHERE id = :hid
+            RETURNING id, transfer_out_id, transfer_out_no, grn_number, grn_date,
+                      receiving_warehouse, received_by, received_at,
+                      box_condition, condition_remarks, status, created_at, updated_at
+        """),
+        {"hid": header_id, "rem": new_remarks},
+    ).fetchone()
+    db.execute(
+        text("UPDATE interunit_transfers_header SET status = 'Received' WHERE id = :toid"),
+        {"toid": header.transfer_out_id},
+    )
+
+    result = _map_transfer_in_header(updated)
+    result["boxes"] = _fetch_transfer_in_boxes(db, header_id)
+    result["written_off"] = len(written_off)
+    result["shortage"] = shortage
+    logger.info("CLOSE_SHORTAGE: GRN header=%s transfer_out=%s shortage=%s written_off=%s by=%s",
+                header_id, header.transfer_out_id, shortage, len(written_off), closed_by)
+    return result
 
 
 def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) -> dict:
@@ -2281,6 +2455,28 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
     ).fetchone()
     if not header:
         raise HTTPException(404, "Transfer IN header not found")
+    if header.status == "Received":
+        # Idempotent: already finalized. Also clear any stray In-Transit rows that
+        # appeared AFTER this header was marked Received (orphan-trap fix): pick the
+        # boxes recorded on this GRN so they don't linger forever on the bridge.
+        _ack = db.execute(
+            text("SELECT box_id, transaction_no FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+            {"hid": header_id},
+        ).fetchall()
+        if _ack:
+            pick_from_pending(transfer_out_id=header.transfer_out_id, db=db,
+                              acknowledged_keys={((r.box_id or ""), (r.transaction_no or "")) for r in _ack})
+        full = db.execute(
+            text("""SELECT id, transfer_out_id, transfer_out_no, grn_number, grn_date,
+                           receiving_warehouse, received_by, received_at, box_condition,
+                           condition_remarks, status, created_at, updated_at
+                    FROM interunit_transfer_in_header WHERE id = :hid"""),
+            {"hid": header_id},
+        ).fetchone()
+        result = _map_transfer_in_header(full)
+        result["boxes"] = _fetch_transfer_in_boxes(db, header_id)
+        result["already_finalized"] = True
+        return result
     if header.status != "Pending":
         raise HTTPException(400, "Transfer IN is not in Pending status")
 
@@ -2292,30 +2488,15 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
     if box_count == 0:
         raise HTTPException(400, "No boxes/articles acknowledged. Cannot finalize.")
 
-    # Update header to Received
-    updated = db.execute(
-        text("""
-            UPDATE interunit_transfer_in_header
-            SET status = 'Received',
-                received_at = CURRENT_TIMESTAMP,
-                box_condition = :box_condition,
-                condition_remarks = :condition_remarks,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = :hid
-            RETURNING id, transfer_out_id, transfer_out_no, grn_number, grn_date,
-                      receiving_warehouse, received_by, received_at,
-                      box_condition, condition_remarks, status,
-                      created_at, updated_at
-        """),
-        {
-            "hid": header_id,
-            "box_condition": data.box_condition,
-            "condition_remarks": data.condition_remarks,
-        },
-    ).fetchone()
-
-    # Move pending_transfer_stock rows into destination tables.
-    picked = pick_from_pending(transfer_out_id=header.transfer_out_id, db=db)
+    # Bridge invariant: pick ONLY the boxes acknowledged on this GRN; the rest stay
+    # In Transit. The transfer flips to 'Received' only when none remain.
+    ack_rows = db.execute(
+        text("SELECT box_id, transaction_no FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+        {"hid": header_id},
+    ).fetchall()
+    acknowledged_keys = {((r.box_id or ""), (r.transaction_no or "")) for r in ack_rows}
+    picked = pick_from_pending(transfer_out_id=header.transfer_out_id, db=db,
+                               acknowledged_keys=acknowledged_keys)
 
     # Legacy fallback (transfers dispatched before pending_transfer_stock was wired in)
     if picked == 0 and data.cold_storage_items:
@@ -2326,16 +2507,121 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
         to_site = tout.to_site if tout else None
         _insert_cold_storage_items(header_id, data.cold_storage_items, header.transfer_out_no, db, to_site=to_site)
 
-    # Update Transfer OUT status to 'Received'
-    db.execute(
-        text("UPDATE interunit_transfers_header SET status = 'Received' WHERE id = :toid"),
-        {"toid": header.transfer_out_id},
-    )
+    # Completion gate: 'Received' only when no real box remains In Transit.
+    remaining = count_remaining_in_transit(header.transfer_out_id, db)
+    if remaining == 0:
+        updated = db.execute(
+            text("""
+                UPDATE interunit_transfer_in_header
+                SET status = 'Received',
+                    received_at = CURRENT_TIMESTAMP,
+                    box_condition = :box_condition,
+                    condition_remarks = :condition_remarks,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :hid
+                RETURNING id, transfer_out_id, transfer_out_no, grn_number, grn_date,
+                          receiving_warehouse, received_by, received_at,
+                          box_condition, condition_remarks, status,
+                          created_at, updated_at
+            """),
+            {"hid": header_id, "box_condition": data.box_condition,
+             "condition_remarks": data.condition_remarks},
+        ).fetchone()
+        db.execute(
+            text("UPDATE interunit_transfers_header SET status = 'Received' WHERE id = :toid"),
+            {"toid": header.transfer_out_id},
+        )
+    else:
+        # Incomplete receipt — persist condition notes but stay 'Pending' so the
+        # unreceived boxes keep showing on the bridge (Transfer OUT stays 'Dispatch').
+        updated = db.execute(
+            text("""
+                UPDATE interunit_transfer_in_header
+                SET box_condition = :box_condition,
+                    condition_remarks = :condition_remarks,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :hid
+                RETURNING id, transfer_out_id, transfer_out_no, grn_number, grn_date,
+                          receiving_warehouse, received_by, received_at,
+                          box_condition, condition_remarks, status,
+                          created_at, updated_at
+            """),
+            {"hid": header_id, "box_condition": data.box_condition,
+             "condition_remarks": data.condition_remarks},
+        ).fetchone()
 
     result = _map_transfer_in_header(updated)
     result["boxes"] = _fetch_transfer_in_boxes(db, header_id)
     result["total_boxes_scanned"] = len(result["boxes"])
+    result["remaining_in_transit"] = remaining
     return result
+
+
+def _autofinalize_if_complete(db: Session, header_id: int) -> bool:
+    """Auto-finalize a Pending transfer-in once its acknowledged boxes cover every box
+    still in transit for the dispatch. Fixes the 'acknowledged but never finalized' gap
+    that left a fully-received transfer stuck in the Pending modal as 'Partial (GRN raised)'.
+    Returns True if it finalized. Caller owns the surrounding transaction/commit."""
+    h = db.execute(
+        text("SELECT id, status, transfer_out_id FROM interunit_transfer_in_header WHERE id = :hid"),
+        {"hid": header_id},
+    ).fetchone()
+    if not h or h.status != "Pending":
+        return False
+    acked = db.execute(
+        text("SELECT COUNT(*) FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+        {"hid": header_id},
+    ).scalar() or 0
+    in_transit = db.execute(
+        text("SELECT COUNT(*) FROM pending_transfer_stock "
+             "WHERE transfer_out_id = :tid AND status = 'In Transit'"),
+        {"tid": h.transfer_out_id},
+    ).scalar() or 0
+    if acked > 0 and in_transit > 0 and acked >= in_transit:
+        # SAVEPOINT-isolate the finalize: it does multiple writes (header->Received,
+        # pick_from_pending, transfer-out->Received). If any step fails, roll back ONLY
+        # the finalize so the acknowledgement that triggered it still commits — never
+        # leave a half-finalized header. The backlog sweep can retry later.
+        try:
+            with db.begin_nested():
+                finalize_transfer_in(header_id, FinalizeTransferIn(), db)
+            logger.info("AUTO-FINALIZE: GRN header=%s transfer_out=%s (acked %s >= in_transit %s)",
+                        header_id, h.transfer_out_id, acked, in_transit)
+            return True
+        except Exception:
+            logger.exception("AUTO-FINALIZE failed for GRN header=%s transfer_out=%s; "
+                             "acknowledgement preserved, finalize deferred to sweep",
+                             header_id, h.transfer_out_id)
+            return False
+    return False
+
+
+def finalize_complete_pending_grns(db: Session, dry_run: bool = False) -> dict:
+    """Backlog sweep: finalize every Pending transfer-in whose acknowledged boxes already
+    cover the in-transit set (the acknowledged-but-not-finalized backlog). Commits per GRN
+    on apply. Returns a summary; writes nothing when dry_run=True."""
+    rows = db.execute(text("""
+        SELECT tih.id AS grn_id, tih.transfer_out_id, tih.grn_number,
+               (SELECT COUNT(*) FROM interunit_transfer_in_boxes b WHERE b.header_id = tih.id) AS acked,
+               (SELECT COUNT(*) FROM pending_transfer_stock p
+                  WHERE p.transfer_out_id = tih.transfer_out_id AND p.status = 'In Transit') AS in_transit
+        FROM interunit_transfer_in_header tih
+        WHERE tih.status = 'Pending'
+        ORDER BY tih.id
+    """)).fetchall()
+    summary = {"pending_grns_scanned": len(rows), "finalized": [], "skipped": []}
+    for r in rows:
+        complete = r.acked > 0 and r.in_transit > 0 and r.acked >= r.in_transit
+        rec = {"grn_id": r.grn_id, "transfer_out_id": r.transfer_out_id,
+               "grn_number": r.grn_number, "acked": int(r.acked), "in_transit": int(r.in_transit)}
+        if complete:
+            summary["finalized"].append(rec)
+            if not dry_run:
+                finalize_transfer_in(r.grn_id, FinalizeTransferIn(), db)
+                db.commit()
+        else:
+            summary["skipped"].append(rec)
+    return summary
 
 
 def get_pending_by_transfer_out(transfer_out_id: int, db: Session) -> dict:
@@ -2539,9 +2825,292 @@ def get_transfer_in(transfer_in_id: int, db: Session) -> dict:
     return result
 
 
+# -- Edit transfer IN (privileged full-receipt edit) --
+
+TRANSFER_IN_EDIT_ALLOWED_EMAILS = {"b.hrithik@candorfoods.in"}
+
+
+def get_transfer_in_by_transfer_out(transfer_out_id: int, db: Session) -> dict:
+    """Fetch the transfer-in (header + boxes) for a transfer-out, ANY status.
+    Used to pre-fill the privileged edit form (the receive screen only holds the
+    transfer-out id). Returns the latest if more than one exists."""
+    row = db.execute(
+        text("""
+            SELECT h.id, h.transfer_out_id, h.transfer_out_no, h.grn_number,
+                   h.grn_date, h.receiving_warehouse, h.received_by, h.received_at,
+                   h.box_condition, h.condition_remarks, h.status,
+                   h.inward_transaction_no, h.created_at, h.updated_at,
+                   t.from_site AS from_warehouse
+            FROM interunit_transfer_in_header h
+            LEFT JOIN interunit_transfers_header t ON h.transfer_out_id = t.id
+            WHERE h.transfer_out_id = :toid
+            ORDER BY h.id DESC
+            LIMIT 1
+        """),
+        {"toid": transfer_out_id},
+    ).fetchone()
+    if not row:
+        return {"exists": False, "header": None}
+    header = _map_transfer_in_header(row)
+    header["boxes"] = _fetch_transfer_in_boxes(db, row.id)
+    header["total_boxes_scanned"] = len(header["boxes"])
+    return {"exists": True, "header": header}
+
+
+def edit_transfer_in(transfer_out_id: int, data: TransferInEdit, user_email: str, db: Session) -> dict:
+    """Privileged full-receipt edit. Updates the transfer-in header + boxes, and
+    keeps the two other copies in sync: the source transfer-out boxes
+    (interunit_transfer_boxes, via the transfer_out_box_id FK) and the destination
+    cold-storage stock (cfpl/cdpl_cold_stocks, keyed by box_id + transaction_no).
+    Per-field COALESCE means omitted (null) fields are left untouched; pass a value
+    (including an empty string) to change one. Gated to TRANSFER_IN_EDIT_ALLOWED_EMAILS.
+    """
+    if (user_email or "").strip().lower() not in TRANSFER_IN_EDIT_ALLOWED_EMAILS:
+        raise HTTPException(403, "You are not authorized to edit transfer-in records.")
+
+    # Only 'Received' receipts are editable here. A Pending receipt's stock still
+    # lives in pending_transfer_stock (not the destination), so editing it would
+    # desync; correct a Pending receipt on the receive screen before finalizing.
+    rows = db.execute(
+        text("""SELECT id, status, transfer_out_id, grn_number
+                FROM interunit_transfer_in_header
+                WHERE transfer_out_id = :toid AND status = 'Received'
+                ORDER BY id DESC"""),
+        {"toid": transfer_out_id},
+    ).fetchall()
+    if not rows:
+        raise HTTPException(404, "No 'Received' transfer-in found for this transfer (only received receipts can be edited).")
+    if len(rows) > 1:
+        raise HTTPException(409, "Multiple received transfer-ins exist for this transfer; resolve manually.")
+    header = rows[0]
+    header_id = header.id
+
+    # ── Header fields ── (GRN number is UNIQUE — re-check on change)
+    new_grn = data.grn_number.strip() if (data.grn_number and data.grn_number.strip()) else None
+    if new_grn and new_grn != (header.grn_number or ""):
+        clash = db.execute(
+            text("SELECT 1 FROM interunit_transfer_in_header WHERE grn_number = :g AND id != :hid LIMIT 1"),
+            {"g": new_grn, "hid": header_id},
+        ).fetchone()
+        if clash:
+            raise HTTPException(409, f"GRN number '{new_grn}' is already in use.")
+
+    db.execute(
+        text("""
+            UPDATE interunit_transfer_in_header SET
+                grn_number = COALESCE(:grn_number, grn_number),
+                receiving_warehouse = COALESCE(:receiving_warehouse, receiving_warehouse),
+                box_condition = COALESCE(:box_condition, box_condition),
+                condition_remarks = COALESCE(:condition_remarks, condition_remarks),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :hid
+        """),
+        {
+            "grn_number": new_grn,
+            "receiving_warehouse": data.receiving_warehouse,
+            "box_condition": data.box_condition,
+            "condition_remarks": data.condition_remarks,
+            "hid": header_id,
+        },
+    )
+
+    # Destination cold-stock tables that actually exist (for the stock sync).
+    cold_tables = [t for t in ("cfpl_cold_stocks", "cdpl_cold_stocks") if _table_exists(db, t)]
+
+    updated_boxes = 0
+    affected_line_ids: set = set()
+    for b in (data.boxes or []):
+        if not b.box_id:
+            continue
+        ex = db.execute(
+            text("""SELECT id, transfer_out_box_id, transaction_no
+                    FROM interunit_transfer_in_boxes
+                    WHERE header_id = :hid AND box_id = :bid"""),
+            {"hid": header_id, "bid": b.box_id},
+        ).fetchone()
+        if not ex:
+            continue
+        params = {
+            "article": b.article, "batch_number": b.batch_number,
+            "lot_number": b.lot_number, "net_weight": b.net_weight,
+            "gross_weight": b.gross_weight,
+        }
+
+        # 1) The transfer-in receipt box.
+        db.execute(
+            text("""
+                UPDATE interunit_transfer_in_boxes SET
+                    article = COALESCE(:article, article),
+                    batch_number = COALESCE(:batch_number, batch_number),
+                    lot_number = COALESCE(:lot_number, lot_number),
+                    net_weight = COALESCE(:net_weight, net_weight),
+                    gross_weight = COALESCE(:gross_weight, gross_weight),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :id
+            """),
+            {**params, "id": ex.id},
+        )
+
+        # 2) The source transfer-out box (singular table) via the FK link.
+        #    Capture its parent line so we can re-roll the line aggregates after.
+        if ex.transfer_out_box_id:
+            src = db.execute(
+                text("""
+                    UPDATE interunit_transfer_boxes SET
+                        article = COALESCE(:article, article),
+                        batch_number = COALESCE(:batch_number, batch_number),
+                        lot_number = COALESCE(:lot_number, lot_number),
+                        net_weight = COALESCE(:net_weight, net_weight),
+                        gross_weight = COALESCE(:gross_weight, gross_weight),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = :sid
+                    RETURNING transfer_line_id
+                """),
+                {**params, "sid": ex.transfer_out_box_id},
+            ).fetchone()
+            if src and src.transfer_line_id:
+                affected_line_ids.add(src.transfer_line_id)
+
+        # 3) The destination cold-storage stock (keyed by box_id + transaction_no;
+        #    a no-op where no row matches). weight_kg AND total_inventory_kgs are
+        #    kept in lock-step — the cold dashboard sums total_inventory_kgs.
+        if ex.transaction_no:
+            for t in cold_tables:
+                cres = db.execute(
+                    text(f"""
+                        UPDATE {t} SET
+                            lot_no = COALESCE(:lot_number, lot_no),
+                            weight_kg = COALESCE(:net_weight, weight_kg),
+                            total_inventory_kgs = COALESCE(:net_weight, total_inventory_kgs),
+                            item_description = COALESCE(:article, item_description),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE box_id = :bid AND transaction_no = :tno
+                    """),
+                    {"lot_number": b.lot_number, "net_weight": b.net_weight,
+                     "article": b.article, "bid": b.box_id, "tno": ex.transaction_no},
+                )
+                if cres.rowcount and cres.rowcount > 1:
+                    logger.warning(
+                        "EDIT_TRANSFER_IN: cold update matched %s rows in %s for box %s / txn %s",
+                        cres.rowcount, t, b.box_id, ex.transaction_no)
+        updated_boxes += 1
+
+    # Re-roll the source transfer-out line aggregates from their (now-updated) boxes
+    # so the line totals stay consistent with the edited box weights.
+    for lid in affected_line_ids:
+        db.execute(
+            text("""
+                UPDATE interunit_transfers_lines SET
+                    net_weight = COALESCE(
+                        (SELECT SUM(net_weight) FROM interunit_transfer_boxes WHERE transfer_line_id = :lid),
+                        net_weight),
+                    total_weight = COALESCE(
+                        (SELECT SUM(gross_weight) FROM interunit_transfer_boxes WHERE transfer_line_id = :lid),
+                        total_weight)
+                WHERE id = :lid
+            """),
+            {"lid": lid},
+        )
+
+    db.commit()
+    logger.info("EDIT_TRANSFER_IN: transfer_in=%s, transfer_out=%s, boxes=%s, lines=%s, by %s",
+                header_id, transfer_out_id, updated_boxes, len(affected_line_ids), user_email)
+
+    return get_transfer_in(header_id, db)
+
+
 # -- Delete transfer IN --
 
 TRANSFER_IN_DELETE_ALLOWED_EMAILS = {"yash@candorfoods.in"}
+
+# Users allowed to re-open a Received transfer-in back to Pending (to correct a
+# lot number / raise a box issue, then re-finalize).
+TRANSFER_IN_REOPEN_ALLOWED_EMAILS = {"b.hrithik@candorfoods.in"}
+
+
+def reopen_transfer_in(transfer_out_id: int, user_email: str, db: Session) -> dict:
+    """Re-open a Received transfer-in (looked up by its Transfer OUT id) back to
+    Pending.
+
+    Non-destructive: the acknowledged boxes (interunit_transfer_in_boxes) are
+    KEPT so the user can un-acknowledge a box, change its lot number / raise an
+    issue, and then re-finalize. The receipt's stock movement is reversed — the
+    destination rows are removed and the stock is restored to
+    pending_transfer_stock (In Transit) — and the Transfer OUT is reverted to
+    'Dispatch', exactly so a subsequent finalize re-picks the stock cleanly.
+    Keyed by transfer_out_id (1:1 with the receipt) so the receive screen, which
+    only holds the transfer-out id, can call it directly.
+    Gated to TRANSFER_IN_REOPEN_ALLOWED_EMAILS.
+    """
+    if (user_email or "").strip().lower() not in TRANSFER_IN_REOPEN_ALLOWED_EMAILS:
+        raise HTTPException(403, "You are not authorized to re-open transfer-in records.")
+
+    headers = db.execute(
+        text("""SELECT id, status, transfer_out_id, transfer_out_no, grn_number
+                FROM interunit_transfer_in_header
+                WHERE transfer_out_id = :toid AND status = 'Received'
+                ORDER BY id DESC"""),
+        {"toid": transfer_out_id},
+    ).fetchall()
+    if not headers:
+        raise HTTPException(404, "No 'Received' transfer-in found for this transfer.")
+    if len(headers) > 1:
+        # Don't silently reopen one of several — a human must resolve which receipt.
+        raise HTTPException(409, "Multiple received transfer-ins exist for this transfer; resolve manually.")
+    header = headers[0]
+    transfer_in_id = header.id
+
+    box_count = db.execute(
+        text("SELECT COUNT(*) FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+        {"hid": transfer_in_id},
+    ).scalar() or 0
+
+    # Reverse the receipt's stock movement: destination -> pending_transfer_stock.
+    # Boxes are intentionally NOT deleted (unlike delete_transfer_in) so the user
+    # resumes from their acknowledged state.
+    restored = unpick_to_pending(transfer_in_id=transfer_in_id, transfer_out_id=transfer_out_id, db=db)
+
+    # Legacy / partial receipts (e.g. finalized before pending_transfer_stock existed,
+    # or boxes with missing keys) cannot be cleanly reversed — re-parking fewer rows
+    # than there are boxes risks a stock mismatch, so refuse rather than corrupt stock.
+    if box_count > 0 and (restored or 0) < box_count:
+        db.rollback()
+        raise HTTPException(
+            409,
+            "This receipt can't be safely re-opened (legacy or partial stock mapping). "
+            "Delete and re-create it instead.",
+        )
+
+    updated = db.execute(
+        text("""
+            UPDATE interunit_transfer_in_header
+            SET status = 'Pending',
+                received_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :hid
+            RETURNING id, transfer_out_id, transfer_out_no, grn_number, grn_date,
+                      receiving_warehouse, received_by, received_at,
+                      box_condition, condition_remarks, status,
+                      created_at, updated_at
+        """),
+        {"hid": transfer_in_id},
+    ).fetchone()
+
+    # Revert the Transfer OUT back to 'Dispatch' (in-transit) so re-finalize works.
+    db.execute(
+        text("UPDATE interunit_transfers_header SET status = 'Dispatch' WHERE id = :toid"),
+        {"toid": transfer_out_id},
+    )
+
+    db.commit()
+
+    logger.info("REOPEN_TRANSFER_IN: transfer_in=%s, transfer_out=%s, grn=%s, reopened by %s",
+                transfer_in_id, transfer_out_id, header.grn_number, user_email)
+
+    result = _map_transfer_in_header(updated)
+    result["boxes"] = _fetch_transfer_in_boxes(db, transfer_in_id)
+    result["total_boxes_scanned"] = len(result["boxes"])
+    return result
 
 
 def delete_transfer_in(transfer_in_id: int, user_email: str, db: Session) -> dict:

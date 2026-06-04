@@ -219,7 +219,7 @@ def _ensure_canonical_columns(db: Session) -> None:
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/stock-summary")
-async def get_stock_summary(
+def get_stock_summary(
     company: str = Query("all"),
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
@@ -330,7 +330,7 @@ async def get_stock_summary(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/ageing-summary")
-async def get_ageing_summary(
+def get_ageing_summary(
     company: str = Query("all"),
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
@@ -421,7 +421,7 @@ async def get_ageing_summary(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/ageing-summary-days")
-async def get_ageing_summary_days(
+def get_ageing_summary_days(
     company: str = Query("all"),
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
@@ -515,7 +515,7 @@ async def get_ageing_summary_days(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/lot-details")
-async def get_lot_details(
+def get_lot_details(
     company: str = Query("all"),
     storage_location: str = Query(...),
     group_name: str = Query(...),
@@ -606,7 +606,7 @@ async def get_lot_details(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/concentration")
-async def get_concentration(
+def get_concentration(
     company: str = Query("all"),
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
@@ -675,7 +675,7 @@ async def get_concentration(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/inward-trend")
-async def get_inward_trend(
+def get_inward_trend(
     company: str = Query("all"),
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
@@ -790,7 +790,7 @@ async def get_inward_trend(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/storage-locations")
-async def get_dashboard_storage_locations(
+def get_dashboard_storage_locations(
     company: str = Query("all"),
     db: Session = Depends(get_db),
 ):
@@ -813,7 +813,7 @@ async def get_dashboard_storage_locations(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/attention-flags")
-async def get_attention_flags(
+def get_attention_flags(
     company: str = Query("all"),
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
@@ -937,7 +937,7 @@ async def get_attention_flags(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/slow-moving")
-async def get_slow_moving(
+def get_slow_moving(
     company: str = Query("all"),
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
@@ -1035,7 +1035,7 @@ async def get_slow_moving(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/activity-rundown")
-async def get_activity_rundown(
+def get_activity_rundown(
     company: str = Query("all"),
     storage_location: Optional[str] = Query(None),
     db: Session = Depends(get_db),
@@ -1144,7 +1144,7 @@ async def get_activity_rundown(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.post("/admin/backfill-canonical")
-async def backfill_canonical_columns(db: Session = Depends(get_db)):
+def backfill_canonical_columns(db: Session = Depends(get_db)):
     """Re-run canonical_warehouse / canonical_group / canonical_subgroup
     backfill for both cold-stock tables. Idempotent. Trigger keeps them
     in sync going forward."""
@@ -1179,7 +1179,7 @@ async def backfill_canonical_columns(db: Session = Depends(get_db)):
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/resolve-transaction")
-async def resolve_transaction_endpoint(
+def resolve_transaction_endpoint(
     transaction_no: str = Query(..., description="Transaction number from a lot"),
     db: Session = Depends(get_db),
 ):
@@ -1195,7 +1195,7 @@ async def resolve_transaction_endpoint(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.post("/lots/{inward_no}/rectify")
-async def rectify_lot_metadata(
+def rectify_lot_metadata(
     inward_no: str,
     company: str = Query(...),
     unit: Optional[str] = Query(None, description="New warehouse unit (e.g. D-39, Rishi)"),

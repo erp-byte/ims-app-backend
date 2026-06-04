@@ -25,6 +25,7 @@ from services.ims_service.interunit_models import (
     PendingTransferInCreate,
     PendingBoxAcknowledge,
     FinalizeTransferIn,
+    TransferInEdit,
     CategorialSearchResponse,
     CategorialDropdownResponse,
 )
@@ -57,6 +58,7 @@ from services.ims_service.interunit_tools import (
 from services.ims_service.pending_stock_tools import (
     list_pending_transfers,
     pending_by_lot,
+    in_transit_by_lot,
     backfill_pending_from_existing_transfers,
 )
 
@@ -123,17 +125,30 @@ def pending_stock_by_lot_endpoint(
     )
 
 
+@router.get("/pending-stock/in-transit-by-lot")
+def in_transit_by_lot_endpoint(
+    company: Optional[str] = Query(None, description="cfpl or cdpl"),
+    db: Session = Depends(get_db),
+):
+    """Batched map of lot_no -> in-transit {cartons, kg, box_count} for dashboard
+    overlays. Display context only — these boxes are already removed from cold_stocks,
+    so do NOT subtract this from displayed stock."""
+    return in_transit_by_lot(db=db, company=company)
+
+
 @router.post("/pending-stock/backfill")
 def backfill_pending_stock_endpoint(
     user_email: str = Query(..., description="Email of user triggering backfill"),
     user_role: str = Query("", description="Role (admin/developer bypass allowlist)"),
+    dry_run: bool = Query(False, description="Preview only — reconcile report, no DB writes"),
     db: Session = Depends(get_db),
 ):
-    """One-time backfill: park boxes from existing in-transit transfers
-    (status Dispatch/Partial, no Received Transfer In) into
-    pending_transfer_stock and deduct from source. Idempotent."""
+    """Reconcile in-transit transfers into pending_transfer_stock: park any unparked
+    boxes and top up each transfer to its ordered qty by matching shortfall stock
+    BY LOT from the main sheet. Idempotent. Pass dry_run=true to preview without
+    writing (returns a per-transfer reconcile report)."""
     _check_delete_permission(user_email, user_role)
-    return backfill_pending_from_existing_transfers(db)
+    return backfill_pending_from_existing_transfers(db, dry_run=dry_run)
 
 
 @router.get("/box-lookup/{company}")
@@ -172,7 +187,7 @@ def bulk_entry_box_lookup_endpoint(
 @router.post("/requests", response_model=RequestWithLines, status_code=201)
 def create_request_endpoint(
     request_data: RequestCreate,
-    created_by: str = Query("user@example.com"),
+    created_by: str = Query("system"),
     db: Session = Depends(get_db),
 ):
     return create_request(request_data, created_by, db)
@@ -224,7 +239,7 @@ def delete_request_endpoint(
 @router.post("/transfers", status_code=201)
 def create_transfer_endpoint(
     transfer_data: TransferCreate,
-    created_by: str = Query("user@example.com"),
+    created_by: str = Query("system"),
     db: Session = Depends(get_db),
 ):
     return create_transfer(transfer_data, created_by, db)
@@ -359,6 +374,19 @@ def finalize_transfer_in_endpoint(
     db: Session = Depends(get_db),
 ):
     return finalize_transfer_in(header_id, data, db)
+
+
+@router.post("/transfer-in/{header_id}/close-with-shortage")
+def close_transfer_in_with_shortage_endpoint(
+    header_id: int,
+    closed_by: Optional[str] = Query(None),
+    shortage_reason: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Close a Pending transfer-in that has a genuine shortage: write off the
+    unreceived boxes and mark it Received with a shortage note."""
+    from services.ims_service.interunit_tools import close_transfer_in_with_shortage
+    return close_transfer_in_with_shortage(header_id, shortage_reason, closed_by, db)
 
 
 @router.post("/transfer-in/{header_id}/generate-qrs")
@@ -621,6 +649,37 @@ def delete_transfer_in_endpoint(
 ):
     from services.ims_service.interunit_tools import delete_transfer_in
     return delete_transfer_in(transfer_in_id, user_email, db)
+
+
+@router.post("/transfer-in/reopen-by-transfer-out/{transfer_out_id}")
+def reopen_transfer_in_endpoint(
+    transfer_out_id: int,
+    user_email: str = Query(..., description="Email of the user performing the re-open"),
+    db: Session = Depends(get_db),
+):
+    from services.ims_service.interunit_tools import reopen_transfer_in
+    return reopen_transfer_in(transfer_out_id, user_email, db)
+
+
+@router.get("/transfer-in/by-transfer-out/{transfer_out_id}")
+def get_transfer_in_by_transfer_out_endpoint(
+    transfer_out_id: int,
+    db: Session = Depends(get_db),
+):
+    """Fetch a transfer-in (header + boxes), any status, to pre-fill the edit form."""
+    from services.ims_service.interunit_tools import get_transfer_in_by_transfer_out
+    return get_transfer_in_by_transfer_out(transfer_out_id, db)
+
+
+@router.put("/transfer-in/by-transfer-out/{transfer_out_id}/edit")
+def edit_transfer_in_endpoint(
+    transfer_out_id: int,
+    data: TransferInEdit,
+    user_email: str = Query(..., description="Email of the user performing the edit"),
+    db: Session = Depends(get_db),
+):
+    from services.ims_service.interunit_tools import edit_transfer_in
+    return edit_transfer_in(transfer_out_id, data, user_email, db)
 
 
 # ── All SKU lookup endpoints ──

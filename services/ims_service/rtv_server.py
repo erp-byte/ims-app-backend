@@ -40,6 +40,7 @@ from services.ims_service.rtv_tools import (
     set_rtv_status,
     apply_rtv_email_action,
 )
+from services.ims_service.rtv_approval_token import verify_action_token, JWTError
 from shared.email_notifier import (
     notify_rtv_created,
     notify_rtv_approved,
@@ -295,6 +296,7 @@ def create_rtv_endpoint(
 ):
     """Create a new RTV with header and line items."""
     result = create_rtv(data, created_by, db)
+    result["_company"] = company
     notify_rtv_created(result)
     return result
 
@@ -381,12 +383,14 @@ def approve_rtv_endpoint(
     company: Company,
     rtv_id: int,
     payload: RTVApprovalRequest,
+    notify: bool = Query(True, description="Send approval email (set false for create+approve combined flow)"),
     db: Session = Depends(get_db),
 ):
     """Approve an RTV with optional field completion."""
     result = approve_rtv(company, rtv_id, payload, db)
-    detail = get_rtv(company, rtv_id, db)
-    notify_rtv_approved(detail, payload.approved_by)
+    if notify:
+        detail = get_rtv(company, rtv_id, db)
+        notify_rtv_approved(detail, payload.approved_by)
     return result
 
 

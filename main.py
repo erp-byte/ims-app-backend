@@ -9,11 +9,13 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from sqlalchemy import text
+from shared.config_loader import settings
 from shared.database import engine, SessionLocal
 from shared.logger import get_logger
 from shared.middleware import RouteObfuscationMiddleware
 from shared.kafka_producer import shutdown_executor
 from shared.scheduler import auto_punch_out_and_revoke
+from shared.email_reply_listener import poll_once as rtv_email_poll, shutdown as rtv_email_shutdown
 from services.auth_service.server import router as auth_router
 from services.ims_service.server import router as ims_router
 from services.ims_service.inward_server import router as inward_router
@@ -188,6 +190,19 @@ async def lifespan(app: FastAPI):
         IntervalTrigger(minutes=7),
         id="keep_alive",
     )
+    if settings.RTV_EMAIL_APPROVAL_ENABLED:
+        scheduler.add_job(
+            rtv_email_poll,
+            IntervalTrigger(minutes=settings.RTV_EMAIL_POLL_MINUTES),
+            id="rtv_email_poll",
+            max_instances=1,
+            coalesce=True,
+        )
+        mode = "DRY-RUN" if settings.RTV_EMAIL_APPROVAL_DRY_RUN else "LIVE"
+        logger.info(
+            "RTV email reply listener scheduled every %d min — mode: %s (active 07:00–23:00 IST)",
+            settings.RTV_EMAIL_POLL_MINUTES, mode,
+        )
     scheduler.start()
     logger.info("Scheduler started — auto punch-out at 11:00 PM IST daily")
     logger.info("Keep-alive ping scheduled every 7 minutes")
@@ -195,6 +210,7 @@ async def lifespan(app: FastAPI):
     yield
 
     scheduler.shutdown()
+    rtv_email_shutdown()
     shutdown_executor()
     engine.dispose()
 

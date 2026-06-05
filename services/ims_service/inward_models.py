@@ -38,6 +38,7 @@ class TransactionIn(BaseModel):
     po_quantity: Optional[Decimal18_3] = None
     remark: Optional[str] = None
     currency: Optional[str] = "INR"
+    warehouse: Optional[str] = None  # destination warehouse; cold ones (Savla*/Rishi/Supreme) mirror to cold_stocks
 
 
 class ArticleIn(BaseModel):

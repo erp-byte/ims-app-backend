@@ -1821,15 +1821,29 @@ def _map_transfer_in_box(row) -> dict:
 
 
 def _fetch_transfer_in_boxes(db: Session, header_id: int) -> list:
+    # lot_number is read from the IN box, but for older/article-level acknowledges it
+    # may be blank. Fall back to the matching Transfer-OUT box's lot (scoped to THIS
+    # transfer so box-id collisions across transfers can't bleed in) so the Transfer-In
+    # view always shows the lot when it's known on the dispatch side.
     rows = db.execute(
         text("""
-            SELECT id, header_id, box_id, article, batch_number,
-                   lot_number, transaction_no, net_weight, gross_weight,
-                   scanned_at, is_matched, transfer_out_box_id, issue, line_index,
-                   inward_box_id
-            FROM interunit_transfer_in_boxes
-            WHERE header_id = :hid
-            ORDER BY scanned_at
+            SELECT itb.id, itb.header_id, itb.box_id, itb.article, itb.batch_number,
+                   COALESCE(NULLIF(itb.lot_number, ''),
+                       (SELECT ob.lot_number
+                          FROM interunit_transfer_boxes ob
+                          JOIN interunit_transfer_in_header tih ON tih.id = itb.header_id
+                          WHERE ob.header_id = tih.transfer_out_id
+                            AND ob.box_id = itb.box_id
+                            AND ob.transaction_no = itb.transaction_no
+                            AND COALESCE(ob.lot_number, '') <> ''
+                          LIMIT 1)
+                   ) AS lot_number,
+                   itb.transaction_no, itb.net_weight, itb.gross_weight,
+                   itb.scanned_at, itb.is_matched, itb.transfer_out_box_id, itb.issue, itb.line_index,
+                   itb.inward_box_id
+            FROM interunit_transfer_in_boxes itb
+            WHERE itb.header_id = :hid
+            ORDER BY itb.scanned_at
         """),
         {"hid": header_id},
     ).fetchall()
@@ -2660,6 +2674,7 @@ def list_transfer_ins(
     sort_by: str,
     sort_order: str,
     db: Session,
+    search: Optional[str] = None,
 ) -> dict:
     clauses = ["1=1"]
     params: dict = {}
@@ -2673,6 +2688,22 @@ def list_transfer_ins(
     if to_date:
         clauses.append("h.grn_date <= :to_date")
         params["to_date"] = _convert_date(to_date)
+    if search and search.strip():
+        # Search by GRN / challan / receiver / LOT / box-id / article. Lot is matched
+        # against BOTH the received (IN) boxes and the dispatch (OUT) boxes, since the
+        # IN-box lot can be blank while the OUT box carries it.
+        clauses.append("""(
+            h.grn_number ILIKE :s
+            OR h.transfer_out_no ILIKE :s
+            OR h.received_by ILIKE :s
+            OR EXISTS (SELECT 1 FROM interunit_transfer_in_boxes ib
+                       WHERE ib.header_id = h.id
+                         AND (ib.lot_number ILIKE :s OR ib.box_id ILIKE :s OR ib.article ILIKE :s))
+            OR EXISTS (SELECT 1 FROM interunit_transfer_boxes ob
+                       WHERE ob.header_id = h.transfer_out_id
+                         AND (ob.lot_number ILIKE :s OR ob.box_id ILIKE :s OR ob.article ILIKE :s))
+        )""")
+        params["s"] = f"%{search.strip()}%"
 
     where = " AND ".join(clauses)
 
@@ -2698,7 +2729,14 @@ def list_transfer_ins(
                 h.box_condition, h.condition_remarks, h.status,
                 h.created_at, h.updated_at,
                 COUNT(b.id) AS total_boxes_scanned,
-                t.from_site AS from_warehouse
+                t.from_site AS from_warehouse,
+                (SELECT STRING_AGG(DISTINCT lot, ' ') FROM (
+                     SELECT lot_number AS lot FROM interunit_transfer_in_boxes
+                       WHERE header_id = h.id AND COALESCE(lot_number,'') <> ''
+                     UNION
+                     SELECT lot_number FROM interunit_transfer_boxes
+                       WHERE header_id = h.transfer_out_id AND COALESCE(lot_number,'') <> ''
+                 ) lx) AS lot_numbers
             FROM interunit_transfer_in_header h
             LEFT JOIN interunit_transfer_in_boxes b ON h.id = b.header_id
             LEFT JOIN interunit_transfers_header t ON h.transfer_out_id = t.id
@@ -2714,6 +2752,7 @@ def list_transfer_ins(
     for row in rows:
         item = _map_transfer_in_header(row)
         item["total_boxes_scanned"] = row.total_boxes_scanned or 0
+        item["lot_numbers"] = getattr(row, "lot_numbers", None) or ""
         records.append(item)
 
     return {

@@ -391,14 +391,19 @@ def _apply_offset(placeholder_box_id: str, offset: int) -> Optional[str]:
 
 def _already_acknowledged(db: Session, box_id: str, transaction_no: str) -> Optional[dict]:
     """Check whether a (box_id, transaction_no) is already locked into a
-    completed flow — either landed in destination cold_stocks/boxes_v2 OR
-    acknowledged in a DIFFERENT active Transfer In.
+    completed flow.
+
+    NOTE: boxes_v2 is intentionally NOT checked. Transfer-In does NOT save received
+    stock into cfpl/cdpl_boxes_v2 — for warehouse destinations the receipt lives ONLY
+    in interunit_transfer_in_boxes. boxes_v2 is the warehouse's own source/inward
+    stock, so a box sitting there is NOT "already received via a transfer" — checking
+    it caused false 409s ("already received into cfpl_boxes_v2"). Only the cold
+    destination (cold→cold) is a genuine stock-table landing spot.
 
     Returns:
-      None if available, else a dict describing where it's locked:
-      {"location": "destination_cold" | "destination_warehouse" | "ack_other", ...}
+      None if available, else {"location": "destination_cold", ...}.
     """
-    # Already in destination cold_stocks?
+    # Already in destination cold_stocks? (genuine landing spot for cold→cold)
     for tbl in ("cfpl_cold_stocks", "cdpl_cold_stocks"):
         if not _table_exists(db, tbl):
             continue
@@ -408,18 +413,6 @@ def _already_acknowledged(db: Session, box_id: str, transaction_no: str) -> Opti
         ).fetchone()
         if hit:
             return {"location": "destination_cold", "table": tbl, "row_id": hit.id, "unit": hit.unit}
-    # Already in destination boxes_v2?
-    for tbl in ("cfpl_boxes_v2", "cdpl_boxes_v2"):
-        if not _table_exists(db, tbl):
-            continue
-        hit = db.execute(
-            text(f"SELECT id FROM {tbl} WHERE box_id = :b AND transaction_no = :t LIMIT 1"),
-            {"b": box_id, "t": transaction_no},
-        ).fetchone()
-        if hit:
-            return {"location": "destination_warehouse", "table": tbl, "row_id": hit.id}
-    # Already acknowledged in another active Transfer In header (Pending status, different header)?
-    # We don't know caller's header_id here — caller filters that out.
     return None
 
 

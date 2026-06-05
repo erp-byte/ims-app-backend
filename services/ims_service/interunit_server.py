@@ -311,13 +311,14 @@ def list_transfer_ins_endpoint(
     receiving_warehouse: Optional[str] = Query(None),
     from_date: Optional[str] = Query(None),
     to_date: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, description="GRN / challan / lot / box-id / article"),
     sort_by: str = Query("created_at"),
     sort_order: str = Query("desc"),
     db: Session = Depends(get_db),
 ):
     return list_transfer_ins(
         page, per_page, receiving_warehouse,
-        from_date, to_date, sort_by, sort_order, db,
+        from_date, to_date, sort_by, sort_order, db, search=search,
     )
 
 

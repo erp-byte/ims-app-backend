@@ -2164,7 +2164,58 @@ def create_inward_bulk_sticker(payload, db: Session) -> dict:
 
         ))
 
-
+    # 4) Mirror into cold_stocks (one row per box) — ONLY for cold warehouses
+    #    (Savla* / Rishi / Supreme). Dry warehouses (W202, A68, ...) are NOT mirrored.
+    #    Bulk-sticker inward previously wrote only {prefix}_boxes_v2 and skipped
+    #    cold_stocks, so cold stock inwarded here never appeared in the cold tables.
+    #    This mirrors what bulk_entry_service.create_bulk_entry does.
+    _wh = (getattr(t, "warehouse", None) or "").strip()
+    _wl = _wh.lower()
+    if _wl.startswith("savla") or _wl.startswith("rishi") or _wl.startswith("supreme"):
+        _cold_table = f"{'cfpl' if payload.company == 'CFPL' else 'cdpl'}_cold_stocks"
+        _unit_map = {"Savla D-39": "D-39", "Savla D-514": "D-514", "Rishi": "Rishi", "Supreme": "Supreme"}
+        _unit = _unit_map.get(_wh, _wh)
+        cold_rows = []
+        for article, art_group in zip(payload.articles, all_box_groups):
+            _box_net = float(article.box_net_weight) if article.box_net_weight is not None else None
+            _rate = float(article.unit_rate) if article.unit_rate is not None else None
+            _per_box_value = round(_box_net * _rate, 2) if (_box_net and _rate) else None
+            for box_info in art_group.boxes:
+                cold_rows.append({
+                    "inward_dt": t.entry_date, "unit": _unit, "inward_no": txno,
+                    "cold_item_mark": None, "vakkal": None, "lot_no": article.lot_number,
+                    "no_of_cartons": 1, "weight_kg": _box_net, "total_inventory_kgs": _box_net,
+                    "group_name": article.item_category, "item_description": article.item_description,
+                    "storage_location": _wh, "exporter": t.vendor_supplier_name,
+                    "last_purchase_rate": _rate, "box_id": box_info.box_id, "transaction_no": txno,
+                    "item_subgroup": article.sub_category, "item_mark": None, "value": _per_box_value,
+                    "inward_transaction_no": txno, "auto_created_from_inward": True, "spl_remarks": None,
+                    "canonical_warehouse": _wh, "canonical_group": article.item_category,
+                    "canonical_subgroup": article.sub_category,
+                })
+        if cold_rows:
+            db.execute(
+                text(f"""
+                    INSERT INTO {_cold_table} (
+                        inward_dt, unit, inward_no, cold_item_mark, vakkal, lot_no,
+                        no_of_cartons, weight_kg, total_inventory_kgs, group_name,
+                        item_description, storage_location, exporter, last_purchase_rate,
+                        box_id, transaction_no, item_subgroup, item_mark, value,
+                        inward_transaction_no, auto_created_from_inward, spl_remarks,
+                        canonical_warehouse, canonical_group, canonical_subgroup
+                    ) VALUES (
+                        :inward_dt, :unit, :inward_no, :cold_item_mark, :vakkal, :lot_no,
+                        :no_of_cartons, :weight_kg, :total_inventory_kgs, :group_name,
+                        :item_description, :storage_location, :exporter, :last_purchase_rate,
+                        :box_id, :transaction_no, :item_subgroup, :item_mark, :value,
+                        :inward_transaction_no, :auto_created_from_inward, :spl_remarks,
+                        :canonical_warehouse, :canonical_group, :canonical_subgroup
+                    )
+                """),
+                cold_rows,
+            )
+            logger.info("Bulk-sticker cold mirror: %d cold_stocks rows for %s (warehouse=%s)",
+                        len(cold_rows), txno, _wh)
 
     db.commit()
 

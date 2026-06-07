@@ -23,6 +23,16 @@ from services.ims_service.pending_stock_tools import (
 logger = get_logger("ims.interunit")
 
 
+# Cold destinations that must route through /interunit/cold-transfer-in/* instead
+# of the legacy /transfer-in endpoints (2026-06-06). Umbrella label "Cold Storage"
+# excluded — IN-side receiving_warehouse is always a concrete sub-warehouse.
+_COLD_DEST_LOWER = {"savla d-39", "savla d-514", "rishi", "supreme"}
+
+
+def _is_cold_destination_name(name: Optional[str]) -> bool:
+    return bool(name) and name.strip().lower() in _COLD_DEST_LOWER
+
+
 # -- Cold sub-warehouse mapping --
 #
 # Cold-source transfers always store from_site='Cold Storage' on the header; the
@@ -766,56 +776,20 @@ def _auto_derive_warehouse_boxes(db: Session, from_site: str, lines: list) -> li
 # -- Create transfer --
 
 
-def _validate_cold_boxes_in_stock(db, from_site, boxes):
-    """For COLD-source transfers, reject any box that exists in NEITHER cold_stocks NOR
-    pending_transfer_stock (In Transit) by (box_id, transaction_no) — i.e. an unknown or
-    typo box id. A box already parked In Transit is accepted, so this stays SAFE for
-    edits of an already-dispatched transfer (update_transfer) where the boxes have
-    legitimately left cold. Existence is checked WITHOUT lot to avoid false positives
-    from lot-label drift.
-    """
-    if not _is_cold_site(from_site):
-        return
-    missing = []
-    for box in (boxes or []):
-        bid = (getattr(box, "box_id", None) or "").strip()
-        tno = (getattr(box, "transaction_no", None) or "").strip()
-        if not bid or not tno or tno == "DIRECT":
-            continue
-        found = False
-        for table in ("cfpl_cold_stocks", "cdpl_cold_stocks"):
-            if not _table_exists(db, table):
-                continue
-            if db.execute(
-                text(f"SELECT 1 FROM {table} WHERE box_id = :b AND transaction_no = :t LIMIT 1"),
-                {"b": bid, "t": tno},
-            ).fetchone():
-                found = True
-                break
-        if not found:
-            # Accept a box already parked In Transit (a known dispatched box being
-            # re-validated during an edit of its own transfer). Keeps the guard safe
-            # for update_transfer; truly unknown/typo box ids are still rejected.
-            if db.execute(
-                text("SELECT 1 FROM pending_transfer_stock WHERE box_id = :b AND transaction_no = :t AND status = 'In Transit' LIMIT 1"),
-                {"b": bid, "t": tno},
-            ).fetchone():
-                found = True
-        if not found:
-            missing.append(bid)
-    if missing:
+def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
+    # Cold-source dispatches must use POST /interunit/cold-transfer-out/create.
+    # That endpoint owns cold_stocks deduction + cold metadata preservation.
+    from services.ims_service.pending_stock_tools import _is_cold_site as _is_cold
+    _from = getattr(data.header, "from_warehouse", None) or ""
+    if _is_cold(_from):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"{len(missing)} box(es) not found in cold stock or in transit "
-                f"(unknown/typo box id): {', '.join(missing[:10])}"
-                f"{'…' if len(missing) > 10 else ''}. Re-add the cold-storage item so "
-                "live FIFO boxes are picked."
+                "Cold-source transfers must use POST /interunit/cold-transfer-out/create. "
+                f"from_warehouse={_from!r}"
             ),
         )
 
-
-def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
     stock_trf_date = _convert_date(data.header.stock_trf_date)
     challan_no = data.header.challan_no or _generate_challan_no()
 
@@ -947,14 +921,11 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
                         status_code=400,
                         detail=(
                             f"Duplicate box_id '{bid}' for transaction '{tno}' in this transfer. "
-                            "Every physical box must carry a unique box_id — re-add the cold-storage "
-                            "item so per-box IDs are fetched via FIFO."
+                            "Every physical box must carry a unique box_id."
                         ),
                     )
                 seen_keys.add(key)
 
-        # Cold-source guard: reject boxes no longer in cold stock (blocks double-dispatch).
-        _validate_cold_boxes_in_stock(db, data.header.from_warehouse, data.boxes)
 
         # Build article-to-line-id lookup for correct box-to-line association
         line_id_by_article: dict = {}
@@ -1037,26 +1008,38 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
                     {"u": joined, "id": header_id},
                 )
 
-    elif lines:
-        # No box-level rows — article/quantity-only transfer, or the source stock is
-        # not box-tracked so Plan C couldn't derive boxes. Park line-level pending rows
-        # so EVERY transfer is represented in the in-transit ledger. Tracking-only:
-        # deducts/inserts no inventory (see park_lines_in_pending).
+    # MIXED scan + manual: park ALSO the lines that have no scanned/derived box, so
+    # manually-filled entries are NEVER dropped. The old `elif lines` skipped line parking
+    # whenever ANY box was scanned → manual stock vanished + transfer went Partial.
+    # Coverage is counted per (article, lot); each article entry == 1 box in this form.
+    _covered: dict = {}
+    for _b in (data.boxes or []):
+        _k = ((_b.article or "").strip().upper(), (_b.lot_number or "").strip())
+        _covered[_k] = _covered.get(_k, 0) + 1
+    uncovered_lines = []
+    for _l in lines:
+        _k = ((_l.item_desc_raw or "").strip().upper(), (_l.lot_number or "").strip())
+        if _covered.get(_k, 0) > 0:
+            _covered[_k] -= 1            # this line's box was scanned / auto-derived
+        else:
+            uncovered_lines.append(_l)   # manual / unscanned → park box-less so it isn't lost
+    if uncovered_lines:
         park_lines_in_pending(
             transfer_out_id=header_id,
             challan_no=header.challan_no,
             from_site=data.header.from_warehouse,
             to_site=data.header.to_warehouse,
-            lines=lines,
+            lines=uncovered_lines,
             dispatched_by=getattr(header, "created_by", "system") or "system",
             db=db,
         )
 
-    # Determine status based on box count vs expected qty
+    # Determine status. Everything is now parked (scanned boxes + box-less manual lines),
+    # so a mixed / short-scan transfer is still fully dispatched — not Partial.
     if boxes:
         total_expected = sum(int(l.qty) for l in lines)
-        actual_scanned = len(boxes)
-        transfer_status = "Dispatch" if actual_scanned >= total_expected else "Partial"
+        actual_dispatched = len(boxes) + len(uncovered_lines)
+        transfer_status = "Dispatch" if actual_dispatched >= total_expected else "Partial"
 
         db.execute(
             text("""
@@ -1404,6 +1387,18 @@ def get_transfer(transfer_id: int, db: Session) -> dict:
 
 def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict:
     """Update an existing transfer by replacing header, lines, and boxes."""
+    # Cold-source edits must use POST /interunit/cold-transfer-out/{id}/edit.
+    from services.ims_service.pending_stock_tools import _is_cold_site as _is_cold
+    _from = getattr(data.header, "from_warehouse", None) or ""
+    if _is_cold(_from):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Cold-source transfers must use POST /interunit/cold-transfer-out/{id}/edit. "
+                f"from_warehouse={_from!r}"
+            ),
+        )
+
     existing = db.execute(
         text("SELECT id, challan_no, status, request_id FROM interunit_transfers_header WHERE id = :tid"),
         {"tid": transfer_id},
@@ -1557,14 +1552,11 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
                         status_code=400,
                         detail=(
                             f"Duplicate box_id '{bid}' for transaction '{tno}' in this transfer. "
-                            "Every physical box must carry a unique box_id — re-add the cold-storage "
-                            "item so per-box IDs are fetched via FIFO."
+                            "Every physical box must carry a unique box_id."
                         ),
                     )
                 seen_keys.add(key)
 
-        # Cold-source guard: reject boxes no longer in cold stock (blocks double-dispatch).
-        _validate_cold_boxes_in_stock(db, data.header.from_warehouse, data.boxes)
 
         # Build article-to-line-id lookup for correct box-to-line association
         line_id_by_article: dict = {}
@@ -1647,26 +1639,38 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
                     {"u": joined, "id": header_id},
                 )
 
-    elif lines:
-        # No box-level rows — article/quantity-only transfer, or the source stock is
-        # not box-tracked so Plan C couldn't derive boxes. Park line-level pending rows
-        # so EVERY transfer is represented in the in-transit ledger. Tracking-only:
-        # deducts/inserts no inventory (see park_lines_in_pending).
+    # MIXED scan + manual: park ALSO the lines that have no scanned/derived box, so
+    # manually-filled entries are NEVER dropped. The old `elif lines` skipped line parking
+    # whenever ANY box was scanned → manual stock vanished + transfer went Partial.
+    # Coverage is counted per (article, lot); each article entry == 1 box in this form.
+    _covered: dict = {}
+    for _b in (data.boxes or []):
+        _k = ((_b.article or "").strip().upper(), (_b.lot_number or "").strip())
+        _covered[_k] = _covered.get(_k, 0) + 1
+    uncovered_lines = []
+    for _l in lines:
+        _k = ((_l.item_desc_raw or "").strip().upper(), (_l.lot_number or "").strip())
+        if _covered.get(_k, 0) > 0:
+            _covered[_k] -= 1            # this line's box was scanned / auto-derived
+        else:
+            uncovered_lines.append(_l)   # manual / unscanned → park box-less so it isn't lost
+    if uncovered_lines:
         park_lines_in_pending(
             transfer_out_id=header_id,
             challan_no=header.challan_no,
             from_site=data.header.from_warehouse,
             to_site=data.header.to_warehouse,
-            lines=lines,
+            lines=uncovered_lines,
             dispatched_by=getattr(header, "created_by", "system") or "system",
             db=db,
         )
 
-    # Determine status based on box count vs expected qty
+    # Determine status. Everything is now parked (scanned boxes + box-less manual lines),
+    # so a mixed / short-scan transfer is still fully dispatched — not Partial.
     if boxes:
         total_expected = sum(int(l.qty) for l in lines)
-        actual_scanned = len(boxes)
-        transfer_status = "Dispatch" if actual_scanned >= total_expected else "Partial"
+        actual_dispatched = len(boxes) + len(uncovered_lines)
+        transfer_status = "Dispatch" if actual_dispatched >= total_expected else "Partial"
 
         db.execute(
             text("""
@@ -1742,6 +1746,27 @@ def delete_transfer(transfer_id: int, db: Session) -> dict:
 
     db.execute(
         text("DELETE FROM interunit_transfer_in_header WHERE transfer_out_id = :tid"),
+        {"tid": transfer_id},
+    )
+
+    # Step 2b: cascade-remove COLD transfer-IN receipts for this transfer-out. Cold
+    # receipts live in cold_transfer_in_headers / cold_transfer_inboxes (the unpick
+    # above only reverses cold_stocks for boxes tracked in interunit_transfer_in_boxes),
+    # so without this they orphan and keep showing in the cold Transfer-In records.
+    # We intentionally do NOT delete <company>_cold_stocks here — unpick already
+    # reversed them for the normal flow; deleting blindly could lose stock in the rare
+    # cold-receipt-without-interunit-header case.
+    cold_in_headers = db.execute(
+        text("SELECT id FROM cold_transfer_in_headers WHERE transfer_out_id = :tid"),
+        {"tid": transfer_id},
+    ).fetchall()
+    for ch in cold_in_headers:
+        db.execute(
+            text("DELETE FROM cold_transfer_inboxes WHERE header_id = :hid"),
+            {"hid": ch.id},
+        )
+    db.execute(
+        text("DELETE FROM cold_transfer_in_headers WHERE transfer_out_id = :tid"),
         {"tid": transfer_id},
     )
 
@@ -1854,6 +1879,13 @@ def _fetch_transfer_in_boxes(db: Session, header_id: int) -> list:
 
 
 def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
+    # Cold destinations must use the dedicated cold-transfer-in endpoint.
+    if _is_cold_destination_name(data.receiving_warehouse):
+        raise HTTPException(
+            status_code=400,
+            detail="Cold receipts must use POST /interunit/cold-transfer-in/create",
+        )
+
     # Verify Transfer OUT exists
     transfer_out = db.execute(
         text("SELECT id, challan_no, to_site FROM interunit_transfers_header WHERE id = :id"),
@@ -1914,15 +1946,14 @@ def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
     header_id = header.id
 
     # Bridge invariant: pick ONLY the boxes scanned/received now; the rest stay
-    # In Transit so a partial receipt can't leak them.
-    acknowledged_keys = {((b.box_id or ""), (b.transaction_no or "")) for b in data.scanned_boxes}
+    # In Transit so a partial receipt can't leak them. Pass lots too so relabeled /
+    # transaction_no-less scans still reconcile fungibly by lot (no phantom leak).
+    acknowledged_boxes = [
+        {"box_id": b.box_id, "transaction_no": b.transaction_no, "lot_number": b.lot_number}
+        for b in data.scanned_boxes
+    ]
     picked = pick_from_pending(transfer_out_id=data.transfer_out_id, db=db,
-                               acknowledged_keys=acknowledged_keys)
-
-    # Legacy fallback (transfers dispatched before pending_transfer_stock was wired in)
-    if picked == 0 and data.cold_storage_items:
-        to_site_val = transfer_out.to_site if hasattr(transfer_out, 'to_site') else None
-        _insert_cold_storage_items(header_id, data.cold_storage_items, transfer_out.challan_no, db, to_site=to_site_val)
+                               acknowledged_boxes=acknowledged_boxes)
 
     # Insert scanned boxes
     boxes = []
@@ -2410,11 +2441,11 @@ def close_transfer_in_with_shortage(header_id: int, shortage_reason, closed_by, 
 
     # Pick the boxes actually acknowledged on this GRN.
     ack_rows = db.execute(
-        text("SELECT box_id, transaction_no FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+        text("SELECT box_id, transaction_no, lot_number FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
         {"hid": header_id},
     ).fetchall()
-    acknowledged_keys = {((r.box_id or ""), (r.transaction_no or "")) for r in ack_rows}
-    pick_from_pending(transfer_out_id=header.transfer_out_id, db=db, acknowledged_keys=acknowledged_keys)
+    acknowledged_boxes = [{"box_id": r.box_id, "transaction_no": r.transaction_no, "lot_number": r.lot_number} for r in ack_rows]
+    pick_from_pending(transfer_out_id=header.transfer_out_id, db=db, acknowledged_boxes=acknowledged_boxes)
 
     # Count the real shortage, then write off ALL remaining in-transit rows for the transfer.
     shortage = count_remaining_in_transit(header.transfer_out_id, db)
@@ -2460,6 +2491,17 @@ def close_transfer_in_with_shortage(header_id: int, shortage_reason, closed_by, 
 
 def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) -> dict:
     """Finalize a Pending transfer-in: transition status to Received."""
+    # Cold destinations must use the dedicated cold-transfer-in finalize endpoint.
+    hdr_row = db.execute(
+        text("SELECT receiving_warehouse FROM interunit_transfer_in_header WHERE id=:hid"),
+        {"hid": header_id},
+    ).fetchone()
+    if hdr_row and _is_cold_destination_name(hdr_row._mapping["receiving_warehouse"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Cold receipts must use POST /interunit/cold-transfer-in/{header_id}/finalize",
+        )
+
     header = db.execute(
         text("""
             SELECT id, status, transfer_out_id, transfer_out_no
@@ -2474,12 +2516,12 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
         # appeared AFTER this header was marked Received (orphan-trap fix): pick the
         # boxes recorded on this GRN so they don't linger forever on the bridge.
         _ack = db.execute(
-            text("SELECT box_id, transaction_no FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+            text("SELECT box_id, transaction_no, lot_number FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
             {"hid": header_id},
         ).fetchall()
         if _ack:
             pick_from_pending(transfer_out_id=header.transfer_out_id, db=db,
-                              acknowledged_keys={((r.box_id or ""), (r.transaction_no or "")) for r in _ack})
+                              acknowledged_boxes=[{"box_id": r.box_id, "transaction_no": r.transaction_no, "lot_number": r.lot_number} for r in _ack])
         full = db.execute(
             text("""SELECT id, transfer_out_id, transfer_out_no, grn_number, grn_date,
                            receiving_warehouse, received_by, received_at, box_condition,
@@ -2505,21 +2547,13 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
     # Bridge invariant: pick ONLY the boxes acknowledged on this GRN; the rest stay
     # In Transit. The transfer flips to 'Received' only when none remain.
     ack_rows = db.execute(
-        text("SELECT box_id, transaction_no FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+        text("SELECT box_id, transaction_no, lot_number FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
         {"hid": header_id},
     ).fetchall()
-    acknowledged_keys = {((r.box_id or ""), (r.transaction_no or "")) for r in ack_rows}
+    acknowledged_boxes = [{"box_id": r.box_id, "transaction_no": r.transaction_no, "lot_number": r.lot_number} for r in ack_rows]
     picked = pick_from_pending(transfer_out_id=header.transfer_out_id, db=db,
-                               acknowledged_keys=acknowledged_keys)
+                               acknowledged_boxes=acknowledged_boxes)
 
-    # Legacy fallback (transfers dispatched before pending_transfer_stock was wired in)
-    if picked == 0 and data.cold_storage_items:
-        tout = db.execute(
-            text("SELECT to_site FROM interunit_transfers_header WHERE id = :id"),
-            {"id": header.transfer_out_id},
-        ).fetchone()
-        to_site = tout.to_site if tout else None
-        _insert_cold_storage_items(header_id, data.cold_storage_items, header.transfer_out_no, db, to_site=to_site)
 
     # Completion gate: 'Received' only when no real box remains In Transit.
     remaining = count_remaining_in_transit(header.transfer_out_id, db)
@@ -2662,6 +2696,48 @@ def get_pending_by_transfer_out(transfer_out_id: int, db: Session) -> dict:
     return {"exists": True, "header": header}
 
 
+def get_pending_boxes_by_transfer_out(transfer_out_id: int, db: Session) -> dict:
+    """Return the 'In Transit' pending_transfer_stock rows for a transfer-out, mapped to
+    the box shape the cold receive form consumes. Includes 'LINE-%' synthetic rows so
+    warehouse→cold transfers (parked line-level because the warehouse source has no
+    per-box stock) can still be received on the cold IN page. Read-only; no writes."""
+    rows = db.execute(
+        text("""
+            SELECT pts.id, pts.box_id, pts.transaction_no, pts.item_description, pts.lot_no,
+                   pts.batch_number, pts.weight_kg, pts.gross_weight, pts.net_weight,
+                   pts.article, pts.cold_storage_data,
+                   otb.id AS transfer_out_box_id
+            FROM pending_transfer_stock pts
+            LEFT JOIN interunit_transfer_boxes otb
+              ON otb.header_id = pts.transfer_out_id
+             AND otb.box_id = pts.box_id
+             AND COALESCE(otb.transaction_no, '') = COALESCE(pts.transaction_no, '')
+            WHERE pts.transfer_out_id = :tid
+              AND pts.status = 'In Transit'
+            ORDER BY pts.id
+        """),
+        {"tid": transfer_out_id},
+    ).fetchall()
+
+    boxes = []
+    for r in rows:
+        cold = r.cold_storage_data if isinstance(r.cold_storage_data, dict) else {}
+        net = r.net_weight if r.net_weight is not None else r.weight_kg
+        boxes.append({
+            "id": r.id,
+            "transfer_out_box_id": r.transfer_out_box_id,
+            "box_id": r.box_id,
+            "transaction_no": r.transaction_no,
+            "article": r.article or r.item_description,
+            "lot_number": r.lot_no,
+            "batch_number": r.batch_number or cold.get("batch_number"),
+            "net_weight": float(net) if net is not None else None,
+            "gross_weight": float(r.gross_weight) if r.gross_weight is not None else None,
+        })
+
+    return {"transfer_out_id": transfer_out_id, "total": len(boxes), "boxes": boxes}
+
+
 # -- List transfer INs --
 
 
@@ -2761,6 +2837,147 @@ def list_transfer_ins(
         "page": page,
         "per_page": per_page,
         "total_pages": (total + per_page - 1) // per_page if total else 0,
+    }
+
+
+# -- List Cold-only Transfer-IN records (new dedicated cold tables) --
+#
+# Reads exclusively from `cold_transfer_in_headers` + `cold_transfer_inboxes`
+# (no fallthrough to `interunit_transfer_in_header*`). Shape-identical to
+# list_transfer_ins() so the cold-transfer page can swap with one identifier
+# change. Column-name diffs vs. the legacy tables: lot_no (not lot_number),
+# weight_kg (not net_weight), item_description (not article), to_site (≈
+# receiving_warehouse), from_site (≈ from_warehouse). Cold-destination is
+# guaranteed by the table itself per the 2026-06-06 correction.
+def list_cold_transfer_ins(
+    page: int,
+    per_page: int,
+    receiving_warehouse: Optional[str],
+    from_date: Optional[str],
+    to_date: Optional[str],
+    sort_by: str,
+    sort_order: str,
+    db: Session,
+    search: Optional[str] = None,
+) -> dict:
+    clauses = ["1=1"]
+    params: dict = {}
+
+    if receiving_warehouse:
+        clauses.append("UPPER(h.to_site) = :rw")
+        params["rw"] = receiving_warehouse.upper()
+    if from_date:
+        clauses.append("h.grn_date >= :from_date")
+        params["from_date"] = _convert_date(from_date)
+    if to_date:
+        clauses.append("h.grn_date <= :to_date")
+        params["to_date"] = _convert_date(to_date)
+    if search and search.strip():
+        # Match what the legacy endpoint searches over, mapped to the new
+        # column names. TODO: extend if the cold-transfer page surfaces more
+        # searchable fields.
+        clauses.append("""(
+            h.grn_number ILIKE :s
+            OR h.transfer_out_no ILIKE :s
+            OR h.received_by ILIKE :s
+            OR h.from_site ILIKE :s
+            OR h.to_site ILIKE :s
+            OR EXISTS (SELECT 1 FROM cold_transfer_inboxes ib
+                       WHERE ib.header_id = h.id
+                         AND (ib.lot_no ILIKE :s
+                              OR ib.box_id ILIKE :s
+                              OR ib.item_description ILIKE :s))
+        )""")
+        params["s"] = f"%{search.strip()}%"
+
+    where = " AND ".join(clauses)
+
+    valid_sort = {"grn_number", "grn_date", "to_site", "status", "created_at"}
+    # Map the legacy sort key "receiving_warehouse" → cold column "to_site"
+    # so the existing frontend params keep working unchanged.
+    sort_alias = {"receiving_warehouse": "to_site"}
+    sort_col = sort_alias.get(sort_by, sort_by)
+    if sort_col not in valid_sort:
+        sort_col = "created_at"
+    direction = "DESC" if sort_order.lower() == "desc" else "ASC"
+
+    total = db.execute(
+        text(f"SELECT COUNT(*) FROM cold_transfer_in_headers h WHERE {where}"),
+        params,
+    ).scalar()
+
+    offset = (page - 1) * per_page
+    params["limit"] = per_page
+    params["offset"] = offset
+
+    rows = db.execute(
+        text(f"""
+            SELECT
+                h.id,
+                h.transfer_out_id,
+                h.transfer_out_no,
+                h.grn_number,
+                h.grn_date,
+                h.to_site AS receiving_warehouse,
+                h.from_site AS from_warehouse,
+                h.received_by,
+                h.received_at,
+                h.box_condition,
+                h.condition_remarks,
+                h.status,
+                h.inward_transaction_no,
+                h.to_company,
+                h.created_at,
+                h.updated_at,
+                (SELECT COUNT(*) FROM cold_transfer_inboxes b
+                   WHERE b.header_id = h.id) AS total_boxes_scanned,
+                (SELECT STRING_AGG(DISTINCT u, ', ') FROM (
+                     SELECT unit AS u FROM cold_transfer_inboxes
+                       WHERE header_id = h.id AND COALESCE(unit, '') <> ''
+                 ) ux) AS from_cold_unit,
+                (SELECT STRING_AGG(DISTINCT lot, ' ') FROM (
+                     SELECT lot_no AS lot FROM cold_transfer_inboxes
+                       WHERE header_id = h.id AND COALESCE(lot_no, '') <> ''
+                 ) lx) AS lot_numbers
+            FROM cold_transfer_in_headers h
+            WHERE {where}
+            ORDER BY h.{sort_col} {direction}
+            LIMIT :limit OFFSET :offset
+        """),
+        params,
+    ).fetchall()
+
+    records = []
+    for row in rows:
+        item = {
+            "id": row.id,
+            "transfer_out_id": row.transfer_out_id,
+            "transfer_out_no": row.transfer_out_no or "",
+            "grn_number": row.grn_number or "",
+            "grn_date": row.grn_date,
+            "receiving_warehouse": row.receiving_warehouse or "",
+            "from_warehouse": row.from_warehouse or "",
+            "received_by": row.received_by or "",
+            "received_at": row.received_at,
+            "box_condition": row.box_condition,
+            "condition_remarks": row.condition_remarks,
+            "status": row.status or "Received",
+            "inward_transaction_no": row.inward_transaction_no or None,
+            "to_company": row.to_company or None,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+            "total_boxes_scanned": row.total_boxes_scanned or 0,
+            "from_cold_unit": row.from_cold_unit or "",
+            "lot_numbers": row.lot_numbers or "",
+        }
+        records.append(item)
+
+    return {
+        "records": records,
+        "total": total or 0,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": ((total or 0) + per_page - 1) // per_page if total else 0,
     }
 
 

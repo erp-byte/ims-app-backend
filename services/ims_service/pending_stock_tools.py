@@ -36,9 +36,13 @@ def _normalize_site(raw: Optional[str]) -> str:
 
 COLD_STORAGE_SITE_NAMES = {
     "cold storage",
+    "rishi",
     "rishi cold",
+    "savla d-39",
     "savla d-39 cold",
+    "savla d-514",
     "savla d-514 cold",
+    "supreme",
 }
 
 
@@ -970,17 +974,35 @@ def reconcile_box_in_pending(
             "reconciliation_id": None, "siblings": [],
         }
 
-    # STEP 1 — Already locked into a destination or another transfer?
-    lock = _already_acknowledged(db, scanned_box_id, scanned_transaction_no)
-    if lock and lock.get("location", "").startswith("destination_"):
-        return {
-            "status": "duplicate",
-            "actual_box_id": scanned_box_id, "original_box_id": None,
-            "transfer_out_id": transfer_out_id, "lot_no": None,
-            "propagated_count": 0,
-            "reason": f"Box already received into {lock.get('table')}",
-            "reconciliation_id": None, "siblings": [],
-        }
+    # Derive destination class once. For cold→warehouse, the receipt lives
+    # exclusively in interunit_transfer_in_boxes, so scanning cold_stocks for
+    # "already received" is meaningless and only produces false positives when
+    # the (box_id, transaction_no) pair coincides with unrelated stock in
+    # cold_stocks (different item/lot — historical sticker + txn reuse).
+    _out_to_site_row = db.execute(
+        text("SELECT to_site FROM interunit_transfers_header WHERE id = :tid"),
+        {"tid": transfer_out_id},
+    ).fetchone()
+    _to_storage_type = (
+        "cold" if (_out_to_site_row and _is_cold_site(_out_to_site_row.to_site))
+        else "warehouse"
+    )
+
+    # STEP 1 — Already locked into a destination? Cold-destination only.
+    # Warehouse destinations skip the cold_stocks scan; the only acknowledge
+    # state that matters for warehouse receives is pending_transfer_stock + the
+    # interunit_transfer_in_boxes write (handled by Step 2 / acknowledge path).
+    if _to_storage_type == "cold":
+        lock = _already_acknowledged(db, scanned_box_id, scanned_transaction_no)
+        if lock and lock.get("location", "").startswith("destination_"):
+            return {
+                "status": "duplicate",
+                "actual_box_id": scanned_box_id, "original_box_id": None,
+                "transfer_out_id": transfer_out_id, "lot_no": None,
+                "propagated_count": 0,
+                "reason": f"Box already received into {lock.get('table')}",
+                "reconciliation_id": None, "siblings": [],
+            }
 
     # STEP 2 — Is the scanned box already in THIS active pending batch?
     existing = _find_active_pending_row(db, scanned_box_id, scanned_transaction_no)
@@ -1056,8 +1078,10 @@ def reconcile_box_in_pending(
                 _, src_row = _find_in_bulk_entry(db, predicted, sib.transaction_no, sib.lot_no)
             if src_row is None:
                 continue
-            # Skip if predicted box is already locked elsewhere
-            if _already_acknowledged(db, predicted, sib.transaction_no):
+            # Skip if predicted box is already locked elsewhere. Only meaningful
+            # for cold destinations — for warehouse destinations the cold_stocks
+            # scan is just a false-positive trap (see Step 1 note above).
+            if _to_storage_type == "cold" and _already_acknowledged(db, predicted, sib.transaction_no):
                 continue
             try:
                 _swap_pending_row(
@@ -1647,7 +1671,8 @@ def reconcile_transfer_to_order(transfer_out_id: int, db: Session,
 #  pick_from_pending — called from create_transfer_in / finalize_transfer_in
 # ----------------------------------------------------------------------------
 def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: Optional[str] = None,
-                      acknowledged_keys: Optional[set] = None) -> int:
+                      acknowledged_keys: Optional[set] = None,
+                      acknowledged_boxes: Optional[list] = None) -> int:
     """Move 'In Transit' rows tied to this transfer_out into their destination table,
     then delete the pending row. Returns count picked.
 
@@ -1664,76 +1689,76 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
         {"tid": transfer_out_id},
     ).fetchall()
 
+    from collections import Counter
+
+    # Acknowledged matching. Prefer acknowledged_boxes (carries lot -> enables the
+    # fungible lot-fallback below); fall back to acknowledged_keys (exact only).
     ack = None
-    if acknowledged_keys is not None:
+    ack_lot_total = Counter()
+    if acknowledged_boxes is not None:
+        ack = set()
+        for b in acknowledged_boxes:
+            _g = (lambda k: b.get(k) if isinstance(b, dict) else getattr(b, k, None))
+            _bid = (_g("box_id") or "").strip()
+            _txn = (_g("transaction_no") or "").strip()
+            _lot = (_g("lot_number") or _g("lot_no") or "").strip()
+            ack.add((_bid, _txn))
+            ack_lot_total[_lot] += 1
+    elif acknowledged_keys is not None:
         ack = {((b or "").strip(), (t or "").strip()) for (b, t) in acknowledged_keys}
 
+    def _norm_lot(x):
+        return (x or "").strip()
+
+    def _do_pick(p):
+        """Consume a pending row (interunit IN side only).
+
+        Warehouse destinations: nothing to insert here — interunit_transfer_in_boxes
+        is the final state for received transferred stock (cfpl_boxes_v2 / cdpl_boxes_v2
+        track the warehouse's OWN inward inventory, not cross-unit receipts).
+
+        Cold destinations: handled exclusively by the cold module
+        (cold_transfer_in_tools.py). pick_from_pending should never be called for
+        a cold-dest receive — the interunit IN path that calls us refuses cold dest
+        at the top of create_transfer_in.
+
+        We just delete the pending row + write the disposition.
+        """
+        dest = p.destination_table
+        db.execute(text("DELETE FROM pending_transfer_stock WHERE id = :id"), {"id": p.id})
+        logger.info("PICK_PENDING: box_id=%s tno=%s -> %s (transfer_out_id=%s)",
+                    p.box_id, p.transaction_no, dest, transfer_out_id)
+        return True
+
     picked = 0
+    picked_lot = Counter()
+    unpicked = []
+
+    # Phase 1 — exact match by (box_id, transaction_no); 'LINE-%' tracking rows always picked.
     for p in pending_rows:
-        # Scope to acknowledged boxes when provided: only pick boxes actually received
-        # (by (box_id, transaction_no)); 'LINE-%' tracking rows are always picked.
         if ack is not None:
             _bid = (p.box_id or "").strip()
             if not _bid.startswith("LINE-") and (_bid, (p.transaction_no or "").strip()) not in ack:
+                unpicked.append(p)
                 continue
-        dest = p.destination_table
+        if _do_pick(p):
+            picked += 1
+            if not (p.box_id or "").strip().startswith("LINE-"):
+                picked_lot[_norm_lot(p.lot_no)] += 1
 
-        # Transfer-in only stores in interunit_transfer_in tables.
-        # For cold-destination transfers (cold→cold), insert into destination cold_stocks.
-        # For warehouse-destination transfers (cold→warehouse), do NOT insert into
-        # bulk_entry_boxes — the interunit_transfer_in_boxes records are the final state.
-        if dest.endswith("_cold_stocks"):
-            if not _table_exists(db, dest):
-                logger.warning("PICK_PENDING: destination table %s missing, skip box_id=%s", dest, p.box_id)
-                continue
-
-            cold_json = p.cold_storage_data or {}
-            db.execute(
-                text(f"""
-                    INSERT INTO {dest}
-                        (inward_dt, unit, inward_no, item_description, item_mark,
-                         vakkal, lot_no, no_of_cartons, weight_kg,
-                         total_inventory_kgs, group_name, item_subgroup, storage_location,
-                         exporter, last_purchase_rate, value,
-                         box_id, transaction_no, spl_remarks)
-                    VALUES
-                        (:inward_dt, :unit, :inward_no, :item_description, :item_mark,
-                         :vakkal, :lot_no, :no_of_cartons, :weight_kg,
-                         :total_inventory_kgs, :group_name, :item_subgroup, :storage_location,
-                         :exporter, :last_purchase_rate, :value,
-                         :box_id, :transaction_no, :spl_remarks)
-                    ON CONFLICT DO NOTHING
-                """),
-                {
-                    "inward_dt": cold_json.get("inward_dt"),
-                    "unit": cold_json.get("unit") or p.to_site,
-                    "inward_no": challan_no_for_inward or cold_json.get("inward_no") or p.transfer_out_challan_no,
-                    "item_description": p.item_description,
-                    "item_mark": cold_json.get("item_mark"),
-                    "vakkal": cold_json.get("vakkal"),
-                    "lot_no": p.lot_no,
-                    "no_of_cartons": p.no_of_cartons or 1,
-                    "weight_kg": p.weight_kg,
-                    "total_inventory_kgs": cold_json.get("total_inventory_kgs") or float(p.weight_kg or 0),
-                    "group_name": cold_json.get("group_name"),
-                    "item_subgroup": cold_json.get("item_subgroup"),
-                    "storage_location": cold_json.get("storage_location") or p.to_site,
-                    "exporter": cold_json.get("exporter"),
-                    "last_purchase_rate": cold_json.get("last_purchase_rate"),
-                    "value": cold_json.get("value"),
-                    "box_id": p.box_id,
-                    "transaction_no": p.transaction_no,
-                    "spl_remarks": cold_json.get("spl_remarks"),
-                },
-            )
-
-        db.execute(
-            text("DELETE FROM pending_transfer_stock WHERE id = :id"),
-            {"id": p.id},
-        )
-        picked += 1
-        logger.info("PICK_PENDING: box_id=%s tno=%s -> %s (transfer_out_id=%s)",
-                    p.box_id, p.transaction_no, dest, transfer_out_id)
+    # Phase 2 — fungible lot-fallback. Acknowledged boxes that did NOT match an exact
+    # (box_id, transaction_no) are still reconciled against THIS transfer's remaining
+    # pending rows of the SAME lot, bounded by the acknowledged count for that lot.
+    # This stops relabeled / transaction_no-less Transfer-In scans from leaking boxes
+    # as phantom 'In Transit' (the partial-receipt leak). Only active when
+    # acknowledged_boxes (with lots) was supplied.
+    if ack is not None and ack_lot_total:
+        for p in unpicked:
+            lot = _norm_lot(p.lot_no)
+            if picked_lot[lot] < ack_lot_total.get(lot, 0):
+                if _do_pick(p):
+                    picked += 1
+                    picked_lot[lot] += 1
 
     logger.info("PICK_PENDING: picked %d rows for transfer_out_id=%s", picked, transfer_out_id)
     return picked
@@ -2022,11 +2047,22 @@ def restore_to_source(transfer_out_id: int, db: Session) -> int:
                         restored += 1
                         continue
 
-            article_key = (p.transaction_no or "", p.article or p.item_description or "")
-            box_number_counters[article_key] = box_number_counters.get(article_key, 0) + 1
-            box_num = box_number_counters[article_key]
+            # Use the ORIGINAL box_number (encoded in the box_id suffix, e.g. "34732254-5" -> 5)
+            # so the restored row does NOT collide with surviving siblings on the
+            # (transaction_no, article_description, box_number) UNIQUE key. The old code used a
+            # fresh counter starting at 1, which collided with box #1 still in stock → the
+            # `ON CONFLICT DO NOTHING` then silently dropped the restore and the box was LOST.
+            box_num = None
+            if p.box_id and "-" in str(p.box_id):
+                _suffix = str(p.box_id).rsplit("-", 1)[-1]
+                if _suffix.isdigit():
+                    box_num = int(_suffix)
+            if box_num is None:
+                article_key = (p.transaction_no or "", p.article or p.item_description or "")
+                box_number_counters[article_key] = box_number_counters.get(article_key, 0) + 1
+                box_num = box_number_counters[article_key]
 
-            db.execute(
+            res = db.execute(
                 text(f"""
                     INSERT INTO {target_table}
                         (box_id, transaction_no, article_description, lot_number,
@@ -2047,6 +2083,14 @@ def restore_to_source(transfer_out_id: int, db: Session) -> int:
                     "count": p.no_of_cartons or 1,
                 },
             )
+            # Never lose a box silently: if the restore INSERT was a no-op (still a conflict),
+            # log it loudly so it can be reconciled instead of vanishing.
+            if res.rowcount == 0:
+                logger.warning(
+                    "RESTORE_SOURCE: box_id=%s tno=%s box_number=%s NOT restored to %s "
+                    "(ON CONFLICT no-op) — box may remain missing, needs manual check.",
+                    p.box_id, p.transaction_no, box_num, target_table,
+                )
 
         # Mark the disposition row as reverted (transfer was cancelled/deleted).
         # Use both the current box_id and original_box_id (if STBR remapped it)

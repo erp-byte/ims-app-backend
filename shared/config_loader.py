@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 720  # 12h — long session so users aren't logged out mid-work (no token-refresh flow yet)
     REFRESH_TOKEN_EXPIRE_HOURS: int = 10
     AES_SECRET_KEY: str  # 64-char hex string (32 bytes)
     LOCATIONIQ_API_KEY: str

@@ -29,6 +29,24 @@ from services.ims_service.interunit_models import (
     CategorialSearchResponse,
     CategorialDropdownResponse,
 )
+from services.ims_service.cold_transfer_in_tools import (
+    ColdTransferInCreate,
+    ColdTransferInFinalize,
+    ColdTransferInDetail,
+    ColdTransferInCreateResponse,
+    create_cold_transfer_in,
+    finalize_cold_transfer_in,
+    get_cold_transfer_in_by_id,
+    delete_cold_transfer_in,
+)
+from services.ims_service.cold_transfer_out_tools import (
+    ColdTransferOutCreate,
+    ColdTransferOutEdit,
+    ColdTransferOutCreateResponse,
+    create_cold_transfer_out,
+    edit_cold_transfer_out,
+    delete_cold_transfer_out,
+)
 from services.ims_service.interunit_tools import (
     get_warehouse_sites,
     create_request,
@@ -43,6 +61,7 @@ from services.ims_service.interunit_tools import (
     delete_transfer,
     create_transfer_in,
     list_transfer_ins,
+    list_cold_transfer_ins,
     get_transfer_in,
     create_pending_transfer_in,
     acknowledge_pending_box,
@@ -50,6 +69,7 @@ from services.ims_service.interunit_tools import (
     acknowledge_pending_boxes_batch,
     finalize_transfer_in,
     get_pending_by_transfer_out,
+    get_pending_boxes_by_transfer_out,
     categorial_global_search,
     categorial_dropdown,
     get_bulk_entry_box,
@@ -322,6 +342,101 @@ def list_transfer_ins_endpoint(
     )
 
 
+# Cold-only Transfer-In listing. Reads exclusively from the new
+# `cold_transfer_in_headers` + `cold_transfer_inboxes` tables. Shape-
+# identical to /interunit/transfer-in above so the cold-transfer page can
+# swap with one identifier change. The legacy /transfer-in endpoint is
+# untouched and continues to back the main /transfer page.
+@router.get("/cold-transfer-in/list")
+def list_cold_transfer_ins_endpoint(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=1000),
+    receiving_warehouse: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, description="GRN / challan / lot / box-id / item / site"),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
+    db: Session = Depends(get_db),
+):
+    return list_cold_transfer_ins(
+        page, per_page, receiving_warehouse,
+        from_date, to_date, sort_by, sort_order, db, search=search,
+    )
+
+
+# Cold-only write endpoints — sole entry point for cold-destination receipts.
+# Writes go to cold_transfer_in_headers + cold_transfer_inboxes + <company>_cold_stocks
+# and clean up pending_transfer_stock. They DO NOT touch interunit_transfer_in_header /
+# interunit_transfer_in_boxes. The legacy /transfer-in endpoint rejects cold destinations.
+@router.post("/cold-transfer-in/create", response_model=ColdTransferInCreateResponse)
+def create_cold_transfer_in_endpoint(
+    data: ColdTransferInCreate,
+    db: Session = Depends(get_db),
+):
+    return create_cold_transfer_in(db, data)
+
+
+@router.post("/cold-transfer-in/{header_id}/finalize", response_model=ColdTransferInCreateResponse)
+def finalize_cold_transfer_in_endpoint(
+    header_id: int,
+    data: ColdTransferInFinalize,
+    db: Session = Depends(get_db),
+):
+    return finalize_cold_transfer_in(db, header_id, data)
+
+
+# No response_model — get_cold_transfer_in_by_id returns the FULL header + box detail
+# (all cold-storage fields) for the view page; a strict model would strip them.
+@router.get("/cold-transfer-in/{header_id}")
+def get_cold_transfer_in_endpoint(
+    header_id: int,
+    db: Session = Depends(get_db),
+):
+    return get_cold_transfer_in_by_id(db, header_id)
+
+
+@router.delete("/cold-transfer-in/{header_id}")
+def delete_cold_transfer_in_endpoint(
+    header_id: int,
+    user_email: str = Query(..., description="Email of user performing delete"),
+    db: Session = Depends(get_db),
+):
+    return delete_cold_transfer_in(db, header_id, user_email)
+
+
+# ── Cold transfer-OUT (cold-source dispatch) ──
+# Writes header/lines/boxes to shared OUT tables (interunit_transfers_header,
+# interunit_transfer_boxes, interunit_transfers_lines) AND deducts source cold
+# stock via the shared park_in_pending middleware. Cold-source code is owned
+# exclusively by this module — the legacy /transfers create endpoints reject
+# cold sources with HTTP 400.
+
+@router.post("/cold-transfer-out/create", response_model=ColdTransferOutCreateResponse)
+def create_cold_transfer_out_endpoint(
+    payload: ColdTransferOutCreate,
+    db: Session = Depends(get_db),
+):
+    return create_cold_transfer_out(db, payload)
+
+
+@router.post("/cold-transfer-out/{header_id}/edit")
+def edit_cold_transfer_out_endpoint(
+    header_id: int,
+    payload: ColdTransferOutEdit,
+    db: Session = Depends(get_db),
+):
+    return edit_cold_transfer_out(db, header_id, payload)
+
+
+@router.delete("/cold-transfer-out/{header_id}")
+def delete_cold_transfer_out_endpoint(
+    header_id: int,
+    db: Session = Depends(get_db),
+):
+    return delete_cold_transfer_out(db, header_id)
+
+
 # ── Pending Transfer IN (real-time acknowledge) ──
 
 
@@ -339,6 +454,14 @@ def get_pending_by_transfer_out_endpoint(
     db: Session = Depends(get_db),
 ):
     return get_pending_by_transfer_out(transfer_out_id, db)
+
+
+@router.get("/pending-stock/boxes/by-transfer-out/{transfer_out_id}")
+def get_pending_boxes_by_transfer_out_endpoint(
+    transfer_out_id: int,
+    db: Session = Depends(get_db),
+):
+    return get_pending_boxes_by_transfer_out(transfer_out_id, db)
 
 
 @router.post("/transfer-in/{header_id}/acknowledge")

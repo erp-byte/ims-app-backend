@@ -3694,7 +3694,105 @@ def get_box_by_box_id(company: Company, box_id: str, transaction_no: str, db: Se
 
 
 
-    raise HTTPException(404, f"Box with box_id '{box_id}' and transaction_no '{transaction_no}' not found in cfpl_boxes or cdpl_boxes")
+    # Fallback: Bulk-Entry boxes. Boxes created via Bulk Entry live in
+    # {prefix}_bulk_entry_boxes (not {prefix}_boxes_v2); their item details come from
+    # {prefix}_bulk_entry_articles (joined by transaction_no + article_description).
+    for prefix in ("cfpl", "cdpl"):
+        be_box = f"{prefix}_bulk_entry_boxes"
+        be_art = f"{prefix}_bulk_entry_articles"
+        sku_table = f"{prefix}sku"
+
+        be_res = db.execute(
+            text(f"""
+                SELECT b.box_id, b.transaction_no, b.box_number, b.article_description,
+                       b.net_weight AS box_net_weight, b.gross_weight AS box_gross_weight,
+                       b.lot_number AS box_lot_number, b.count AS box_count,
+                       a.sku_id, a.item_description, a.item_category, a.sub_category,
+                       a.material_type, a.uom, a.quality_grade, a.quantity_units, a.units,
+                       a.net_weight AS art_net_weight, a.total_weight AS art_total_weight,
+                       a.lot_number AS art_lot_number, a.manufacturing_date, a.expiry_date,
+                       a.item_mark, a.vakkal,
+                       s.material_type AS sku_material_type
+                FROM {be_box} b
+                LEFT JOIN {be_art} a
+                       ON b.transaction_no = a.transaction_no
+                      AND b.article_description = a.item_description
+                LEFT JOIN {sku_table} s ON a.sku_id = s.id
+                WHERE b.box_id = :box_id AND b.transaction_no = :txno
+                LIMIT 1
+            """),
+            {"box_id": box_id, "txno": transaction_no},
+        ).fetchone()
+
+        if be_res:
+            box = dict(be_res._mapping)
+            return {
+                "success": True,
+                "box": {
+                    "box_id": box.get("box_id"),
+                    "transaction_no": box.get("transaction_no"),
+                    "box_number": box.get("box_number"),
+                    "article_description": box.get("article_description"),
+                    "item_description": box.get("item_description") or box.get("article_description"),
+                    "sku_id": box.get("sku_id"),
+                    "item_category": box.get("item_category"),
+                    "sub_category": box.get("sub_category"),
+                    "material_type": box.get("material_type") or box.get("sku_material_type"),
+                    "net_weight": float(box.get("box_net_weight") or box.get("art_net_weight") or 0),
+                    "gross_weight": float(box.get("box_gross_weight") or 0),
+                    "lot_number": box.get("box_lot_number") or box.get("art_lot_number"),
+                    "batch_number": None,
+                    "uom": box.get("uom"),
+                    "manufacturing_date": str(box.get("manufacturing_date") or ""),
+                    "expiry_date": str(box.get("expiry_date") or ""),
+                    "quantity_units": box.get("quantity_units") or box.get("units"),
+                    "packaging_type": None,
+                    "quality_grade": box.get("quality_grade"),
+                    "count": box.get("box_count"),
+                    "source_table": be_box,
+                },
+            }
+
+    # Not in any stock table. Consult the disposition ledger (cold_stock_disposition)
+    # to explain WHY — already dispatched, or cancelled-but-not-restored — so the
+    # scan can show a clear 2-3 line message instead of a bare "not found".
+    detail = (
+        f"Box {box_id} (txn {transaction_no}) is NOT in available stock. "
+        f"No inward or dispatch record found — it may never have been created, "
+        f"or was already received elsewhere."
+    )
+    try:
+        disp = db.execute(
+            text("""
+                SELECT disposition_type, disposition_ref_no, disposed_at, disposed_by,
+                       reverted, reverted_reason
+                FROM cold_stock_disposition
+                WHERE box_id = :box_id AND transaction_no = :txno
+                ORDER BY id DESC LIMIT 1
+            """),
+            {"box_id": box_id, "txno": transaction_no},
+        ).fetchone()
+        if disp:
+            m = disp._mapping
+            when = str(m["disposed_at"])[:16] if m["disposed_at"] else "?"
+            ref = m["disposition_ref_no"] or "?"
+            who = m["disposed_by"] or "?"
+            if m["reverted"]:
+                detail = (
+                    f"Box {box_id} is NOT in available stock. "
+                    f"It was dispatched in transfer {ref} on {when} (by {who}), which was later cancelled — "
+                    f"but the box was not restored to stock. Ask an admin to restore it before dispatching."
+                )
+            else:
+                detail = (
+                    f"Box {box_id} is NOT in available stock. "
+                    f"It is already dispatched / in-transit in transfer {ref} (on {when}, by {who}). "
+                    f"Receive or cancel that transfer before dispatching this box again."
+                )
+    except Exception:
+        pass  # ledger optional — fall back to the generic message above
+
+    raise HTTPException(404, detail)
 
 
 

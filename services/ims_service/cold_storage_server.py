@@ -458,8 +458,13 @@ def search_cold_storage_stocks(
         LIMIT :limit
     """
 
-    # Always search cfpl_cold_stocks first; fall back to cdpl_cold_stocks if empty
+    # Always search cfpl_cold_stocks first; fall back to cdpl_cold_stocks if empty.
+    # Track which table the rows actually came from so each result carries its
+    # REAL source company (cfpl/cdpl). The UI no longer guesses company from a
+    # dropdown/navbar — it uses this value so pick-boxes + deduction hit the
+    # correct cold table.
     rows = []
+    source_company = None
     for tbl in ["cfpl_cold_stocks", "cdpl_cold_stocks"]:
         tbl_exists = db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{tbl}"}).scalar()
         if not tbl_exists:
@@ -469,6 +474,7 @@ def search_cold_storage_stocks(
             params,
         ).fetchall()
         if rows:
+            source_company = "cfpl" if tbl == "cfpl_cold_stocks" else "cdpl"
             break
 
     results = [
@@ -492,6 +498,7 @@ def search_cold_storage_stocks(
             "value": float(r.value) if r.value else None,
             "box_id": r.box_id,
             "transaction_no": r.transaction_no,
+            "company": source_company,
         }
         for r in rows
     ]

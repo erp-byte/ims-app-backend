@@ -381,7 +381,7 @@ def _deduct_cold_storage_stock(db: Session, header_id: int, line_items: list):
     header_ctx = None
     try:
         header_ctx = db.execute(
-            text("""SELECT challan_no, company, created_by
+            text("""SELECT challan_no, created_by
                     FROM jb_materialout_header WHERE id = :id"""),
             {"id": header_id},
         ).mappings().fetchone()
@@ -464,7 +464,8 @@ def _deduct_cold_storage_stock(db: Session, header_id: int, line_items: list):
                 transaction_no=str(transaction_no),
                 lot_no=row_dict.get("lot_no") or item.get("lot_number"),
                 item_description=row_dict.get("item_description") or item.get("description"),
-                from_company=(header_ctx or {}).get("company") if header_ctx else None,
+                from_company=("CFPL" if table == "cfpl_cold_stocks"
+                              else "CDPL" if table == "cdpl_cold_stocks" else None),
                 unit=row_dict.get("unit") or cold_unit,
                 from_site=row_dict.get("storage_location") or row_dict.get("warehouse"),
                 source_table=table,
@@ -1372,37 +1373,29 @@ def submit_material_in(
         else:
             fg_counts_by_desc[_desc] = fg_counts_by_desc.get(_desc, 0) + 1
 
-    # Per-item kg caps: total net_weight in a bucket must not exceed the user's stated kg.
-    sent_caps_fg:  dict[str, float] = {}
-    sent_caps_rej: dict[str, float] = {}
-    for _it in items:
-        _d = (_it.get("description") or "").strip()
-        sent_caps_fg[_d]  = sent_caps_fg.get(_d, 0.0)  + float(_it.get("finished_goods_kgs") or 0)
-        sent_caps_rej[_d] = sent_caps_rej.get(_d, 0.0) + float(_it.get("rejection_kgs") or 0)
+    # Kg caps: total box net-weight per bucket must not exceed the user's stated
+    # FG / Rejection received. Compared as TOTALS (not per-description) because in
+    # job work the finished-good product description can differ from the dispatched
+    # raw-material description (e.g. raw cashew -> "BLACK PEPPER CASHEW BULK").
+    # Matching by description gave false "exceeds (0.000kg)" rejections. The frontend
+    # enforces the same total-based caps before submit.
+    total_cap_fg  = sum(float(_it.get("finished_goods_kgs") or 0) for _it in items)
+    total_cap_rej = sum(float(_it.get("rejection_kgs") or 0) for _it in items)
+    total_box_fg  = sum(float(_b.get("net_weight") or 0) for _b in boxes_payload
+                        if (_b.get("box_type") or "FG").upper() != "REJECTION")
+    total_box_rej = sum(float(_b.get("net_weight") or 0) for _b in boxes_payload
+                        if (_b.get("box_type") or "FG").upper() == "REJECTION")
 
-    box_kg_fg:  dict[str, float] = {}
-    box_kg_rej: dict[str, float] = {}
-    for _b in boxes_payload:
-        _d  = (_b.get("item_description") or "").strip()
-        _bt = (_b.get("box_type") or "FG").upper()
-        _w  = float(_b.get("net_weight") or 0)
-        if _bt == "REJECTION":
-            box_kg_rej[_d] = box_kg_rej.get(_d, 0.0) + _w
-        else:
-            box_kg_fg[_d] = box_kg_fg.get(_d, 0.0) + _w
-
-    for _d, _w in box_kg_fg.items():
-        if _w > sent_caps_fg.get(_d, 0.0) + 0.01:
-            raise HTTPException(
-                status_code=400,
-                detail=f"FG box net-weight total ({_w:.3f}kg) exceeds FG Received ({sent_caps_fg.get(_d, 0.0):.3f}kg) for '{_d}'.",
-            )
-    for _d, _w in box_kg_rej.items():
-        if _w > sent_caps_rej.get(_d, 0.0) + 0.01:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Rejection box net-weight total ({_w:.3f}kg) exceeds Rejection ({sent_caps_rej.get(_d, 0.0):.3f}kg) for '{_d}'.",
-            )
+    if total_box_fg > total_cap_fg + 0.01:
+        raise HTTPException(
+            status_code=400,
+            detail=f"FG box net-weight total ({total_box_fg:.3f}kg) exceeds FG Received ({total_cap_fg:.3f}kg).",
+        )
+    if total_box_rej > total_cap_rej + 0.01:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Rejection box net-weight total ({total_box_rej:.3f}kg) exceeds Rejection ({total_cap_rej:.3f}kg).",
+        )
 
     for item in items:
         db.execute(text("""

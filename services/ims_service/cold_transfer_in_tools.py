@@ -568,6 +568,23 @@ def _process_box_loop(
     SELECT above never touches them because the TX-In page regenerates real
     `{epoch}-{n}` box_ids before submit.
     """
+    # Reject boxes that haven't been through "Generate QR" — they carry no unique
+    # identity (blank box_id / transaction_no), which collides on the cold_stocks
+    # UNIQUE (transaction_no, box_id). Fail fast with an actionable message instead
+    # of a 500 deep in the INSERT.
+    _ungenerated = [
+        b for b in boxes
+        if not (b.box_id or "").strip() or not (b.transaction_no or "").strip()
+    ]
+    if _ungenerated:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{len(_ungenerated)} box(es) have no generated ID. "
+                "Click 'Generate QR' to assign unique box IDs before finalizing."
+            ),
+        )
+
     inserted = 0
     for b in boxes:
         # Match the pending row by the PHYSICAL box identity (box_id + transaction_no) —

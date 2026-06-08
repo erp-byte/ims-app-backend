@@ -764,7 +764,13 @@ def inner_cold_transfer(payload: InnerTransferPayload, db: Session = Depends(get
                 errors.append(f"Line {idx + 1}: Record ID {line.stock_record_id} not found")
                 continue
 
-            # Fetch ALL rows matching this item/lot group (since stock search groups by item+lot)
+            # Fetch ALL rows matching this item/lot group (since stock search groups by item+lot).
+            # Filter on the line's explicit old_lot_number, NOT ref_row.lot_no: when multiple
+            # lines in one payload share the same stock_record_id, an earlier line may have
+            # already relabeled that record's lot_no, making ref_row.lot_no stale. Using it would
+            # make a later line convert boxes out of the wrong (already-new) lot. Fall back to
+            # ref_row.lot_no only if the line carries no old_lot_number.
+            source_lot = line.old_lot_number if line.old_lot_number else ref_row.lot_no
             all_rows = db.execute(
                 text(f"""
                     SELECT id, no_of_cartons, weight_kg, value
@@ -776,7 +782,7 @@ def inner_cold_transfer(payload: InnerTransferPayload, db: Session = Depends(get
                 """),
                 {
                     "desc": ref_row.item_description,
-                    "lot_no": ref_row.lot_no,
+                    "lot_no": source_lot,
                     "inward_no": ref_row.inward_no,
                 },
             ).fetchall()

@@ -561,7 +561,8 @@ def bulk_delete_cold_storage(record_ids: list[int], db: Session) -> dict:
 DIRECT_OUT_COLS = (
     "id, transaction_no, transaction_type, company, entry_date, authority_person, "
     "to_customer, warehouse, vehicle_no, invoice_no, remarks, lines, line_count, "
-    "total_issue_qty, status, created_by, created_at, updated_at, removed_stock_snapshot"
+    "total_issue_qty, status, created_by, created_at, updated_at, removed_stock_snapshot, "
+    "lot_no"
 )
 
 
@@ -597,6 +598,7 @@ def _map_direct_out_row(row) -> dict:
         "remarks": row.remarks,
         "lines": lines_val or [],
         "line_count": row.line_count,
+        "lot_no": getattr(row, "lot_no", None),
         "total_issue_qty": float(row.total_issue_qty) if row.total_issue_qty is not None else None,
         "status": row.status,
         "created_by": row.created_by,
@@ -613,6 +615,15 @@ def create_direct_out(payload, db: Session) -> dict:
     transaction_no = f"DO-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     lines_list = [l.model_dump() for l in payload.lines]
     total_issue_qty = sum(float(l.issue_qty or 0) for l in payload.lines)
+
+    # Persist the lot number(s) on the header's lot_no column. A Direct Out can span
+    # multiple lots/lines, so store the distinct lot values joined by ", " (single lot
+    # → just that lot; none → NULL).
+    lot_values = sorted({
+        str(l.lot_no).strip() for l in payload.lines
+        if getattr(l, "lot_no", None) and str(l.lot_no).strip()
+    })
+    lot_no_combined = ", ".join(lot_values) if lot_values else None
 
     # ── Snapshot + delete the picked stock rows ──────────────
     # Each row in cold_stocks = ONE carton/box. The form lets the user type
@@ -729,6 +740,7 @@ def create_direct_out(payload, db: Session) -> dict:
         "removed_stock_snapshot": snapshot_json,
         "total_issue_qty": total_issue_qty,
         "created_by": payload.created_by,
+        "lot_no": lot_no_combined,
     }
 
     row = db.execute(
@@ -736,11 +748,11 @@ def create_direct_out(payload, db: Session) -> dict:
             f"INSERT INTO {table} ("
             "transaction_no, transaction_type, company, entry_date, authority_person, "
             "to_customer, warehouse, vehicle_no, invoice_no, remarks, lines, "
-            "removed_stock_snapshot, total_issue_qty, created_by"
+            "removed_stock_snapshot, total_issue_qty, created_by, lot_no"
             ") VALUES ("
             ":transaction_no, :transaction_type, :company, :entry_date, :authority_person, "
             ":to_customer, :warehouse, :vehicle_no, :invoice_no, :remarks, CAST(:lines AS jsonb), "
-            "CAST(:removed_stock_snapshot AS jsonb), :total_issue_qty, :created_by"
+            "CAST(:removed_stock_snapshot AS jsonb), :total_issue_qty, :created_by, :lot_no"
             f") RETURNING {DIRECT_OUT_COLS}"
         ),
         params,

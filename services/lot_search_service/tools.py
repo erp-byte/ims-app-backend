@@ -13,9 +13,14 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 
-# Per-category row cap. Beyond this we surface the count and ask the user to
-# narrow their query (e.g. add a transaction_no).
+# Per-category row cap. We still cap the *rows* returned for display, but report
+# the exact total count (so the UI shows e.g. "247" instead of "100+").
 PER_TABLE_LIMIT = 100
+
+
+def _count(db: Session, from_sql: str, where: str, params: dict) -> int:
+    """Exact COUNT(*) for a table+filter — only invoked when a table is truncated."""
+    return int(db.execute(text(f"SELECT COUNT(*) FROM {from_sql} WHERE {where}"), params).scalar() or 0)
 
 
 def _and_clauses(lot_col: str, box_col: str, txn_col: str,
@@ -57,7 +62,8 @@ def _search_v2_boxes(db: Session, lot: Optional[str], box: Optional[str], txn: O
                 "extra": {"box_number": r.box_number, "gross_weight": float(r.gross_weight or 0)},
             })
         if len(rows) > PER_TABLE_LIMIT:
-            results.append({"table": table, "_truncated": True})
+            results.append({"table": table, "_truncated": True,
+                            "_total": _count(db, table, where, params)})
     return results
 
 
@@ -82,7 +88,8 @@ def _search_bulk_entry_boxes(db: Session, lot: Optional[str], box: Optional[str]
                 "extra": {"box_number": r.box_number, "gross_weight": float(r.gross_weight or 0)},
             })
         if len(rows) > PER_TABLE_LIMIT:
-            results.append({"table": table, "_truncated": True})
+            results.append({"table": table, "_truncated": True,
+                            "_total": _count(db, table, where, params)})
     return results
 
 
@@ -118,7 +125,8 @@ def _search_transfer_out(db: Session, lot: Optional[str], box: Optional[str], tx
             },
         })
     if len(rows) > PER_TABLE_LIMIT:
-        out.append({"table": "interunit_transfer_boxes", "_truncated": True})
+        out.append({"table": "interunit_transfer_boxes", "_truncated": True,
+                    "_total": _count(db, "interunit_transfer_boxes itb", where, params)})
     return out
 
 
@@ -161,7 +169,8 @@ def _search_transfer_in(db: Session, lot: Optional[str], box: Optional[str], txn
             },
         })
     if len(rows) > PER_TABLE_LIMIT:
-        out.append({"table": "interunit_transfer_in_boxes", "_truncated": True})
+        out.append({"table": "interunit_transfer_in_boxes", "_truncated": True,
+                    "_total": _count(db, "interunit_transfer_in_boxes itb", where, params)})
     return out
 
 
@@ -191,7 +200,8 @@ def _search_jb_materialout(db: Session, lot: Optional[str], box: Optional[str], 
             },
         })
     if len(rows) > PER_TABLE_LIMIT:
-        out.append({"table": "jb_materialout_lines", "_truncated": True})
+        out.append({"table": "jb_materialout_lines", "_truncated": True,
+                    "_total": _count(db, "jb_materialout_lines l", where, params)})
     return out
 
 
@@ -223,7 +233,8 @@ def _search_jb_inward_boxes(db: Session, lot: Optional[str], box: Optional[str],
             },
         })
     if len(rows) > PER_TABLE_LIMIT:
-        out.append({"table": "jb_inward_boxes", "_truncated": True})
+        out.append({"table": "jb_inward_boxes", "_truncated": True,
+                    "_total": _count(db, "jb_inward_boxes", where, params)})
     return out
 
 
@@ -256,7 +267,8 @@ def _search_cold_stocks(db: Session, lot: Optional[str], box: Optional[str], txn
                 },
             })
         if len(rows) > PER_TABLE_LIMIT:
-            results.append({"table": table, "_truncated": True})
+            results.append({"table": table, "_truncated": True,
+                            "_total": _count(db, table, where, params)})
     return results
 
 
@@ -294,7 +306,8 @@ def _search_cold_transfer_in(db: Session, lot: Optional[str], box: Optional[str]
             },
         })
     if len(rows) > PER_TABLE_LIMIT:
-        out.append({"table": "cold_transfer_inboxes", "_truncated": True})
+        out.append({"table": "cold_transfer_inboxes", "_truncated": True,
+                    "_total": _count(db, "cold_transfer_inboxes ctb", where, params)})
     return out
 
 
@@ -347,7 +360,8 @@ def _search_disposition(db: Session, lot: Optional[str], box: Optional[str], txn
             },
         })
     if len(rows) > PER_TABLE_LIMIT:
-        out.append({"table": "cold_stock_disposition", "_truncated": True})
+        out.append({"table": "cold_stock_disposition", "_truncated": True,
+                    "_total": _count(db, "cold_stock_disposition", where, params)})
     return out
 
 
@@ -387,7 +401,8 @@ def _search_direct_out_headers(db: Session, txn: Optional[str]) -> list[dict]:
                 },
             })
         if len(rows) > PER_TABLE_LIMIT:
-            out.append({"table": table, "_truncated": True})
+            out.append({"table": table, "_truncated": True,
+                        "_total": _count(db, table, "transaction_no = :txn", {"txn": txn})})
     return out
 
 
@@ -406,6 +421,29 @@ CATEGORIES = (
 )
 
 
+def _category_payload(label: str, rows: list[dict]) -> dict:
+    """Build a category result: capped `rows` for display, but an EXACT `count`.
+
+    A category can span multiple tables (e.g. cfpl+cdpl). For a truncated table we
+    use its `_total` (exact COUNT); for a non-truncated table we use the number of
+    rows it actually returned (which is its full count, ≤ PER_TABLE_LIMIT).
+    """
+    non_marker = [r for r in rows if not r.get("_truncated")]
+    markers = [r for r in rows if r.get("_truncated")]
+    truncated_totals = {m["table"]: int(m.get("_total") or 0) for m in markers}
+    returned_by_table: dict = {}
+    for r in non_marker:
+        returned_by_table[r["table"]] = returned_by_table.get(r["table"], 0) + 1
+    all_tables = set(returned_by_table) | set(truncated_totals)
+    exact = sum(truncated_totals.get(t, returned_by_table.get(t, 0)) for t in all_tables)
+    return {
+        "label": label,
+        "count": exact,
+        "rows": non_marker,
+        "truncated": bool(markers),
+    }
+
+
 def search_lot(
     db: Session,
     lot_number: Optional[str],
@@ -419,29 +457,16 @@ def search_lot(
     categories: dict = {}
     grand_total = 0
     for key, label, fn in CATEGORIES:
-        rows = fn(db, lot, box, txn)
-        non_marker = [r for r in rows if not r.get("_truncated")]
-        truncated = any(r.get("_truncated") for r in rows)
-        categories[key] = {
-            "label": label,
-            "count": len(non_marker),
-            "rows": non_marker,
-            "truncated": truncated,
-        }
-        grand_total += len(non_marker)
+        payload = _category_payload(label, fn(db, lot, box, txn))
+        categories[key] = payload
+        grand_total += payload["count"]
 
     # Direct-out header lookup (only meaningful with txn = DO-...)
     do_rows = _search_direct_out_headers(db, txn)
     if do_rows:
-        non_marker = [r for r in do_rows if not r.get("_truncated")]
-        truncated = any(r.get("_truncated") for r in do_rows)
-        categories["direct_out_header"] = {
-            "label": "Direct Out — Transaction",
-            "count": len(non_marker),
-            "rows": non_marker,
-            "truncated": truncated,
-        }
-        grand_total += len(non_marker)
+        payload = _category_payload("Direct Out — Transaction", do_rows)
+        categories["direct_out_header"] = payload
+        grand_total += payload["count"]
 
     return {
         "query": {"lot_number": lot, "box_id": box, "transaction_no": txn},

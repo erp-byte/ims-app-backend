@@ -112,6 +112,21 @@ class ColdTransferOutCreateResponse(BaseModel):
     boxes_parked: int
 
 
+def _parse_trf_date(raw: Optional[str]):
+    """Convert the form's DD-MM-YYYY (or ISO) stock-transfer date into a real date
+    object. Inserting the raw 'DD-MM-YYYY' string lets Postgres misparse it under the
+    default MDY DateStyle (09-06-2026 -> Sep 6), corrupting the stored/displayed date
+    — the regular create_transfer path avoids this via _convert_date."""
+    s = (raw or "").strip()
+    if s:
+        for fmt in ("%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+    return datetime.now().date()
+
+
 def create_cold_transfer_out(
     db: Session,
     payload: ColdTransferOutCreate,
@@ -133,7 +148,7 @@ def create_cold_transfer_out(
         )
 
     # Defaults for NOT NULL columns (stock_trf_date, vehicle_no, remark, reason_code).
-    stock_trf_date = payload.stock_trf_date or datetime.now().date().isoformat()
+    stock_trf_date = _parse_trf_date(payload.stock_trf_date)
     vehicle_no = payload.vehicle_no or ""
     remark = payload.remark or ""
     reason_code = payload.reason_code or ""
@@ -363,7 +378,7 @@ def edit_cold_transfer_out(
     update_fields: Dict[str, Any] = {}
     for col, value in [
         ("challan_no", payload.challan_no),
-        ("stock_trf_date", payload.stock_trf_date),
+        ("stock_trf_date", _parse_trf_date(payload.stock_trf_date) if payload.stock_trf_date else None),
         ("from_site", payload.from_warehouse),
         ("to_site", payload.to_warehouse),
         ("reason_code", payload.reason_code),

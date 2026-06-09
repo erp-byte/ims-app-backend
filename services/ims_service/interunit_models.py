@@ -2,7 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ── Request input schemas ──
@@ -169,11 +169,17 @@ class TransferHeaderCreate(BaseModel):
 
 
 class TransferLineCreate(BaseModel):
-    material_type: str
+    # The transfer forms (direct + cold transfer-out) send the internal line shape
+    # (rm_pm_fg_type / item_desc_raw / qty, with numeric pack_size/weights). Accept
+    # those aliases alongside the canonical names and coerce numbers to str so the
+    # endpoint stops 422-ing. populate_by_name keeps the canonical names working too.
+    model_config = ConfigDict(populate_by_name=True)
+
+    material_type: str = Field(validation_alias=AliasChoices("material_type", "rm_pm_fg_type"))
     item_category: str
     sub_category: str
-    item_description: str
-    quantity: Optional[str] = "0"
+    item_description: str = Field(validation_alias=AliasChoices("item_description", "item_desc_raw"))
+    quantity: Optional[str] = Field(default="0", validation_alias=AliasChoices("quantity", "qty"))
     uom: Optional[str] = ""
     pack_size: Optional[str] = "0.00"
     unit_pack_size: Optional[str] = None
@@ -181,6 +187,14 @@ class TransferLineCreate(BaseModel):
     total_weight: Optional[str] = None
     batch_number: Optional[str] = None
     lot_number: Optional[str] = None
+
+    @field_validator(
+        "quantity", "pack_size", "unit_pack_size", "net_weight", "total_weight",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_number_to_str(cls, v):
+        return str(v) if isinstance(v, (int, float)) else v
 
     @field_validator("material_type")
     @classmethod

@@ -18,6 +18,8 @@ from services.ims_service.rtv_models import (
     RTVDeleteResponse,
     RTVBoxUpsertRequest,
     RTVBoxUpsertResponse,
+    RTVBulkBoxUpdateRequest,
+    RTVBulkBoxUpdateResponse,
     RTVLinesUpdateRequest,
     RTVLinesUpdateResponse,
     RTVApprovalRequest,
@@ -33,6 +35,8 @@ from services.ims_service.rtv_tools import (
     update_rtv,
     delete_rtv,
     upsert_rtv_box,
+    bulk_save_rtv_boxes,
+    compute_rtv_weight_discrepancy,
     update_rtv_lines,
     approve_rtv,
     log_rtv_box_edits,
@@ -48,6 +52,7 @@ from shared.email_notifier import (
     notify_rtv_header_updated,
     notify_rtv_lines_updated,
     notify_rtv_status_changed,
+    notify_rtv_weight_discrepancy,
 )
 
 router = APIRouter(prefix="/rtv", tags=["rtv"])
@@ -297,7 +302,6 @@ def create_rtv_endpoint(
     """Create a new RTV with header and line items."""
     result = create_rtv(data, created_by, db)
     result["_company"] = company
-    notify_rtv_created(result)
     return result
 
 
@@ -330,6 +334,22 @@ def get_rtv_endpoint(
 ):
     """Get RTV detail with lines and boxes."""
     return get_rtv(company, rtv_id, db)
+
+
+@router.post("/{company}/{rtv_id}/send-for-approval")
+def send_for_approval_endpoint(
+    company: Company,
+    rtv_id: int,
+    db: Session = Depends(get_db),
+):
+    """Fire the Business-Head approval mail for an already-saved RTV.
+
+    Separate from create so the FE can hard-save header+lines first, then send.
+    Re-sendable; does not mutate lines/boxes."""
+    detail = get_rtv(company, rtv_id, db)   # same builder GET /{company}/{rtv_id} uses
+    detail["_company"] = company
+    notify_rtv_created(detail)
+    return {"status": "sent", "rtv_id": detail.get("rtv_id", "")}
 
 
 @router.put("/{company}/{rtv_id}", response_model=RTVHeaderResponse)
@@ -403,3 +423,32 @@ def upsert_rtv_box_endpoint(
 ):
     """Upsert a single RTV box (called at print time)."""
     return upsert_rtv_box(company, rtv_id, payload, db)
+
+
+@router.put("/{company}/{rtv_id}/boxes", response_model=RTVBulkBoxUpdateResponse)
+def bulk_save_rtv_boxes_endpoint(
+    company: Company,
+    rtv_id: int,
+    payload: RTVBulkBoxUpdateRequest,
+    notify_discrepancy: bool = Query(
+        True, description="Send the net-weight discrepancy summary email on final submit"
+    ),
+    db: Session = Depends(get_db),
+):
+    """Persist the full box set as a state-aware sync (final submit).
+
+    Mirrors the inward box-merge semantics: insert new / update changed /
+    keep unchanged / delete removed — preserving box_id and printed state on
+    matched rows. After the sync, sends the net-weight discrepancy summary
+    email (per-line expected vs actual totals; no full box table).
+    """
+    result = bulk_save_rtv_boxes(company, rtv_id, payload, db)
+    db.commit()
+
+    if notify_discrepancy:
+        summary = compute_rtv_weight_discrepancy(company, rtv_id, db)
+        detail = get_rtv(company, rtv_id, db)
+        detail["_company"] = company
+        notify_rtv_weight_discrepancy(detail, summary)
+
+    return result

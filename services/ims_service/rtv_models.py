@@ -87,24 +87,6 @@ class RTVLinesUpdateRequest(BaseModel):
     lines: List["RTVLineCreate"] = Field(..., min_length=1)
 
 
-# ── Bulk box save (state-aware full sync) ────
-
-
-class RTVBulkBoxItem(BaseModel):
-    article_description: str
-    box_number: int = Field(..., ge=1)
-    uom: Optional[str] = None
-    conversion: Optional[str] = None
-    lot_number: Optional[str] = None
-    net_weight: Optional[Decimal18_3] = None
-    gross_weight: Optional[Decimal18_3] = None
-    count: Optional[int] = None
-
-
-class RTVBulkBoxUpdateRequest(BaseModel):
-    boxes: List[RTVBulkBoxItem] = Field(default_factory=list)
-
-
 # ── Approval request schemas ─────────────────
 
 
@@ -261,19 +243,6 @@ class RTVLinesUpdateResponse(BaseModel):
     status: str
     rtv_id: str
     lines_count: int
-    # State-diff merge counters (match the frontend types).
-    inserted: int = 0
-    updated: int = 0
-    unchanged: int = 0
-
-
-class RTVBulkBoxUpdateResponse(BaseModel):
-    status: str
-    rtv_id: str
-    inserted: int = 0
-    updated: int = 0
-    unchanged: int = 0
-    deleted: int = 0
 
 
 class RTVApprovalResponse(BaseModel):

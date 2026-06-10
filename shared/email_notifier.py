@@ -2,6 +2,7 @@ import smtplib
 import threading
 from datetime import datetime
 from email.message import EmailMessage
+from html import escape
 from urllib.parse import quote
 
 from shared.config_loader import settings
@@ -75,6 +76,11 @@ def _build_rtv_cc(business_head: str | None, *actors: str | None) -> list[str]:
         seen.add(normalized)
         deduped.append(addr.strip())
     return deduped
+
+
+def _rtv_thread_key(rtv_id: str | None) -> str | None:
+    """Stable Message-ID per CR so all its mails land in one Gmail thread."""
+    return f"RTV-{rtv_id}@candorfoods.in" if rtv_id else None
 
 
 def _send_email_background(
@@ -406,6 +412,106 @@ def notify_rtv_created(rtv_detail: dict) -> None:
         plain_body=plain,
         to=to_list,
         cc=cc,
+        message_id=_rtv_thread_key(rtv_id),
+    )
+
+
+def notify_rtv_weight_discrepancy(rtv_detail: dict, summary: dict) -> None:
+    """Email a net-weight discrepancy SUMMARY at final box submit.
+
+    ``summary`` is produced by compute_rtv_weight_discrepancy and has:
+      rows: [{item_description, expected, actual, diff}], total_expected,
+      total_actual, total_diff, has_discrepancy.
+
+    The mail is a per-line totals summary (Item | Expected | Actual | Diff) plus
+    an overall total row. It deliberately does NOT include a per-box table.
+    Recipients follow the standard RTV pattern (BH + pooja in TO; constants +
+    creator in CC).
+    """
+    rtv_id = rtv_detail.get("rtv_id", "")
+    business_head = rtv_detail.get("business_head")
+    created_by = rtv_detail.get("created_by")
+    rows = summary.get("rows", [])
+
+    def _fmt(n) -> str:
+        try:
+            return f"{float(n):.3f}"
+        except (TypeError, ValueError):
+            return "0.000"
+
+    row_html = []
+    for r in rows:
+        diff = r.get("diff", 0) or 0
+        diff_color = "#c0392b" if diff != 0 else "#27ae60"
+        row_html.append(
+            f"<tr>"
+            f"<td style='padding:6px 10px;border:1px solid #e2e8f0;'>{escape(str(r.get('item_description', '')))}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e2e8f0;text-align:right;'>{_fmt(r.get('expected'))}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e2e8f0;text-align:right;'>{_fmt(r.get('actual'))}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e2e8f0;text-align:right;color:{diff_color};font-weight:bold;'>{_fmt(diff)}</td>"
+            f"</tr>"
+        )
+
+    total_diff = summary.get("total_diff", 0) or 0
+    total_color = "#c0392b" if total_diff != 0 else "#27ae60"
+    banner = (
+        "Net-weight discrepancy detected between the expected (UOM × Total Qty) "
+        "and the actual box-wise totals."
+        if summary.get("has_discrepancy")
+        else "Box entry submitted — expected and actual net weights match."
+    )
+
+    html = f"""<!DOCTYPE html>
+<html><body style="font-family:Arial,Helvetica,sans-serif;color:#222;">
+  <h2 style="font-size:18px;margin:0 0 6px;">Net-Weight Summary — {escape(rtv_id)}</h2>
+  <p style="font-size:13px;color:#555;margin:0 0 14px;">{escape(banner)}</p>
+  <table style="border-collapse:collapse;font-size:13px;min-width:480px;">
+    <thead>
+      <tr style="background:#29417A;color:#fff;">
+        <th style="padding:8px 10px;border:1px solid #29417A;text-align:left;">Item</th>
+        <th style="padding:8px 10px;border:1px solid #29417A;text-align:right;">Expected (kg)</th>
+        <th style="padding:8px 10px;border:1px solid #29417A;text-align:right;">Actual (kg)</th>
+        <th style="padding:8px 10px;border:1px solid #29417A;text-align:right;">Diff (kg)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(row_html)}
+      <tr style="background:#f4f4f4;font-weight:bold;">
+        <td style="padding:8px 10px;border:1px solid #e2e8f0;">Total</td>
+        <td style="padding:8px 10px;border:1px solid #e2e8f0;text-align:right;">{_fmt(summary.get('total_expected'))}</td>
+        <td style="padding:8px 10px;border:1px solid #e2e8f0;text-align:right;">{_fmt(summary.get('total_actual'))}</td>
+        <td style="padding:8px 10px;border:1px solid #e2e8f0;text-align:right;color:{total_color};">{_fmt(total_diff)}</td>
+      </tr>
+    </tbody>
+  </table>
+</body></html>"""
+
+    plain_lines = [f"Net-Weight Summary — {rtv_id}", banner, ""]
+    plain_lines.append("Item | Expected | Actual | Diff")
+    for r in rows:
+        plain_lines.append(
+            f"{r.get('item_description', '')} | {_fmt(r.get('expected'))} | "
+            f"{_fmt(r.get('actual'))} | {_fmt(r.get('diff'))}"
+        )
+    plain_lines.append(
+        f"TOTAL | {_fmt(summary.get('total_expected'))} | "
+        f"{_fmt(summary.get('total_actual'))} | {_fmt(total_diff)}"
+    )
+    plain = "\n".join(plain_lines)
+
+    to_list: list[str] = []
+    bh_email = _lookup_business_head_email(business_head)
+    if bh_email:
+        to_list.append(bh_email)
+    to_list.append(RTV_NOTIFY_TO)
+
+    _send_email_background(
+        subject=f"RTV Net-Weight Discrepancy: {rtv_id}",
+        html_body=html,
+        plain_body=plain,
+        to=to_list,
+        cc=_build_rtv_cc(business_head, created_by),
+        in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
 
 
@@ -451,6 +557,7 @@ def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: st
         plain_body=plain,
         to=to_list,
         cc=cc,
+        in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
     # Action-required email goes separately to the assigned business head only.
     notify_rtv_action_required(rtv_detail)
@@ -525,6 +632,7 @@ def notify_rtv_rejected(rtv_detail: dict, rejected_by: str) -> None:
         html_body=html,
         plain_body=plain,
         cc=cc,
+        in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
 
 
@@ -543,6 +651,7 @@ def notify_rtv_held(rtv_detail: dict, held_by: str) -> None:
         html_body=html,
         plain_body=plain,
         cc=cc,
+        in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
     # Resend action-required email so BH still has the buttons.
     notify_rtv_action_required(rtv_detail)
@@ -567,15 +676,17 @@ def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:
         html_body=html,
         plain_body=plain,
         cc=cc,
+        in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
 
 
 def notify_rtv_deleted(
     rtv_id: str,
     company: str,
+    deleted_by: str | None = None,
+    *,
     business_head: str | None = None,
     created_by: str | None = None,
-    deleted_by: str | None = None,
 ) -> None:
     """Send notification email when an RTV is deleted."""
     header = {"rtv_id": rtv_id, "status": "Deleted", "business_head": business_head, "created_by": created_by}
@@ -595,6 +706,7 @@ def notify_rtv_deleted(
         html_body=html,
         plain_body=plain,
         cc=cc,
+        in_reply_to=_rtv_thread_key(rtv_id),
     )
 
 
@@ -612,6 +724,7 @@ def notify_rtv_header_updated(rtv_detail: dict) -> None:
         html_body=html,
         plain_body=plain,
         cc=cc,
+        in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
 
 

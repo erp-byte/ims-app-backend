@@ -12,6 +12,7 @@ from services.ims_service.rtv_models import (
     RTVCreate,
     RTVHeaderUpdate,
     RTVBoxUpsertRequest,
+    RTVBulkBoxUpdateRequest,
     RTVLinesUpdateRequest,
     RTVApprovalRequest,
     RTVBoxEditLogRequest,
@@ -36,7 +37,11 @@ def rtv_table_names(company: Company) -> dict:
 
 
 def _generate_rtv_id() -> str:
-    return f"RTV-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    # Transaction-number prefix changed from RTV- to CR- (generation only).
+    # Existing RTV- records are untouched; all lookups match by the full
+    # rtv_id string, so they remain prefix-agnostic. This value also flows
+    # into the QR payload and printed labels.
+    return f"CR-{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
 
 def _convert_date(date_str: str):
@@ -64,6 +69,10 @@ def _map_header_row(row) -> dict:
         "created_by": row.created_by,
         "created_ts": row.created_ts,
         "updated_at": row.updated_at,
+        "vehicle_number": getattr(row, "vehicle_number", None),
+        "transporter_name": getattr(row, "transporter_name", None),
+        "driver_name": getattr(row, "driver_name", None),
+        "inward_manager": getattr(row, "inward_manager", None),
     }
 
 
@@ -172,14 +181,19 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             INSERT INTO {tables['header']}
                 (rtv_id, rtv_date, factory_unit, customer,
                  invoice_number, challan_no, dn_no, conversion,
-                 sales_poc, business_head, remark, status, created_by, created_ts)
+                 sales_poc, business_head, remark,
+                 vehicle_number, transporter_name, driver_name, inward_manager,
+                 status, created_by, created_ts)
             VALUES
                 (:rtv_id, NOW(), :factory_unit, :customer,
                  :invoice_number, :challan_no, :dn_no, :conversion,
-                 :sales_poc, :business_head, :remark, 'Pending', :created_by, NOW())
+                 :sales_poc, :business_head, :remark,
+                 :vehicle_number, :transporter_name, :driver_name, :inward_manager,
+                 'Pending', :created_by, NOW())
             RETURNING id, rtv_id, rtv_date, factory_unit, customer,
                       invoice_number, challan_no, dn_no, conversion,
-                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at
+                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at,
+                      vehicle_number, transporter_name, driver_name, inward_manager
         """),
         {
             "rtv_id": rtv_id,
@@ -192,6 +206,10 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             "sales_poc": data.header.sales_poc,
             "business_head": data.header.business_head,
             "remark": data.header.remark,
+            "vehicle_number": data.header.vehicle_number,
+            "transporter_name": data.header.transporter_name,
+            "driver_name": data.header.driver_name,
+            "inward_manager": data.header.inward_manager,
             "created_by": created_by,
         },
     ).fetchone()
@@ -344,7 +362,8 @@ def get_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
         text(f"""
             SELECT id, rtv_id, rtv_date, factory_unit, customer,
                    invoice_number, challan_no, dn_no, conversion,
-                   sales_poc, business_head, remark, status, created_by, created_ts, updated_at
+                   sales_poc, business_head, remark, status, created_by, created_ts, updated_at,
+                   vehicle_number, transporter_name, driver_name, inward_manager
             FROM {tables['header']}
             WHERE id = :hid
         """),
@@ -383,6 +402,10 @@ def update_rtv(company: Company, rtv_id_int: int, data: RTVHeaderUpdate, db: Ses
         "business_head": data.business_head,
         "remark": data.remark,
         "status": data.status,
+        "vehicle_number": data.vehicle_number,
+        "transporter_name": data.transporter_name,
+        "driver_name": data.driver_name,
+        "inward_manager": data.inward_manager,
     }
 
     for col, val in field_map.items():
@@ -407,7 +430,8 @@ def update_rtv(company: Company, rtv_id_int: int, data: RTVHeaderUpdate, db: Ses
             WHERE id = :hid
             RETURNING id, rtv_id, rtv_date, factory_unit, customer,
                       invoice_number, challan_no, dn_no, conversion,
-                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at
+                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at,
+                      vehicle_number, transporter_name, driver_name, inward_manager
         """),
         params,
     ).fetchone()
@@ -567,13 +591,229 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
 
 
 # ══════════════════════════════════════════════
-#  Update lines (replace all)
+#  Bulk box save (state-aware full sync)
+# ══════════════════════════════════════════════
+
+
+def bulk_save_rtv_boxes(
+    company: Company, rtv_id_int: int, data: "RTVBulkBoxUpdateRequest", db: Session
+) -> dict:
+    """Persist the full box set for an RTV as a state-aware sync.
+
+    Diffs the incoming boxes against existing rows keyed by
+    (article_description, box_number):
+      * INSERT rows present in the payload but not in the DB,
+      * UPDATE only changed columns (preserving box_id and printed state),
+      * leave unchanged rows untouched,
+      * DELETE rows in the DB that the payload no longer contains (full sync,
+        including printed boxes the user removed on screen).
+
+    Called on the post-approval "final submit". Returns inserted/updated/
+    unchanged/deleted counters.
+    """
+    tables = rtv_table_names(company)
+
+    header = db.execute(
+        text(f"SELECT id, rtv_id FROM {tables['header']} WHERE id = :hid"),
+        {"hid": rtv_id_int},
+    ).fetchone()
+    if not header:
+        raise HTTPException(404, "RTV not found")
+
+    # Map article_description -> line id (FK) for the incoming articles.
+    line_rows = db.execute(
+        text(f"SELECT id, item_description FROM {tables['lines']} WHERE header_id = :hid"),
+        {"hid": rtv_id_int},
+    ).fetchall()
+    line_id_by_desc = {r.item_description: r.id for r in line_rows}
+
+    # Load existing boxes keyed by (article_description, box_number).
+    existing_rows = db.execute(
+        text(f"""
+            SELECT article_description, box_number, uom, conversion, lot_number,
+                   net_weight, gross_weight, count
+            FROM {tables['boxes']}
+            WHERE header_id = :hid
+        """),
+        {"hid": rtv_id_int},
+    ).fetchall()
+    existing_map = {(r.article_description, r.box_number): r for r in existing_rows}
+
+    inserted = updated = unchanged = 0
+    incoming_keys: set[tuple] = set()
+
+    def _num(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    for b in data.boxes:
+        key = (b.article_description, b.box_number)
+        incoming_keys.add(key)
+        net = float(b.net_weight) if b.net_weight is not None else None
+        gross = float(b.gross_weight) if b.gross_weight is not None else None
+        params = {
+            "hid": rtv_id_int,
+            "line_id": line_id_by_desc.get(b.article_description),
+            "art_desc": b.article_description,
+            "box_num": b.box_number,
+            "uom": b.uom,
+            "conversion": b.conversion,
+            "lot_number": b.lot_number,
+            "net_weight": net,
+            "gross_weight": gross,
+            "count": b.count,
+        }
+
+        old = existing_map.get(key)
+        if old is None:
+            # New box — inserted without box_id (box_id is assigned at print).
+            db.execute(
+                text(f"""
+                    INSERT INTO {tables['boxes']}
+                        (header_id, rtv_line_id, box_number, article_description,
+                         uom, conversion, lot_number, net_weight, gross_weight, count)
+                    VALUES
+                        (:hid, :line_id, :box_num, :art_desc,
+                         :uom, :conversion, :lot_number, :net_weight, :gross_weight, :count)
+                """),
+                params,
+            )
+            inserted += 1
+            continue
+
+        changed = (
+            (old.uom or "") != (b.uom or "")
+            or (str(old.conversion) if old.conversion is not None else "") != (b.conversion or "")
+            or (old.lot_number or "") != (b.lot_number or "")
+            or _num(old.net_weight) != net
+            or _num(old.gross_weight) != gross
+            or (old.count if old.count is not None else None) != b.count
+        )
+
+        if changed:
+            # Update mutable columns only; box_id and printed state are preserved
+            # because they are simply not in the SET list.
+            db.execute(
+                text(f"""
+                    UPDATE {tables['boxes']}
+                    SET rtv_line_id = :line_id,
+                        uom = :uom,
+                        conversion = :conversion,
+                        lot_number = :lot_number,
+                        net_weight = :net_weight,
+                        gross_weight = :gross_weight,
+                        count = :count,
+                        updated_at = NOW()
+                    WHERE header_id = :hid
+                      AND article_description = :art_desc
+                      AND box_number = :box_num
+                """),
+                params,
+            )
+            updated += 1
+        else:
+            unchanged += 1
+
+    # Full sync: delete boxes the payload no longer contains.
+    deleted = 0
+    for (art_desc, box_num) in existing_map:
+        if (art_desc, box_num) not in incoming_keys:
+            db.execute(
+                text(f"""
+                    DELETE FROM {tables['boxes']}
+                    WHERE header_id = :hid
+                      AND article_description = :art_desc
+                      AND box_number = :box_num
+                """),
+                {"hid": rtv_id_int, "art_desc": art_desc, "box_num": box_num},
+            )
+            deleted += 1
+
+    return {
+        "status": "synced",
+        "rtv_id": header.rtv_id,
+        "inserted": inserted,
+        "updated": updated,
+        "unchanged": unchanged,
+        "deleted": deleted,
+    }
+
+
+def compute_rtv_weight_discrepancy(company: Company, rtv_id_int: int, db: Session) -> dict:
+    """Compute the per-line net-weight discrepancy summary for an RTV.
+
+    expected = line.net_weight (UOM x Total Qty, written by the form),
+    actual   = SUM(box.net_weight) for the article,
+    diff     = actual - expected.
+
+    Returns a summary dict with per-line rows and overall totals — used by the
+    discrepancy notification email. No box-level rows are included.
+    """
+    tables = rtv_table_names(company)
+
+    lines = db.execute(
+        text(f"""
+            SELECT item_description, net_weight
+            FROM {tables['lines']}
+            WHERE header_id = :hid
+            ORDER BY id
+        """),
+        {"hid": rtv_id_int},
+    ).fetchall()
+
+    box_sums = db.execute(
+        text(f"""
+            SELECT article_description, COALESCE(SUM(net_weight), 0) AS net_sum
+            FROM {tables['boxes']}
+            WHERE header_id = :hid
+            GROUP BY article_description
+        """),
+        {"hid": rtv_id_int},
+    ).fetchall()
+    actual_by_desc = {r.article_description: float(r.net_sum or 0) for r in box_sums}
+
+    rows = []
+    total_expected = total_actual = 0.0
+    for ln in lines:
+        expected = float(ln.net_weight or 0)
+        actual = actual_by_desc.get(ln.item_description, 0.0)
+        rows.append({
+            "item_description": ln.item_description,
+            "expected": round(expected, 3),
+            "actual": round(actual, 3),
+            "diff": round(actual - expected, 3),
+        })
+        total_expected += expected
+        total_actual += actual
+
+    return {
+        "rows": rows,
+        "total_expected": round(total_expected, 3),
+        "total_actual": round(total_actual, 3),
+        "total_diff": round(total_actual - total_expected, 3),
+        "has_discrepancy": any(r["diff"] != 0 for r in rows),
+    }
+
+
+# ══════════════════════════════════════════════
+#  Update lines (state-aware merge — no destructive wipe)
 # ══════════════════════════════════════════════
 
 
 def update_rtv_lines(
     company: Company, rtv_id_int: int, data: RTVLinesUpdateRequest, db: Session
 ) -> dict:
+    """State-aware line merge.
+
+    Diffs the incoming lines against what is already stored, keyed by
+    item_description, and INSERTs new lines / UPDATEs only changed columns /
+    leaves unchanged rows untouched / DELETEs lines the payload no longer
+    contains. This replaces the old destructive DELETE-all + re-INSERT so an
+    update never throws away (and re-creates) rows that did not actually
+    change. Returns inserted/updated/unchanged counters the frontend expects.
+    """
     tables = rtv_table_names(company)
 
     existing = db.execute(
@@ -585,13 +825,21 @@ def update_rtv_lines(
 
     header_id = existing.id
 
-    # Delete old lines
-    db.execute(
-        text(f"DELETE FROM {tables['lines']} WHERE header_id = :hid"),
+    # Load current lines keyed by item_description for diffing.
+    existing_rows = db.execute(
+        text(f"""
+            SELECT item_description, material_type, item_category, sub_category,
+                   uom, qty, rate, value, net_weight, carton_weight
+            FROM {tables['lines']}
+            WHERE header_id = :hid
+        """),
         {"hid": header_id},
-    )
+    ).fetchall()
+    existing_map = {r.item_description: r for r in existing_rows}
 
-    # Insert new lines
+    inserted = updated = unchanged = 0
+    incoming_descs: set[str] = set()
+
     for line in data.lines:
         qty_i = int(line.qty) if line.qty else 0
         rate_f = float(line.rate) if line.rate else 0.0
@@ -599,34 +847,94 @@ def update_rtv_lines(
         net_weight_f = float(line.net_weight) if line.net_weight else 0.0
         carton_weight_f = float(line.carton_weight) if line.carton_weight else 0.0
 
+        incoming_descs.add(line.item_description)
+        params = {
+            "header_id": header_id,
+            "material_type": line.material_type,
+            "item_category": line.item_category,
+            "sub_category": line.sub_category,
+            "item_description": line.item_description,
+            "uom": line.uom,
+            "qty": qty_i,
+            "rate": rate_f,
+            "value": value_f,
+            "net_weight": net_weight_f,
+            "carton_weight": carton_weight_f,
+        }
+
+        old = existing_map.get(line.item_description)
+        if old is None:
+            db.execute(
+                text(f"""
+                    INSERT INTO {tables['lines']}
+                        (header_id, material_type, item_category, sub_category,
+                         item_description, uom, qty, rate, value, net_weight, carton_weight)
+                    VALUES
+                        (:header_id, :material_type, :item_category, :sub_category,
+                         :item_description, :uom, :qty, :rate, :value, :net_weight, :carton_weight)
+                """),
+                params,
+            )
+            inserted += 1
+            continue
+
+        # Field-level diff — only UPDATE when something actually changed.
+        def _num(v) -> float:
+            try:
+                return float(v) if v is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        changed = (
+            (old.material_type or "") != (line.material_type or "")
+            or (old.item_category or "") != (line.item_category or "")
+            or (old.sub_category or "") != (line.sub_category or "")
+            or (old.uom or "") != (line.uom or "")
+            or _num(old.qty) != float(qty_i)
+            or _num(old.rate) != rate_f
+            or _num(old.value) != value_f
+            or _num(old.net_weight) != net_weight_f
+            or _num(old.carton_weight) != carton_weight_f
+        )
+
+        if changed:
+            db.execute(
+                text(f"""
+                    UPDATE {tables['lines']}
+                    SET material_type = :material_type,
+                        item_category = :item_category,
+                        sub_category = :sub_category,
+                        uom = :uom, qty = :qty, rate = :rate, value = :value,
+                        net_weight = :net_weight, carton_weight = :carton_weight,
+                        updated_at = NOW()
+                    WHERE header_id = :header_id AND item_description = :item_description
+                """),
+                params,
+            )
+            updated += 1
+        else:
+            unchanged += 1
+
+    # Delete lines the payload no longer contains, and their boxes (a removed
+    # article means its boxes go too — keeps the FK and box list consistent).
+    removed = [desc for desc in existing_map if desc not in incoming_descs]
+    for desc in removed:
         db.execute(
-            text(f"""
-                INSERT INTO {tables['lines']}
-                    (header_id, material_type, item_category, sub_category,
-                     item_description, uom, qty, rate, value, net_weight, carton_weight)
-                VALUES
-                    (:header_id, :material_type, :item_category, :sub_category,
-                     :item_description, :uom, :qty, :rate, :value, :net_weight, :carton_weight)
-            """),
-            {
-                "header_id": header_id,
-                "material_type": line.material_type,
-                "item_category": line.item_category,
-                "sub_category": line.sub_category,
-                "item_description": line.item_description,
-                "uom": line.uom,
-                "qty": qty_i,
-                "rate": rate_f,
-                "value": value_f,
-                "net_weight": net_weight_f,
-                "carton_weight": carton_weight_f,
-            },
+            text(f"DELETE FROM {tables['boxes']} WHERE header_id = :hid AND article_description = :desc"),
+            {"hid": header_id, "desc": desc},
+        )
+        db.execute(
+            text(f"DELETE FROM {tables['lines']} WHERE header_id = :hid AND item_description = :desc"),
+            {"hid": header_id, "desc": desc},
         )
 
     return {
         "status": "updated",
         "rtv_id": existing.rtv_id,
         "lines_count": len(data.lines),
+        "inserted": inserted,
+        "updated": updated,
+        "unchanged": unchanged,
     }
 
 

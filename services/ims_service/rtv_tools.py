@@ -319,6 +319,7 @@ def list_rtvs(
             SELECT h.id, h.rtv_id, h.rtv_date, h.factory_unit, h.customer,
                    h.invoice_number, h.challan_no, h.dn_no, h.conversion,
                    h.sales_poc, h.business_head, h.remark, h.status, h.created_by, h.created_ts, h.updated_at,
+                   h.vehicle_number, h.transporter_name, h.driver_name, h.inward_manager,
                    COUNT(DISTINCT l.id) AS items_count,
                    COUNT(DISTINCT b.id) AS boxes_count,
                    COALESCE(SUM(l.qty), 0) AS total_qty

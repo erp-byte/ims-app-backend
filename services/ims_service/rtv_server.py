@@ -25,6 +25,7 @@ from services.ims_service.rtv_models import (
     RTVBoxEditLogRequest,
     RTVActionRequest,
     RTVActionResponse,
+    SendForApprovalResponse,
 )
 from services.ims_service.rtv_tools import (
     create_rtv,
@@ -331,7 +332,7 @@ def get_rtv_endpoint(
     return get_rtv(company, rtv_id, db)
 
 
-@router.post("/{company}/{rtv_id}/send-for-approval")
+@router.post("/{company}/{rtv_id}/send-for-approval", response_model=SendForApprovalResponse)
 def send_for_approval_endpoint(
     company: Company,
     rtv_id: int,
@@ -342,6 +343,7 @@ def send_for_approval_endpoint(
     Separate from create so the FE can hard-save header+lines first, then send.
     Re-sendable; does not mutate lines/boxes."""
     detail = get_rtv(company, rtv_id, db)   # same builder GET /{company}/{rtv_id} uses
+    detail["_company"] = company
     notify_rtv_created(detail)
     return {"status": "sent", "rtv_id": detail.get("rtv_id", "")}
 

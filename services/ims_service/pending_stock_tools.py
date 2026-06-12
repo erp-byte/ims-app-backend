@@ -638,6 +638,7 @@ def _swap_pending_row(
     scanned_by: Optional[str],
     scan_source: str,
     propagated_from_id: Optional[int] = None,
+    full_swap: bool = True,
 ) -> Optional[int]:
     """Core single-box ledger flip:
 
@@ -645,6 +646,16 @@ def _swap_pending_row(
       2. Find the NEW (scanned) box in source, snapshot it, then delete it.
       3. UPDATE pending_transfer_stock SET box_id=new, original_box_id=old, reconciled=TRUE.
       4. INSERT transfer_box_reconciliation row.
+
+    `full_swap` (2026-06-12) controls the SOURCE-inventory side:
+      • full_swap=True  (cold-source → warehouse-dest): literal swap — DELETE the
+        scanned box from source and restore the FIFO placeholder back to
+        *_cold_stocks. Box-level accuracy matters because the cold dashboard
+        ages/values each carton.
+      • full_swap=False (COPY_ONLY: warehouse-source anywhere, or cold-dest
+        receives): NEVER touch any source table. We only look the scanned box up
+        to copy its fields into the receipt, then relabel the pending row. The
+        source count is already correct from dispatch; only the label changes.
 
     Returns the reconciliation row id, or None on a soft skip (no-op same-id).
     """
@@ -725,6 +736,16 @@ def _swap_pending_row(
             new_lot_no = getattr(row, "lot_no", None) or new_lot_no
             new_weight_kg = float(getattr(row, "weight_kg", 0) or new_weight_kg or 0)
             new_no_of_cartons = int(getattr(row, "no_of_cartons", 1) or 1)
+        else:
+            # Fallback (user spec 2026-06-12): a cold-source scanned box may have
+            # been inwarded via bulk entry rather than cold_stocks. Look there too
+            # so the FULL_SWAP path can still deduct it.
+            tbl, row = _find_in_bulk_entry(db, new_box_id, pending_row.transaction_no, pending_row.lot_no)
+            if row is not None:
+                new_source_table = tbl
+                new_gross = float(getattr(row, "gross_weight", 0) or 0)
+                new_net = float(getattr(row, "net_weight", 0) or 0)
+                new_article = getattr(row, "article_description", None) or new_article
     else:
         tbl, row = _find_in_bulk_entry(db, new_box_id, pending_row.transaction_no, pending_row.lot_no)
         if row is not None:
@@ -763,9 +784,10 @@ def _swap_pending_row(
         if (not pending_row.lot_no) or (scanned_lot or "") == (pending_row.lot_no or ""):
             is_fungible_swap = True
 
-    if new_source_table:
-        # Literal swap path: deduct the scanned box from source and restore
-        # the IMS placeholder back to source (it was never really shipped).
+    if full_swap and new_source_table:
+        # Literal swap path (cold-source → warehouse-dest only): deduct the
+        # scanned box from source and restore the IMS placeholder back to source
+        # (it was never really shipped).
         db.execute(
             text(f"DELETE FROM {new_source_table} WHERE box_id = :b AND transaction_no = :t"),
             {"b": new_box_id, "t": pending_row.transaction_no},
@@ -805,7 +827,7 @@ def _swap_pending_row(
         except Exception as e:
             logger.warning("Disposition relabel skipped: %s", e)
 
-    elif is_fungible_swap:
+    elif full_swap and is_fungible_swap:
         # Fungible swap path: no source-side ops.
         # The IMS placeholder was a bookkeeping label for ONE unit of count
         # from this inward pool. The scanned box was ALREADY consumed (per
@@ -881,7 +903,14 @@ def _swap_pending_row(
     )
 
     # 4. INSERT reconciliation audit row
-    if new_source_table:
+    if not full_swap:
+        # COPY_ONLY: source untouched; only the pending label changed.
+        status = "copied"
+        reason = (
+            "Copy-only relabel — warehouse-source or cold-destination receive. "
+            "No source deduction/restore; box_ids within a pool are arbitrary labels."
+        )
+    elif new_source_table:
         status = "overridden"
         reason = None
     elif is_fungible_swap:
@@ -1043,64 +1072,34 @@ def reconcile_box_in_pending(
             "reconciliation_id": None, "siblings": [],
         }
 
-    # STEP 4 — Swap this single box (restore old, deduct new, update pending, audit)
+    # STEP 4 — Swap this single box. Mode is derived from direction:
+    #   FULL_SWAP   only when cold-source → warehouse-dest (deduct scanned from
+    #               source + restore the FIFO placeholder to *_cold_stocks).
+    #   COPY_ONLY   everything else (warehouse-source anywhere, or any cold-dest
+    #               receive): never touch source — just relabel the pending row.
+    # (user spec 2026-06-12)
+    _is_full_swap = (
+        _to_storage_type == "warehouse"
+        and placeholder.from_storage_type == "cold"
+    )
     primary_rec_id = _swap_pending_row(
         db, placeholder, scanned_box_id, transfer_in_header_id,
         scanned_by, scan_source, propagated_from_id=None,
+        full_swap=_is_full_swap,
     )
 
-    # STEP 5 — Try arithmetic series propagation to remaining siblings.
-    # Narrow scope (user decision): (transfer_out_id, transaction_no, lot_no).
-    offset = _series_offset(placeholder.box_id, scanned_box_id)
+    # STEP 5 — Auto series-propagation DISABLED (user decision 2026-06-12).
+    # Physical cartons arrive in random order, so a clean arithmetic offset
+    # rarely holds; each physical box is scanned individually instead.
     siblings_remapped: list = []
-    if offset is not None and offset != 0:
-        sibling_rows = db.execute(
-            text("""
-                SELECT * FROM pending_transfer_stock
-                WHERE transfer_out_id = :tid
-                  AND transaction_no = :txn
-                  AND COALESCE(lot_no, '') = COALESCE(:lot, '')
-                  AND status = 'In Transit'
-                  AND COALESCE(reconciled, FALSE) = FALSE
-                ORDER BY id ASC
-            """),
-            {"tid": transfer_out_id, "txn": scanned_transaction_no,
-             "lot": placeholder.lot_no},
-        ).fetchall()
-        for sib in sibling_rows:
-            predicted = _apply_offset(sib.box_id, offset)
-            if not predicted:
-                continue
-            # Verify the predicted box actually exists in source — otherwise skip
-            if sib.from_storage_type == "cold":
-                _, src_row = _find_in_cold_stocks(db, predicted, sib.transaction_no, sib.lot_no)
-            else:
-                _, src_row = _find_in_bulk_entry(db, predicted, sib.transaction_no, sib.lot_no)
-            if src_row is None:
-                continue
-            # Skip if predicted box is already locked elsewhere. Only meaningful
-            # for cold destinations — for warehouse destinations the cold_stocks
-            # scan is just a false-positive trap (see Step 1 note above).
-            if _to_storage_type == "cold" and _already_acknowledged(db, predicted, sib.transaction_no):
-                continue
-            try:
-                _swap_pending_row(
-                    db, sib, predicted, transfer_in_header_id,
-                    scanned_by, scan_source="auto_match",
-                    propagated_from_id=primary_rec_id,
-                )
-                siblings_remapped.append({"old": sib.box_id, "new": predicted})
-            except Exception as e:
-                logger.warning("STBR propagation skipped for sibling %s -> %s: %s",
-                               sib.box_id, predicted, e)
 
     return {
-        "status": "propagated" if siblings_remapped else "overridden",
+        "status": "overridden" if _is_full_swap else "copied",
         "actual_box_id": scanned_box_id,
         "original_box_id": placeholder.box_id,
         "transfer_out_id": transfer_out_id,
         "lot_no": placeholder.lot_no,
-        "propagated_count": len(siblings_remapped),
+        "propagated_count": 0,
         "reason": None,
         "reconciliation_id": primary_rec_id,
         "siblings": siblings_remapped,

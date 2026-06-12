@@ -25,6 +25,10 @@ class RTVHeaderCreate(BaseModel):
     sales_poc: Optional[str] = None
     business_head: Optional[str] = None
     remark: Optional[str] = None
+    vehicle_number: Optional[str] = None
+    transporter_name: Optional[str] = None
+    driver_name: Optional[str] = None
+    inward_manager: Optional[str] = None
 
 
 class RTVLineCreate(BaseModel):
@@ -62,6 +66,10 @@ class RTVHeaderUpdate(BaseModel):
     business_head: Optional[str] = None
     remark: Optional[str] = None
     status: Optional[str] = None
+    vehicle_number: Optional[str] = None
+    transporter_name: Optional[str] = None
+    driver_name: Optional[str] = None
+    inward_manager: Optional[str] = None
 
 
 class RTVBoxUpsertRequest(BaseModel):
@@ -200,6 +208,10 @@ class RTVHeaderResponse(BaseModel):
     sales_poc: Optional[str] = None
     business_head: Optional[str] = None
     remark: Optional[str] = None
+    vehicle_number: Optional[str] = None
+    transporter_name: Optional[str] = None
+    driver_name: Optional[str] = None
+    inward_manager: Optional[str] = None
     status: str
     created_by: Optional[str] = None
     created_ts: Optional[datetime] = None
@@ -229,6 +241,11 @@ class RTVDeleteResponse(BaseModel):
     success: bool
     message: str
     rtv_id: Optional[str] = None
+
+
+class SendForApprovalResponse(BaseModel):
+    status: str
+    rtv_id: str
 
 
 class RTVLinesUpdateResponse(BaseModel):

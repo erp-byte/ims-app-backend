@@ -64,6 +64,10 @@ def _map_header_row(row) -> dict:
         "created_by": row.created_by,
         "created_ts": row.created_ts,
         "updated_at": row.updated_at,
+        "vehicle_number": getattr(row, "vehicle_number", None),
+        "transporter_name": getattr(row, "transporter_name", None),
+        "driver_name": getattr(row, "driver_name", None),
+        "inward_manager": getattr(row, "inward_manager", None),
     }
 
 
@@ -172,14 +176,19 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             INSERT INTO {tables['header']}
                 (rtv_id, rtv_date, factory_unit, customer,
                  invoice_number, challan_no, dn_no, conversion,
-                 sales_poc, business_head, remark, status, created_by, created_ts)
+                 sales_poc, business_head, remark,
+                 vehicle_number, transporter_name, driver_name, inward_manager,
+                 status, created_by, created_ts)
             VALUES
                 (:rtv_id, NOW(), :factory_unit, :customer,
                  :invoice_number, :challan_no, :dn_no, :conversion,
-                 :sales_poc, :business_head, :remark, 'Pending', :created_by, NOW())
+                 :sales_poc, :business_head, :remark,
+                 :vehicle_number, :transporter_name, :driver_name, :inward_manager,
+                 'Pending', :created_by, NOW())
             RETURNING id, rtv_id, rtv_date, factory_unit, customer,
                       invoice_number, challan_no, dn_no, conversion,
-                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at
+                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at,
+                      vehicle_number, transporter_name, driver_name, inward_manager
         """),
         {
             "rtv_id": rtv_id,
@@ -192,6 +201,10 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             "sales_poc": data.header.sales_poc,
             "business_head": data.header.business_head,
             "remark": data.header.remark,
+            "vehicle_number": data.header.vehicle_number,
+            "transporter_name": data.header.transporter_name,
+            "driver_name": data.header.driver_name,
+            "inward_manager": data.header.inward_manager,
             "created_by": created_by,
         },
     ).fetchone()
@@ -306,6 +319,7 @@ def list_rtvs(
             SELECT h.id, h.rtv_id, h.rtv_date, h.factory_unit, h.customer,
                    h.invoice_number, h.challan_no, h.dn_no, h.conversion,
                    h.sales_poc, h.business_head, h.remark, h.status, h.created_by, h.created_ts, h.updated_at,
+                   h.vehicle_number, h.transporter_name, h.driver_name, h.inward_manager,
                    COUNT(DISTINCT l.id) AS items_count,
                    COUNT(DISTINCT b.id) AS boxes_count,
                    COALESCE(SUM(l.qty), 0) AS total_qty
@@ -344,7 +358,8 @@ def get_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
         text(f"""
             SELECT id, rtv_id, rtv_date, factory_unit, customer,
                    invoice_number, challan_no, dn_no, conversion,
-                   sales_poc, business_head, remark, status, created_by, created_ts, updated_at
+                   sales_poc, business_head, remark, status, created_by, created_ts, updated_at,
+                   vehicle_number, transporter_name, driver_name, inward_manager
             FROM {tables['header']}
             WHERE id = :hid
         """),
@@ -383,6 +398,10 @@ def update_rtv(company: Company, rtv_id_int: int, data: RTVHeaderUpdate, db: Ses
         "business_head": data.business_head,
         "remark": data.remark,
         "status": data.status,
+        "vehicle_number": data.vehicle_number,
+        "transporter_name": data.transporter_name,
+        "driver_name": data.driver_name,
+        "inward_manager": data.inward_manager,
     }
 
     for col, val in field_map.items():
@@ -407,7 +426,8 @@ def update_rtv(company: Company, rtv_id_int: int, data: RTVHeaderUpdate, db: Ses
             WHERE id = :hid
             RETURNING id, rtv_id, rtv_date, factory_unit, customer,
                       invoice_number, challan_no, dn_no, conversion,
-                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at
+                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at,
+                      vehicle_number, transporter_name, driver_name, inward_manager
         """),
         params,
     ).fetchone()

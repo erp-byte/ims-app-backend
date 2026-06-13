@@ -1949,7 +1949,8 @@ def create_transfer_in(data: TransferInCreate, db: Session) -> dict:
     # In Transit so a partial receipt can't leak them. Pass lots too so relabeled /
     # transaction_no-less scans still reconcile fungibly by lot (no phantom leak).
     acknowledged_boxes = [
-        {"box_id": b.box_id, "transaction_no": b.transaction_no, "lot_number": b.lot_number}
+        {"box_id": b.box_id, "transaction_no": b.transaction_no, "lot_number": b.lot_number,
+         "article": getattr(b, "article", None)}
         for b in data.scanned_boxes
     ]
     picked = pick_from_pending(transfer_out_id=data.transfer_out_id, db=db,
@@ -2441,10 +2442,10 @@ def close_transfer_in_with_shortage(header_id: int, shortage_reason, closed_by, 
 
     # Pick the boxes actually acknowledged on this GRN.
     ack_rows = db.execute(
-        text("SELECT box_id, transaction_no, lot_number FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+        text("SELECT box_id, transaction_no, lot_number, article FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
         {"hid": header_id},
     ).fetchall()
-    acknowledged_boxes = [{"box_id": r.box_id, "transaction_no": r.transaction_no, "lot_number": r.lot_number} for r in ack_rows]
+    acknowledged_boxes = [{"box_id": r.box_id, "transaction_no": r.transaction_no, "lot_number": r.lot_number, "article": r.article} for r in ack_rows]
     pick_from_pending(transfer_out_id=header.transfer_out_id, db=db, acknowledged_boxes=acknowledged_boxes)
 
     # Count the real shortage, then write off ALL remaining in-transit rows for the transfer.
@@ -2516,12 +2517,12 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
         # appeared AFTER this header was marked Received (orphan-trap fix): pick the
         # boxes recorded on this GRN so they don't linger forever on the bridge.
         _ack = db.execute(
-            text("SELECT box_id, transaction_no, lot_number FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+            text("SELECT box_id, transaction_no, lot_number, article FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
             {"hid": header_id},
         ).fetchall()
         if _ack:
             pick_from_pending(transfer_out_id=header.transfer_out_id, db=db,
-                              acknowledged_boxes=[{"box_id": r.box_id, "transaction_no": r.transaction_no, "lot_number": r.lot_number} for r in _ack])
+                              acknowledged_boxes=[{"box_id": r.box_id, "transaction_no": r.transaction_no, "lot_number": r.lot_number, "article": r.article} for r in _ack])
         full = db.execute(
             text("""SELECT id, transfer_out_id, transfer_out_no, grn_number, grn_date,
                            receiving_warehouse, received_by, received_at, box_condition,
@@ -2547,10 +2548,10 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
     # Bridge invariant: pick ONLY the boxes acknowledged on this GRN; the rest stay
     # In Transit. The transfer flips to 'Received' only when none remain.
     ack_rows = db.execute(
-        text("SELECT box_id, transaction_no, lot_number FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+        text("SELECT box_id, transaction_no, lot_number, article FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
         {"hid": header_id},
     ).fetchall()
-    acknowledged_boxes = [{"box_id": r.box_id, "transaction_no": r.transaction_no, "lot_number": r.lot_number} for r in ack_rows]
+    acknowledged_boxes = [{"box_id": r.box_id, "transaction_no": r.transaction_no, "lot_number": r.lot_number, "article": r.article} for r in ack_rows]
     picked = pick_from_pending(transfer_out_id=header.transfer_out_id, db=db,
                                acknowledged_boxes=acknowledged_boxes)
 

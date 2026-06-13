@@ -1694,6 +1694,7 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
     # fungible lot-fallback below); fall back to acknowledged_keys (exact only).
     ack = None
     ack_lot_total = Counter()
+    ack_article_total = Counter()
     if acknowledged_boxes is not None:
         ack = set()
         for b in acknowledged_boxes:
@@ -1701,13 +1702,19 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
             _bid = (_g("box_id") or "").strip()
             _txn = (_g("transaction_no") or "").strip()
             _lot = (_g("lot_number") or _g("lot_no") or "").strip()
+            _art = (_g("article") or "").strip().upper()
             ack.add((_bid, _txn))
             ack_lot_total[_lot] += 1
+            if _art:
+                ack_article_total[_art] += 1
     elif acknowledged_keys is not None:
         ack = {((b or "").strip(), (t or "").strip()) for (b, t) in acknowledged_keys}
 
     def _norm_lot(x):
         return (x or "").strip()
+
+    def _norm_article(x):
+        return (x or "").strip().upper()
 
     def _do_pick(p):
         """Consume a pending row (interunit IN side only).
@@ -1731,6 +1738,7 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
 
     picked = 0
     picked_lot = Counter()
+    picked_article = Counter()
     unpicked = []
 
     # Phase 1 — exact match by (box_id, transaction_no); 'LINE-%' tracking rows always picked.
@@ -1744,6 +1752,7 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
             picked += 1
             if not (p.box_id or "").strip().startswith("LINE-"):
                 picked_lot[_norm_lot(p.lot_no)] += 1
+                picked_article[_norm_article(getattr(p, "article", None))] += 1
 
     # Phase 2 — fungible lot-fallback. Acknowledged boxes that did NOT match an exact
     # (box_id, transaction_no) are still reconciled against THIS transfer's remaining
@@ -1751,6 +1760,7 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
     # This stops relabeled / transaction_no-less Transfer-In scans from leaking boxes
     # as phantom 'In Transit' (the partial-receipt leak). Only active when
     # acknowledged_boxes (with lots) was supplied.
+    still_unpicked = []
     if ack is not None and ack_lot_total:
         for p in unpicked:
             lot = _norm_lot(p.lot_no)
@@ -1758,6 +1768,27 @@ def pick_from_pending(transfer_out_id: int, db: Session, challan_no_for_inward: 
                 if _do_pick(p):
                     picked += 1
                     picked_lot[lot] += 1
+                    picked_article[_norm_article(getattr(p, "article", None))] += 1
+                    continue
+            still_unpicked.append(p)
+    else:
+        still_unpicked = list(unpicked)
+
+    # Phase 3 — article-count backstop. Acknowledged boxes that matched neither an exact
+    # (box_id, transaction_no) [Phase 1] nor a same-lot pending row [Phase 2] are reconciled
+    # against THIS transfer's remaining pending rows of the SAME article, bounded by the
+    # acknowledged count for that article. Covers receives where the IN side regenerated box
+    # ids and lost the lot (e.g. a blank-lot OUT line forcing a fresh "Generate QR"), which
+    # would otherwise strand every box 'In Transit' and freeze the transfer at Dispatch/Pending
+    # even though every box was acknowledged. Still bounded by the acknowledged count per
+    # article, so a genuine partial receipt cannot leak unacknowledged boxes.
+    if ack is not None and ack_article_total:
+        for p in still_unpicked:
+            art = _norm_article(getattr(p, "article", None))
+            if art and picked_article[art] < ack_article_total.get(art, 0):
+                if _do_pick(p):
+                    picked += 1
+                    picked_article[art] += 1
 
     logger.info("PICK_PENDING: picked %d rows for transfer_out_id=%s", picked, transfer_out_id)
     return picked

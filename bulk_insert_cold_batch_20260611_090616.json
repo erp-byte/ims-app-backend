@@ -1,0 +1,85 @@
+{
+  "lots": [
+    {
+      "lot": "8579",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260602090610",
+      "box_base": "48970320",
+      "rows": 95,
+      "total_kg": 2850.0,
+      "total_value": 2308500.0
+    },
+    {
+      "lot": "8580",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260602090612",
+      "box_base": "48970837",
+      "rows": 117,
+      "total_kg": 3510.0,
+      "total_value": 2737800.0
+    },
+    {
+      "lot": "8773",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260603090612",
+      "box_base": "48972267",
+      "rows": 37,
+      "total_kg": 419.58,
+      "total_value": 163636.2
+    },
+    {
+      "lot": "8941",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260604090612",
+      "box_base": "48972569",
+      "rows": 2,
+      "total_kg": 10.0,
+      "total_value": 8450.0
+    },
+    {
+      "lot": "8942",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260604090614",
+      "box_base": "48972663",
+      "rows": 2,
+      "total_kg": 10.0,
+      "total_value": 6350.0
+    },
+    {
+      "lot": "8943",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260604090613",
+      "box_base": "48973770",
+      "rows": 2,
+      "total_kg": 10.0,
+      "total_value": 5650.0
+    },
+    {
+      "lot": "8944",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260604090615",
+      "box_base": "48973892",
+      "rows": 1,
+      "total_kg": 5.0,
+      "total_value": 2015.0
+    },
+    {
+      "lot": "8957",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260604090617",
+      "box_base": "48974995",
+      "rows": 1,
+      "total_kg": 5.0,
+      "total_value": 2310.0
+    }
+  ],
+  "total_boxes": 257
+}

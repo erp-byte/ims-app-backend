@@ -1,0 +1,215 @@
+{
+  "lots": [
+    {
+      "lot": "17172",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260530090238",
+      "box_base": "48758078",
+      "rows": 1,
+      "total_kg": 11.34,
+      "total_value": 14628.6
+    },
+    {
+      "lot": "17401",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090238",
+      "box_base": "48758217",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 914760.0
+    },
+    {
+      "lot": "17402",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090239",
+      "box_base": "48759215",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 914760.0
+    },
+    {
+      "lot": "17403",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090240",
+      "box_base": "48760193",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 914760.0
+    },
+    {
+      "lot": "17404",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090241",
+      "box_base": "48761306",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 914760.0
+    },
+    {
+      "lot": "17405",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090242",
+      "box_base": "48762285",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 914760.0
+    },
+    {
+      "lot": "17406",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090243",
+      "box_base": "48763574",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 914760.0
+    },
+    {
+      "lot": "17407",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090244",
+      "box_base": "48764548",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 914760.0
+    },
+    {
+      "lot": "17408",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090246",
+      "box_base": "48766270",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 914760.0
+    },
+    {
+      "lot": "17409",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090247",
+      "box_base": "48767260",
+      "rows": 200,
+      "total_kg": 700.0,
+      "total_value": 997500.0
+    },
+    {
+      "lot": "17410",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090248",
+      "box_base": "48768275",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    },
+    {
+      "lot": "17411",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090249",
+      "box_base": "48769278",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    },
+    {
+      "lot": "17412",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090250",
+      "box_base": "48770250",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    },
+    {
+      "lot": "17413",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090251",
+      "box_base": "48771270",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    },
+    {
+      "lot": "17414",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090252",
+      "box_base": "48772271",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    },
+    {
+      "lot": "17415",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090253",
+      "box_base": "48773252",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    },
+    {
+      "lot": "17416",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090254",
+      "box_base": "48774239",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    },
+    {
+      "lot": "17417",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090255",
+      "box_base": "48775216",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    },
+    {
+      "lot": "17418",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090256",
+      "box_base": "48776451",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    },
+    {
+      "lot": "17419",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090257",
+      "box_base": "48777475",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    },
+    {
+      "lot": "17420",
+      "company": "cfpl",
+      "table": "cfpl_cold_stocks",
+      "transaction_no": "TR-20260605090258",
+      "box_base": "48778448",
+      "rows": 210,
+      "total_kg": 1050.0,
+      "total_value": 1109850.0
+    }
+  ],
+  "total_boxes": 4191
+}

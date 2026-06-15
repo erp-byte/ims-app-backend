@@ -3060,13 +3060,28 @@ def approve_inward(
 
     if payload.articles:
 
+        # Cold per-article fields (item_mark/spl_remarks/vakkal) exist on the
+        # *_bulk_entry_articles tables but not uniformly on the v2 tables
+        # (*_articles_v2 has no `vakkal`). Filter each update to the columns the
+        # target table actually has so the generic UPDATE can't reference a
+        # missing column and 500 the whole approval.
+        _art_cols = {
+            row[0]
+            for row in db.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = :tbl"
+                ),
+                {"tbl": tables["art"]},
+            ).fetchall()
+        }
+
         for art in payload.articles:
 
             art_data = clean_date_fields(art.model_dump(exclude_none=True))
 
             item_desc = art_data.pop("item_description")
 
-
+            art_data = {k: v for k, v in art_data.items() if k in _art_cols}
 
             if art_data:
 

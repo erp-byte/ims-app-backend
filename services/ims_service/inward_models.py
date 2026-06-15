@@ -309,6 +309,14 @@ class ApprovalArticleFields(BaseModel):
     unit_rate: Optional[Decimal18_2] = None
     total_amount: Optional[Decimal18_2] = None
     carton_weight: Optional[Decimal18_3] = None
+    # Cold-storage per-article fields. The approve page renders these only for cold
+    # warehouses. They must be declared here or FastAPI/Pydantic silently drops them
+    # (default extra="ignore"), so approve_inward never writes them. Persisted on the
+    # *_bulk_entry_articles tables (and item_mark/spl_remarks on *_articles_v2);
+    # approve_inward filters to columns the target table actually has.
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
 
 
 class ApprovalBoxFields(BaseModel):

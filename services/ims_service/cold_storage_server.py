@@ -527,7 +527,7 @@ def pick_boxes(
             FROM {table}
             WHERE item_description = :item_description
               AND CAST(lot_no AS TEXT) = :lot_no
-              AND inward_no = :inward_no
+              AND COALESCE(inward_no, '') = :inward_no
             ORDER BY id ASC
             LIMIT :qty
         """),

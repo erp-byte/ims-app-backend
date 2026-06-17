@@ -2606,8 +2606,35 @@ def update_inward(
         text(f"SELECT * FROM {tables['tx']} WHERE transaction_no = :txno"),
         {"txno": transaction_no},
     ).fetchone()
+
+    # Fall back to bulk_entry tables (cold/bulk inwards live there) — same pattern
+    # as approve_inward/get_inward. Without this, editing a bulk inward 404s.
+    if not existing:
+        _prefix = "cfpl" if company == "CFPL" else "cdpl"
+        tables = {
+            "tx": f"{_prefix}_bulk_entry_transactions",
+            "art": f"{_prefix}_bulk_entry_articles",
+            "box": f"{_prefix}_bulk_entry_boxes",
+            "sku": f"{_prefix}sku",
+        }
+        existing = db.execute(
+            text(f"SELECT * FROM {tables['tx']} WHERE transaction_no = :txno"),
+            {"txno": transaction_no},
+        ).fetchone()
+
     if not existing:
         raise HTTPException(404, f"Transaction '{transaction_no}' not found")
+
+    # Columns the target article table actually has — used to filter out fields
+    # the table lacks (e.g. *_articles_v2 has no `vakkal`) so the dynamic UPDATE
+    # below can't reference a missing column and 500 the edit.
+    _art_cols = {
+        row[0]
+        for row in db.execute(
+            text("SELECT column_name FROM information_schema.columns WHERE table_name = :tbl"),
+            {"tbl": tables["art"]},
+        ).fetchall()
+    }
 
     if payload.transaction.transaction_no != transaction_no:
         raise HTTPException(400, "Transaction number in payload must match URL parameter")
@@ -2670,6 +2697,9 @@ def update_inward(
                             pass
                     if str(old_val) != str(new_val):
                         art_changes[field] = new_val
+
+                # Drop fields the target table doesn't have (e.g. vakkal on v2)
+                art_changes = {k: v for k, v in art_changes.items() if k in _art_cols}
 
                 if art_changes:
                     set_parts = [f"{k} = :{k}" for k in art_changes]
@@ -2765,6 +2795,11 @@ def update_inward(
         for art_desc in touched_articles:
             recalc_article_aggregates(db, tables, transaction_no, art_desc)
 
+    # Re-sync cold_stocks from the edited articles/boxes (cold warehouses only),
+    # so lot/item_mark/vakkal/box edits made here reach the cold ledger. No-op for
+    # dry warehouses; clears stale auto rows on a cold→dry relabel.
+    cold_synced = sync_cold_stocks_from_inward(company, transaction_no, tables, db)
+
     db.commit()
 
     return {
@@ -2773,6 +2808,7 @@ def update_inward(
         "company": company,
         "articles_count": articles_count,
         "boxes_count": boxes_count,
+        "cold_rows_synced": cold_synced,
     }
 
 
@@ -2956,6 +2992,127 @@ def delete_inward(company: Company, transaction_no: str, db: Session, deleted_by
 
 
 
+
+
+# ---------- Cold-stock mirror on approve/edit ----------
+
+# Cold storage destinations whose inward boxes are mirrored into *_cold_stocks.
+# Maps the warehouse label to the cold-stocks `unit` value (matches create_bulk_entry
+# and the gated create_inward_bulk_sticker).
+_COLD_UNIT_MAP = {
+    "Savla D-39": "D-39",
+    "Savla D-514": "D-514",
+    "Rishi": "Rishi",
+    "Supreme": "Supreme",
+}
+
+
+def _is_cold_warehouse(warehouse) -> bool:
+    """True for cold storage destinations (Savla*/Rishi/Supreme) that mirror to *_cold_stocks."""
+    w = (warehouse or "").strip().lower()
+    return w.startswith("savla") or w.startswith("rishi") or w.startswith("supreme")
+
+
+def sync_cold_stocks_from_inward(
+    company: Company, transaction_no: str, tables: dict, db: Session
+) -> int:
+    """Rebuild *_cold_stocks rows for an inward from its FINAL article+box rows.
+
+    The bulk inward path only mirrors cold_stocks once, at creation
+    (bulk_entry_service.create_bulk_entry). But warehouse / lot numbers /
+    item_mark / vakkal / spl_remarks and box edits are finalised later on the
+    approve ("Edit & Review") and edit pages, so the original mirror goes stale
+    or is missing entirely. This re-syncs it.
+
+    Idempotent: deletes the inward's own auto-created rows (keyed on
+    inward_transaction_no + auto_created_from_inward=true — the same key
+    delete_inward uses) then inserts one row per box that has a box_id.
+
+    Only cold warehouses are mirrored — for a dry warehouse it just clears any
+    stale auto rows (e.g. after a cold→dry relabel) and inserts nothing. Meant
+    to run at the approve/edit moment (pre-dispatch): it owns only
+    auto_created_from_inward rows, mirroring create_bulk_entry (insert) and
+    delete_inward (delete). Returns the number of cold rows inserted.
+
+    Does NOT commit — the caller commits as part of its own transaction.
+    """
+    prefix = "cfpl" if company == "CFPL" else "cdpl"
+    cold = f"{prefix}_cold_stocks"
+
+    tx = db.execute(
+        text(
+            f"SELECT warehouse, entry_date, vendor_supplier_name "
+            f"FROM {tables['tx']} WHERE transaction_no = :txno"
+        ),
+        {"txno": transaction_no},
+    ).fetchone()
+    warehouse = (tx.warehouse if tx else None) or ""
+
+    # Always clear the inward's own auto rows first so a warehouse change
+    # (cold→dry, or a relabel) can never leave stale/duplicate cold stock behind.
+    db.execute(
+        text(
+            f"DELETE FROM {cold} "
+            f"WHERE inward_transaction_no = :txno AND auto_created_from_inward = true"
+        ),
+        {"txno": transaction_no},
+    )
+
+    if not _is_cold_warehouse(warehouse):
+        return 0  # dry warehouse — never mirrored to cold
+
+    # The cold per-article fields exist on *_bulk_entry_articles but not uniformly
+    # on *_articles_v2 (no `vakkal`). Reference each only if the column exists, so
+    # a v2-table cold inward can't 500 on a missing column.
+    _art_cols = {
+        row[0]
+        for row in db.execute(
+            text("SELECT column_name FROM information_schema.columns WHERE table_name = :tbl"),
+            {"tbl": tables["art"]},
+        ).fetchall()
+    }
+
+    def _acol(name: str) -> str:
+        return f"a.{name}" if name in _art_cols else "NULL"
+
+    unit = _COLD_UNIT_MAP.get(warehouse, warehouse)
+
+    inserted = db.execute(
+        text(f"""
+            INSERT INTO {cold} (
+                inward_dt, unit, inward_no, cold_item_mark, vakkal, lot_no,
+                no_of_cartons, weight_kg, total_inventory_kgs, group_name,
+                item_description, storage_location, exporter, last_purchase_rate,
+                box_id, transaction_no, item_subgroup, item_mark, value,
+                inward_transaction_no, auto_created_from_inward, spl_remarks,
+                canonical_warehouse, canonical_group, canonical_subgroup
+            )
+            SELECT
+                :entry_date, :unit, :txno, {_acol('item_mark')}, {_acol('vakkal')},
+                COALESCE(b.lot_number, a.lot_number),
+                1, b.net_weight, b.net_weight, a.item_category,
+                a.item_description, :wh, :exporter, a.unit_rate,
+                b.box_id, :txno, a.sub_category, {_acol('item_mark')},
+                ROUND(COALESCE(b.net_weight, 0) * COALESCE(a.unit_rate, 0), 2),
+                :txno, true, {_acol('spl_remarks')},
+                :wh, a.item_category, a.sub_category
+            FROM {tables['box']} b
+            JOIN {tables['art']} a
+              ON b.transaction_no = a.transaction_no
+             AND b.article_description = a.item_description
+            WHERE b.transaction_no = :txno
+              AND b.box_id IS NOT NULL
+        """),
+        {
+            "txno": transaction_no,
+            "unit": unit,
+            "wh": warehouse,
+            "entry_date": (tx.entry_date if tx else None),
+            "exporter": (tx.vendor_supplier_name if tx else None),
+        },
+    ).rowcount
+
+    return inserted
 
 
 def approve_inward(
@@ -3203,7 +3360,11 @@ def approve_inward(
 
                 )
 
-
+    # Mirror the now-final boxes into *_cold_stocks for cold warehouses. Approve
+    # is where the warehouse/lots/marks are finalised, so this is the authoritative
+    # moment to (re)build cold stock. No-op for dry warehouses. See
+    # sync_cold_stocks_from_inward — runs in this same transaction, before commit.
+    cold_synced = sync_cold_stocks_from_inward(company, transaction_no, tables, db)
 
     db.commit()
 
@@ -3220,6 +3381,8 @@ def approve_inward(
         "approved_by": payload.approved_by,
 
         "approved_at": now,
+
+        "cold_rows_synced": cold_synced,
 
     }
 

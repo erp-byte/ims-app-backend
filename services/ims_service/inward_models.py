@@ -62,6 +62,13 @@ class ArticleIn(BaseModel):
     unit_rate: Optional[Decimal18_2] = None
     total_amount: Optional[Decimal18_2] = None
     carton_weight: Optional[Decimal18_3] = None
+    # Cold per-article fields — exist on *_bulk_entry_articles and (item_mark/
+    # spl_remarks only) on *_articles_v2. Declared here so the edit/update path
+    # stops silently dropping them; update_inward filters to the target table's
+    # actual columns. See ApprovalArticleFields for the approve-path counterpart.
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
 
 
 class BoxIn(BaseModel):

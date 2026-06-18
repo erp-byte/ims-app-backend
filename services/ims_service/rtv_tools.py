@@ -49,6 +49,87 @@ def _canonical_factory_unit(raw):
     return canonical_warehouse(raw, raw) or raw
 
 
+# Cold-stock mirror: RTV cold returns also belong to cold-storage inventory.
+_RTV_COLD_UNIT_MAP = {
+    "Savla D-39": "D-39",
+    "Savla D-514": "D-514",
+    "Rishi": "Rishi",
+    "Supreme": "Supreme",
+}
+
+
+def sync_cold_stocks_from_rtv(company: Company, rtv_id_int: int, db: Session) -> int:
+    """Mirror an RTV's cold boxes into {prefix}_cold_stocks so the returned lots
+    show in the cold-storage inventory + dashboard. Idempotent: owns only the rows
+    it auto-creates (inward_transaction_no = the RTV id, auto_created_from_inward=true) —
+    deletes them then re-inserts one row per box with a box_id. Only cold warehouses
+    are mirrored; a dry/unknown warehouse just clears stale auto rows and inserts
+    nothing. Does NOT commit (caller owns the transaction). The DB trigger fills
+    canonical_warehouse/group/subgroup on insert."""
+    tables = rtv_table_names(company)
+    prefix = "cfpl" if company == "CFPL" else "cdpl"
+    cold = f"{prefix}_cold_stocks"
+
+    header = db.execute(
+        text(f"SELECT factory_unit, customer, rtv_id, rtv_date FROM {tables['header']} WHERE id = :hid"),
+        {"hid": rtv_id_int},
+    ).fetchone()
+    if not header:
+        return 0
+
+    rtv_str = header.rtv_id or ""
+    wh = _canonical_factory_unit(header.factory_unit)
+
+    # Always clear our own auto rows first (warehouse change / re-submit safe).
+    db.execute(
+        text(f"DELETE FROM {cold} WHERE inward_transaction_no = :tx AND auto_created_from_inward = true"),
+        {"tx": rtv_str},
+    )
+
+    unit = _RTV_COLD_UNIT_MAP.get(wh)
+    if unit is None:
+        return 0  # not a cold warehouse — nothing mirrored
+
+    inserted = db.execute(
+        text(f"""
+            INSERT INTO {cold} (
+                inward_dt, unit, inward_no, cold_item_mark, vakkal, lot_no,
+                no_of_cartons, weight_kg, total_inventory_kgs, group_name,
+                item_description, storage_location, exporter, last_purchase_rate,
+                box_id, transaction_no, item_subgroup, item_mark, value,
+                inward_transaction_no, auto_created_from_inward, spl_remarks,
+                canonical_warehouse, canonical_group, canonical_subgroup
+            )
+            SELECT
+                :rtv_date, :unit, :rtv_str,
+                COALESCE(b.item_mark, l.item_mark), COALESCE(b.vakkal, l.vakkal),
+                COALESCE(b.lot_number, l.lot_number),
+                1, b.net_weight, b.net_weight, l.item_category,
+                l.item_description, :wh, :exporter, l.rate,
+                b.box_id, :rtv_str, l.sub_category, COALESCE(b.item_mark, l.item_mark),
+                ROUND(COALESCE(b.net_weight, 0) * COALESCE(l.rate, 0), 2),
+                :rtv_str, true, COALESCE(b.spl_remarks, l.spl_remarks),
+                :wh, l.item_category, l.sub_category
+            FROM {tables['boxes']} b
+            JOIN {tables['lines']} l
+              ON b.header_id = l.header_id
+             AND b.article_description = l.item_description
+            WHERE b.header_id = :hid
+              AND b.box_id IS NOT NULL
+        """),
+        {
+            "hid": rtv_id_int,
+            "unit": unit,
+            "wh": wh,
+            "rtv_str": rtv_str,
+            "rtv_date": header.rtv_date,
+            "exporter": header.customer,
+        },
+    ).rowcount
+
+    return inserted
+
+
 def _convert_date(date_str: str):
     try:
         return datetime.strptime(date_str, "%d-%m-%Y").date()
@@ -713,6 +794,9 @@ def bulk_save_boxes(
         )
         deleted += 1
 
+    # Mirror cold boxes into cold-storage inventory (same transaction).
+    sync_cold_stocks_from_rtv(company, rtv_id_int, db)
+
     return {
         "status": "synced",
         "rtv_id": header.rtv_id,
@@ -935,6 +1019,9 @@ def approve_rtv(
                     """),
                     box_params,
                 )
+
+    # Mirror cold boxes into cold-storage inventory (same transaction).
+    sync_cold_stocks_from_rtv(company, rtv_id_int, db)
 
     return {
         "status": "approved",

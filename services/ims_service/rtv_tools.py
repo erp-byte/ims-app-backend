@@ -85,6 +85,10 @@ def _map_line_row(row) -> dict:
         "value": str(row.value) if row.value is not None else "0",
         "net_weight": str(row.net_weight) if row.net_weight is not None else "0",
         "carton_weight": str(row.carton_weight) if row.carton_weight is not None else "0",
+        "lot_number": getattr(row, "lot_number", None),
+        "item_mark": getattr(row, "item_mark", None),
+        "spl_remarks": getattr(row, "spl_remarks", None),
+        "vakkal": getattr(row, "vakkal", None),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -101,6 +105,9 @@ def _map_box_row(row) -> dict:
         "uom": row.uom or None,
         "conversion": str(row.conversion) if row.conversion is not None else None,
         "lot_number": row.lot_number,
+        "item_mark": getattr(row, "item_mark", None),
+        "spl_remarks": getattr(row, "spl_remarks", None),
+        "vakkal": getattr(row, "vakkal", None),
         "net_weight": str(row.net_weight) if row.net_weight is not None else "0",
         "gross_weight": str(row.gross_weight) if row.gross_weight is not None else "0",
         "count": row.count,
@@ -114,6 +121,7 @@ def _fetch_lines(db: Session, tables: dict, header_id: int) -> list:
         text(f"""
             SELECT id, header_id, material_type, item_category, sub_category,
                    item_description, uom, qty, rate, value, net_weight, carton_weight,
+                   lot_number, item_mark, spl_remarks, vakkal,
                    created_at, updated_at
             FROM {tables['lines']}
             WHERE header_id = :hid
@@ -128,7 +136,8 @@ def _fetch_boxes(db: Session, tables: dict, header_id: int) -> list:
     rows = db.execute(
         text(f"""
             SELECT id, header_id, rtv_line_id, box_number, box_id,
-                   article_description, uom, conversion, lot_number, net_weight, gross_weight,
+                   article_description, uom, conversion, lot_number,
+                   item_mark, spl_remarks, vakkal, net_weight, gross_weight,
                    count, created_at, updated_at
             FROM {tables['boxes']}
             WHERE header_id = :hid
@@ -223,12 +232,15 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             text(f"""
                 INSERT INTO {tables['lines']}
                     (header_id, material_type, item_category, sub_category,
-                     item_description, uom, qty, rate, value, net_weight, carton_weight)
+                     item_description, uom, qty, rate, value, net_weight, carton_weight,
+                     lot_number, item_mark, spl_remarks, vakkal)
                 VALUES
                     (:header_id, :material_type, :item_category, :sub_category,
-                     :item_description, :uom, :qty, :rate, :value, :net_weight, :carton_weight)
+                     :item_description, :uom, :qty, :rate, :value, :net_weight, :carton_weight,
+                     :lot_number, :item_mark, :spl_remarks, :vakkal)
                 RETURNING id, header_id, material_type, item_category, sub_category,
                           item_description, uom, qty, rate, value, net_weight, carton_weight,
+                          lot_number, item_mark, spl_remarks, vakkal,
                           created_at, updated_at
             """),
             {
@@ -243,6 +255,10 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
                 "value": value_f,
                 "net_weight": net_weight_f,
                 "carton_weight": carton_weight_f,
+                "lot_number": line.lot_number,
+                "item_mark": line.item_mark,
+                "spl_remarks": line.spl_remarks,
+                "vakkal": line.vakkal,
             },
         ).fetchone()
         lines.append(_map_line_row(row))
@@ -515,6 +531,9 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
         "net_weight": float(payload.net_weight) if payload.net_weight is not None else None,
         "gross_weight": float(payload.gross_weight) if payload.gross_weight is not None else None,
         "lot_number": payload.lot_number,
+        "item_mark": payload.item_mark,
+        "spl_remarks": payload.spl_remarks,
+        "vakkal": payload.vakkal,
         "count": payload.count,
     }
 
@@ -528,6 +547,9 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
                     net_weight = COALESCE(:net_weight, net_weight),
                     gross_weight = COALESCE(:gross_weight, gross_weight),
                     lot_number = COALESCE(:lot_number, lot_number),
+                    item_mark = COALESCE(:item_mark, item_mark),
+                    spl_remarks = COALESCE(:spl_remarks, spl_remarks),
+                    vakkal = COALESCE(:vakkal, vakkal),
                     count = COALESCE(:count, count),
                     rtv_line_id = :line_id, updated_at = NOW()
                 WHERE header_id = :hid
@@ -553,6 +575,9 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
                         net_weight = COALESCE(:net_weight, net_weight),
                         gross_weight = COALESCE(:gross_weight, gross_weight),
                         lot_number = COALESCE(:lot_number, lot_number),
+                        item_mark = COALESCE(:item_mark, item_mark),
+                        spl_remarks = COALESCE(:spl_remarks, spl_remarks),
+                        vakkal = COALESCE(:vakkal, vakkal),
                         count = COALESCE(:count, count),
                         box_id = :box_id, rtv_line_id = :line_id, updated_at = NOW()
                     WHERE header_id = :hid
@@ -567,10 +592,12 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
                     INSERT INTO {tables['boxes']}
                         (header_id, rtv_line_id, box_number, box_id,
                          article_description, uom, conversion, lot_number,
+                         item_mark, spl_remarks, vakkal,
                          net_weight, gross_weight, count)
                     VALUES
                         (:hid, :line_id, :box_num, :box_id,
                          :art_desc, :uom, :conversion, :lot_number,
+                         :item_mark, :spl_remarks, :vakkal,
                          :net_weight, :gross_weight, :count)
                 """),
                 params,
@@ -623,10 +650,12 @@ def update_rtv_lines(
             text(f"""
                 INSERT INTO {tables['lines']}
                     (header_id, material_type, item_category, sub_category,
-                     item_description, uom, qty, rate, value, net_weight, carton_weight)
+                     item_description, uom, qty, rate, value, net_weight, carton_weight,
+                     lot_number, item_mark, spl_remarks, vakkal)
                 VALUES
                     (:header_id, :material_type, :item_category, :sub_category,
-                     :item_description, :uom, :qty, :rate, :value, :net_weight, :carton_weight)
+                     :item_description, :uom, :qty, :rate, :value, :net_weight, :carton_weight,
+                     :lot_number, :item_mark, :spl_remarks, :vakkal)
             """),
             {
                 "header_id": header_id,
@@ -640,6 +669,10 @@ def update_rtv_lines(
                 "value": value_f,
                 "net_weight": net_weight_f,
                 "carton_weight": carton_weight_f,
+                "lot_number": line.lot_number,
+                "item_mark": line.item_mark,
+                "spl_remarks": line.spl_remarks,
+                "vakkal": line.vakkal,
             },
         )
 
@@ -741,6 +774,10 @@ def approve_rtv(
                 "net_weight": float(b.net_weight) if b.net_weight is not None else None,
                 "gross_weight": float(b.gross_weight) if b.gross_weight is not None else None,
                 "count": b.count,
+                "lot_number": b.lot_number,
+                "item_mark": b.item_mark,
+                "spl_remarks": b.spl_remarks,
+                "vakkal": b.vakkal,
             }
 
             existing_box = db.execute(
@@ -761,6 +798,10 @@ def approve_rtv(
                             net_weight = COALESCE(:net_weight, net_weight),
                             gross_weight = COALESCE(:gross_weight, gross_weight),
                             count = COALESCE(:count, count),
+                            lot_number = COALESCE(:lot_number, lot_number),
+                            item_mark = COALESCE(:item_mark, item_mark),
+                            spl_remarks = COALESCE(:spl_remarks, spl_remarks),
+                            vakkal = COALESCE(:vakkal, vakkal),
                             updated_at = NOW()
                         WHERE header_id = :hid
                           AND article_description = :art_desc AND box_number = :box_num
@@ -772,10 +813,12 @@ def approve_rtv(
                     text(f"""
                         INSERT INTO {tables['boxes']}
                             (header_id, box_number, article_description,
-                             uom, conversion, net_weight, gross_weight, count)
+                             uom, conversion, net_weight, gross_weight, count,
+                             lot_number, item_mark, spl_remarks, vakkal)
                         VALUES
                             (:hid, :box_num, :art_desc,
-                             :uom, :conversion, :net_weight, :gross_weight, :count)
+                             :uom, :conversion, :net_weight, :gross_weight, :count,
+                             :lot_number, :item_mark, :spl_remarks, :vakkal)
                     """),
                     box_params,
                 )

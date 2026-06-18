@@ -47,6 +47,20 @@ def test_bulk_save_inserts_and_deletes():
     print("test_bulk_save_inserts_and_deletes: PASS")
 
 
+def test_bulk_insert_box_ids_unique_across_articles():
+    db = BulkDB(existing=[])  # nothing existing -> both take INSERT branch
+    req = RTVBulkBoxUpdateRequest(boxes=[
+        RTVBulkBoxItem(article_description="A", box_number=1, net_weight="1"),
+        RTVBulkBoxItem(article_description="B", box_number=1, net_weight="1"),
+    ])
+    rtv_tools.bulk_save_boxes("CFPL", 1, req, db, notify_discrepancy=False)
+    box_ids = [p.get("box_id") for s, p in db.calls if "INTO" in s and "rtv_boxes" in s]
+    assert len(box_ids) == 2, f"expected 2 inserts, got {box_ids}"
+    assert len(set(box_ids)) == 2, f"box_id collision across articles: {box_ids}"
+    print("test_bulk_insert_box_ids_unique_across_articles: PASS")
+
+
 if __name__ == "__main__":
     test_bulk_save_inserts_and_deletes()
+    test_bulk_insert_box_ids_unique_across_articles()
     print("ALL PASS")

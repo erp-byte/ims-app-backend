@@ -628,6 +628,8 @@ def bulk_save_boxes(
 ) -> dict:
     """State-aware full sync of the box set for a CR. Insert new, update existing
     (preserving box_id), delete boxes no longer present. Persists cold fields."""
+    # NOTE: notify_discrepancy is reserved for a future net-weight discrepancy
+    # notification and is currently a no-op (Phase 1).
     tables = rtv_table_names(company)
 
     header = db.execute(
@@ -643,10 +645,15 @@ def bulk_save_boxes(
         {"hid": rtv_id_int},
     ).fetchall()
     existing_keys = {(r.article_description, r.box_number): r.box_id for r in existing_rows}
-    incoming_keys = {(b.article_description, b.box_number) for b in data.boxes}
+
+    _seen = {}
+    for b in data.boxes:
+        _seen[(b.article_description, b.box_number)] = b   # keep last occurrence
+    incoming_boxes = list(_seen.values())
+    incoming_keys = set(_seen.keys())
 
     inserted = updated = 0
-    for b in data.boxes:
+    for b in incoming_boxes:
         line = db.execute(
             text(f"SELECT id FROM {tables['lines']} WHERE header_id = :hid AND item_description = :art LIMIT 1"),
             {"hid": rtv_id_int, "art": b.article_description},
@@ -684,7 +691,7 @@ def bulk_save_boxes(
             updated += 1
         else:
             base = str(int(time.time() * 1000))[-8:]
-            params["box_id"] = f"{base}-{b.box_number}"
+            params["box_id"] = f"{base}-{b.box_number}-{inserted}"
             db.execute(text(f"""
                 INSERT INTO {tables['boxes']}
                     (header_id, rtv_line_id, box_number, box_id, article_description,

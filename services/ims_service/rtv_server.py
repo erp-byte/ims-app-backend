@@ -433,7 +433,6 @@ def bulk_save_boxes_endpoint(
     db: Session = Depends(get_db),
 ):
     result = bulk_save_boxes(company, rtv_id, payload, db, notify_discrepancy=notify_discrepancy)
-    db.commit()
     return result
 
 

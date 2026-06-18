@@ -18,6 +18,8 @@ from services.ims_service.rtv_models import (
     RTVDeleteResponse,
     RTVBoxUpsertRequest,
     RTVBoxUpsertResponse,
+    RTVBulkBoxUpdateRequest,
+    RTVBulkBoxUpdateResponse,
     RTVLinesUpdateRequest,
     RTVLinesUpdateResponse,
     RTVApprovalRequest,
@@ -34,6 +36,7 @@ from services.ims_service.rtv_tools import (
     update_rtv,
     delete_rtv,
     upsert_rtv_box,
+    bulk_save_boxes,
     update_rtv_lines,
     approve_rtv,
     log_rtv_box_edits,
@@ -419,5 +422,18 @@ def upsert_rtv_box_endpoint(
 ):
     """Upsert a single RTV box (called at print time)."""
     return upsert_rtv_box(company, rtv_id, payload, db)
+
+
+@router.put("/{company}/{rtv_id}/boxes", response_model=RTVBulkBoxUpdateResponse)
+def bulk_save_boxes_endpoint(
+    company: Company,
+    rtv_id: int,
+    payload: RTVBulkBoxUpdateRequest,
+    notify_discrepancy: bool = True,
+    db: Session = Depends(get_db),
+):
+    result = bulk_save_boxes(company, rtv_id, payload, db, notify_discrepancy=notify_discrepancy)
+    db.commit()
+    return result
 
 

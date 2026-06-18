@@ -12,6 +12,7 @@ from services.ims_service.rtv_models import (
     RTVCreate,
     RTVHeaderUpdate,
     RTVBoxUpsertRequest,
+    RTVBulkBoxUpdateRequest,
     RTVLinesUpdateRequest,
     RTVApprovalRequest,
     RTVBoxEditLogRequest,
@@ -610,6 +611,99 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
         "rtv_id": header.rtv_id,
         "article_description": payload.article_description,
         "box_number": payload.box_number,
+    }
+
+
+def bulk_save_boxes(
+    company: Company, rtv_id_int: int, data, db: Session, notify_discrepancy: bool = True
+) -> dict:
+    """State-aware full sync of the box set for a CR. Insert new, update existing
+    (preserving box_id), delete boxes no longer present. Persists cold fields."""
+    tables = rtv_table_names(company)
+
+    header = db.execute(
+        text(f"SELECT id, rtv_id FROM {tables['header']} WHERE id = :hid"),
+        {"hid": rtv_id_int},
+    ).fetchone()
+    if not header:
+        raise HTTPException(404, "RTV not found")
+
+    existing_rows = db.execute(
+        text(f"""SELECT box_number, box_id, article_description
+                 FROM {tables['boxes']} WHERE header_id = :hid"""),
+        {"hid": rtv_id_int},
+    ).fetchall()
+    existing_keys = {(r.article_description, r.box_number): r.box_id for r in existing_rows}
+    incoming_keys = {(b.article_description, b.box_number) for b in data.boxes}
+
+    inserted = updated = 0
+    for b in data.boxes:
+        line = db.execute(
+            text(f"SELECT id FROM {tables['lines']} WHERE header_id = :hid AND item_description = :art LIMIT 1"),
+            {"hid": rtv_id_int, "art": b.article_description},
+        ).fetchone()
+        params = {
+            "hid": rtv_id_int,
+            "line_id": line.id if line else None,
+            "art_desc": b.article_description,
+            "box_num": b.box_number,
+            "uom": b.uom,
+            "conversion": b.conversion,
+            "lot_number": b.lot_number,
+            "item_mark": b.item_mark,
+            "spl_remarks": b.spl_remarks,
+            "vakkal": b.vakkal,
+            "net_weight": float(b.net_weight) if b.net_weight is not None else None,
+            "gross_weight": float(b.gross_weight) if b.gross_weight is not None else None,
+            "count": b.count,
+        }
+        if (b.article_description, b.box_number) in existing_keys:
+            db.execute(text(f"""
+                UPDATE {tables['boxes']}
+                SET uom = COALESCE(:uom, uom),
+                    conversion = COALESCE(:conversion, conversion),
+                    lot_number = COALESCE(:lot_number, lot_number),
+                    item_mark = COALESCE(:item_mark, item_mark),
+                    spl_remarks = COALESCE(:spl_remarks, spl_remarks),
+                    vakkal = COALESCE(:vakkal, vakkal),
+                    net_weight = COALESCE(:net_weight, net_weight),
+                    gross_weight = COALESCE(:gross_weight, gross_weight),
+                    count = COALESCE(:count, count),
+                    rtv_line_id = :line_id, updated_at = NOW()
+                WHERE header_id = :hid AND article_description = :art_desc AND box_number = :box_num
+            """), params)
+            updated += 1
+        else:
+            base = str(int(time.time() * 1000))[-8:]
+            params["box_id"] = f"{base}-{b.box_number}"
+            db.execute(text(f"""
+                INSERT INTO {tables['boxes']}
+                    (header_id, rtv_line_id, box_number, box_id, article_description,
+                     uom, conversion, lot_number, item_mark, spl_remarks, vakkal,
+                     net_weight, gross_weight, count)
+                VALUES
+                    (:hid, :line_id, :box_num, :box_id, :art_desc,
+                     :uom, :conversion, :lot_number, :item_mark, :spl_remarks, :vakkal,
+                     :net_weight, :gross_weight, :count)
+            """), params)
+            inserted += 1
+
+    deleted = 0
+    for (art, num) in existing_keys.keys() - incoming_keys:
+        db.execute(
+            text(f"""DELETE FROM {tables['boxes']}
+                     WHERE header_id = :hid AND article_description = :art AND box_number = :num"""),
+            {"hid": rtv_id_int, "art": art, "num": num},
+        )
+        deleted += 1
+
+    return {
+        "status": "synced",
+        "rtv_id": header.rtv_id,
+        "inserted": inserted,
+        "updated": updated,
+        "unchanged": 0,
+        "deleted": deleted,
     }
 
 

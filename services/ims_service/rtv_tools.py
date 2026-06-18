@@ -38,7 +38,11 @@ def rtv_table_names(company: Company) -> dict:
 
 
 def _generate_rtv_id() -> str:
-    return f"RTV-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    # Prefix is "CR-" (Customer Return). NOT "RTV-": downstream sale/production
+    # systems read "RTV" as Return-To-Vendor (the opposite flow), which
+    # mis-routes these inbound customer returns. Forward-only — legacy RTV-*
+    # ids and their already-printed QR labels stay valid.
+    return f"CR-{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
 
 def _canonical_factory_unit(raw):

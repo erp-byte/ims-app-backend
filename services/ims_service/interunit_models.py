@@ -187,6 +187,7 @@ class TransferLineCreate(BaseModel):
     total_weight: Optional[str] = None
     batch_number: Optional[str] = None
     lot_number: Optional[str] = None
+    vakkal: Optional[str] = None
 
     @field_validator(
         "quantity", "pack_size", "unit_pack_size", "net_weight", "total_weight",
@@ -269,6 +270,7 @@ class TransferLineResponse(BaseModel):
     total_weight: str
     batch_number: Optional[str] = None
     lot_number: Optional[str] = None
+    vakkal: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

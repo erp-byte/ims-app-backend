@@ -67,6 +67,10 @@ def _run_startup_migrations():
             ALTER TABLE interunit_transfer_in_boxes
             ADD COLUMN IF NOT EXISTS line_index INTEGER
         """))
+        db.execute(text("""
+            ALTER TABLE interunit_transfers_lines
+            ADD COLUMN IF NOT EXISTS vakkal VARCHAR(100)
+        """))
         db.commit()
 
         # Separate try/catch for cold storage table columns (table may not exist yet)

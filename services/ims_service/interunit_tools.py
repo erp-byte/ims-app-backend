@@ -511,6 +511,7 @@ def _map_transfer_line(row) -> dict:
         "total_weight": str(row.total_weight) if row.total_weight is not None else "0",
         "batch_number": row.batch_number or "",
         "lot_number": row.lot_number or "",
+        "vakkal": getattr(row, "vakkal", None) or "",
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -570,7 +571,7 @@ def _fetch_transfer_lines(db: Session, header_id: int) -> list:
         text("""
             SELECT id, header_id, rm_pm_fg_type, item_category, sub_category,
                    item_desc_raw, pack_size, qty, uom,
-                   unit_pack_size, net_weight, total_weight, batch_number, lot_number,
+                   unit_pack_size, net_weight, total_weight, batch_number, lot_number, vakkal,
                    created_at, updated_at
             FROM interunit_transfers_lines
             WHERE header_id = :hid
@@ -854,14 +855,14 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
                 INSERT INTO interunit_transfers_lines
                     (header_id, rm_pm_fg_type, item_category, sub_category,
                      item_desc_raw, pack_size, qty, uom,
-                     unit_pack_size, net_weight, total_weight, batch_number, lot_number)
+                     unit_pack_size, net_weight, total_weight, batch_number, lot_number, vakkal)
                 VALUES
                     (:header_id, :material_type, :item_category, :sub_category,
                      :item_desc_raw, :pack_size, :quantity, :uom,
-                     :unit_pack_size, :net_weight, :total_weight, :batch_number, :lot_number)
+                     :unit_pack_size, :net_weight, :total_weight, :batch_number, :lot_number, :vakkal)
                 RETURNING id, header_id, rm_pm_fg_type, item_category, sub_category,
                           item_desc_raw, pack_size, qty, uom,
-                          unit_pack_size, net_weight, total_weight, batch_number, lot_number,
+                          unit_pack_size, net_weight, total_weight, batch_number, lot_number, vakkal,
                           created_at, updated_at
             """),
             {
@@ -878,6 +879,7 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
                 "total_weight": total_weight,
                 "batch_number": line.batch_number or "",
                 "lot_number": line.lot_number or "",
+                "vakkal": line.vakkal or "",
             },
         ).fetchone()
         lines.append(row)
@@ -1485,14 +1487,14 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
                 INSERT INTO interunit_transfers_lines
                     (header_id, rm_pm_fg_type, item_category, sub_category,
                      item_desc_raw, pack_size, qty, uom,
-                     unit_pack_size, net_weight, total_weight, batch_number, lot_number)
+                     unit_pack_size, net_weight, total_weight, batch_number, lot_number, vakkal)
                 VALUES
                     (:header_id, :material_type, :item_category, :sub_category,
                      :item_desc_raw, :pack_size, :quantity, :uom,
-                     :unit_pack_size, :net_weight, :total_weight, :batch_number, :lot_number)
+                     :unit_pack_size, :net_weight, :total_weight, :batch_number, :lot_number, :vakkal)
                 RETURNING id, header_id, rm_pm_fg_type, item_category, sub_category,
                           item_desc_raw, pack_size, qty, uom,
-                          unit_pack_size, net_weight, total_weight, batch_number, lot_number,
+                          unit_pack_size, net_weight, total_weight, batch_number, lot_number, vakkal,
                           created_at, updated_at
             """),
             {
@@ -1509,6 +1511,7 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
                 "total_weight": total_weight,
                 "batch_number": line.batch_number or "",
                 "lot_number": line.lot_number or "",
+                "vakkal": line.vakkal or "",
             },
         ).fetchone()
         lines.append(row)

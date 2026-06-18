@@ -206,6 +206,10 @@ def test_approve_rtv_persists_cold_box_fields():
     assert p["item_mark"] == "MARK-1"
     assert p["spl_remarks"] == "cold"
     assert p["vakkal"] == "VK-99"
+    # Approve-created cold boxes must carry a box_id so they mirror into
+    # cold_stocks (which filters box_id IS NOT NULL).
+    assert "box_id" in sql, "box_id column missing from approve_rtv box INSERT SQL"
+    assert p.get("box_id"), "approve_rtv box INSERT params missing non-empty box_id"
     print("test_approve_rtv_persists_cold_box_fields: PASS")
 
 

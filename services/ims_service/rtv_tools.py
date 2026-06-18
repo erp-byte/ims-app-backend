@@ -111,9 +111,15 @@ def sync_cold_stocks_from_rtv(company: Company, rtv_id_int: int, db: Session) ->
                 :rtv_str, true, COALESCE(b.spl_remarks, l.spl_remarks),
                 :wh, l.item_category, l.sub_category
             FROM {tables['boxes']} b
-            JOIN {tables['lines']} l
-              ON b.header_id = l.header_id
-             AND b.article_description = l.item_description
+            JOIN LATERAL (
+                SELECT l2.item_category, l2.sub_category, l2.item_description,
+                       l2.rate, l2.lot_number, l2.item_mark, l2.spl_remarks, l2.vakkal
+                FROM {tables['lines']} l2
+                WHERE l2.header_id = b.header_id
+                  AND l2.item_description = b.article_description
+                ORDER BY l2.id
+                LIMIT 1
+            ) l ON true
             WHERE b.header_id = :hid
               AND b.box_id IS NOT NULL
         """),
@@ -961,7 +967,7 @@ def approve_rtv(
 
     # 3) Upsert boxes if provided (preserve existing box_ids)
     if payload.boxes:
-        for b in payload.boxes:
+        for _i, b in enumerate(payload.boxes):
             box_params = {
                 "hid": rtv_id_int,
                 "art_desc": b.article_description,
@@ -1006,16 +1012,18 @@ def approve_rtv(
                     box_params,
                 )
             else:
+                base = str(int(time.time() * 1000))[-8:]
+                box_params["box_id"] = f"{base}-{b.box_number}-{_i}"
                 db.execute(
                     text(f"""
                         INSERT INTO {tables['boxes']}
-                            (header_id, box_number, article_description,
-                             uom, conversion, net_weight, gross_weight, count,
-                             lot_number, item_mark, spl_remarks, vakkal)
+                            (header_id, box_number, box_id, article_description,
+                             uom, conversion, lot_number, item_mark, spl_remarks, vakkal,
+                             net_weight, gross_weight, count)
                         VALUES
-                            (:hid, :box_num, :art_desc,
-                             :uom, :conversion, :net_weight, :gross_weight, :count,
-                             :lot_number, :item_mark, :spl_remarks, :vakkal)
+                            (:hid, :box_num, :box_id, :art_desc,
+                             :uom, :conversion, :lot_number, :item_mark, :spl_remarks, :vakkal,
+                             :net_weight, :gross_weight, :count)
                     """),
                     box_params,
                 )

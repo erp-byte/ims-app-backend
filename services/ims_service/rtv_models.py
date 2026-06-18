@@ -42,6 +42,10 @@ class RTVLineCreate(BaseModel):
     value: str = "0"
     net_weight: Optional[str] = "0"
     carton_weight: Optional[str] = "0"
+    lot_number: Optional[str] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
 
     @field_validator("material_type", "uom")
     @classmethod
@@ -80,6 +84,9 @@ class RTVBoxUpsertRequest(BaseModel):
     net_weight: Optional[Decimal18_3] = None
     gross_weight: Optional[Decimal18_3] = None
     lot_number: Optional[str] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
     count: Optional[int] = None
 
 
@@ -113,6 +120,10 @@ class RTVApprovalLineFields(BaseModel):
     material_type: Optional[str] = None
     item_category: Optional[str] = None
     sub_category: Optional[str] = None
+    lot_number: Optional[str] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
 
 
 class RTVApprovalBoxFields(BaseModel):
@@ -123,6 +134,10 @@ class RTVApprovalBoxFields(BaseModel):
     net_weight: Optional[Decimal18_3] = None
     gross_weight: Optional[Decimal18_3] = None
     count: Optional[int] = None
+    lot_number: Optional[str] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
 
 
 class RTVApprovalRequest(BaseModel):
@@ -166,6 +181,10 @@ class RTVLineResponse(BaseModel):
     value: str
     net_weight: str
     carton_weight: str
+    lot_number: Optional[str] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -180,6 +199,9 @@ class RTVBoxResponse(BaseModel):
     uom: Optional[str] = None
     conversion: Optional[str] = None
     lot_number: Optional[str] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
     net_weight: str
     gross_weight: str
     count: Optional[int] = None
@@ -193,6 +215,33 @@ class RTVBoxUpsertResponse(BaseModel):
     rtv_id: str
     article_description: str
     box_number: int
+
+
+class RTVBulkBoxItem(BaseModel):
+    article_description: str
+    box_number: int = Field(..., ge=1)
+    uom: Optional[str] = None
+    conversion: Optional[str] = None
+    lot_number: Optional[str] = None
+    item_mark: Optional[str] = None
+    spl_remarks: Optional[str] = None
+    vakkal: Optional[str] = None
+    net_weight: Optional[Decimal18_3] = None
+    gross_weight: Optional[Decimal18_3] = None
+    count: Optional[int] = None
+
+
+class RTVBulkBoxUpdateRequest(BaseModel):
+    boxes: List[RTVBulkBoxItem] = Field(default_factory=list)
+
+
+class RTVBulkBoxUpdateResponse(BaseModel):
+    status: str
+    rtv_id: str
+    inserted: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    deleted: int = 0
 
 
 class RTVHeaderResponse(BaseModel):

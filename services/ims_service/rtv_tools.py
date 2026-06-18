@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
+from shared.canonicalize import canonical_warehouse
 from services.ims_service.inward_models import Company
 from services.ims_service.rtv_models import (
     RTVCreate,
@@ -38,6 +39,14 @@ def rtv_table_names(company: Company) -> dict:
 
 def _generate_rtv_id() -> str:
     return f"RTV-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+
+def _canonical_factory_unit(raw):
+    """Map a factory_unit string to its canonical warehouse code, or return it
+    unchanged if unrecognized (display-time mapping handles legacy values)."""
+    if not raw:
+        return raw
+    return canonical_warehouse(raw, raw) or raw
 
 
 def _convert_date(date_str: str):
@@ -202,7 +211,7 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
         """),
         {
             "rtv_id": rtv_id,
-            "factory_unit": data.header.factory_unit,
+            "factory_unit": _canonical_factory_unit(data.header.factory_unit),
             "customer": data.header.customer,
             "invoice_number": data.header.invoice_number,
             "challan_no": data.header.challan_no,
@@ -815,6 +824,9 @@ def approve_rtv(
             if field == "conversion":
                 update_parts.append(f"{field} = :{field}")
                 params[field] = float(value) if value else 0
+            elif field == "factory_unit":
+                update_parts.append(f"{field} = :{field}")
+                params[field] = _canonical_factory_unit(value)
             else:
                 update_parts.append(f"{field} = :{field}")
                 params[field] = value

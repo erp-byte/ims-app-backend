@@ -1166,8 +1166,10 @@ def apply_rtv_email_action(
             403, "This action link is not authorised for the recipient on file"
         )
 
-    # Idempotency: if the RTV has already moved out of Pending, do nothing.
-    if current_status != "Pending":
+    # The original mail's buttons stay actionable while Pending or On Hold (a
+    # held return can still be approved/rejected later); a final Approved/Rejected
+    # is terminal and further clicks are no-ops.
+    if current_status not in ("Pending", "On Hold"):
         detail = get_rtv(company, header_id, db)
         return {
             "already_actioned": True,
@@ -1188,7 +1190,7 @@ def apply_rtv_email_action(
                 approved_by = :actor,
                 approved_at = :actioned_at,
                 updated_at  = NOW()
-            WHERE id = :hid AND status = 'Pending'
+            WHERE id = :hid AND status IN ('Pending', 'On Hold')
             """
         ),
         {

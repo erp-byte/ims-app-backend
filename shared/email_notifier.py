@@ -54,6 +54,8 @@ SALES_POC_EMAILS = {
     "R M Patil": "rmpatil@candorfoods.in",
     "Satyendra Garg": "satyendra@candorfoods.in",
     "Prashant Pal": "prashant.pal@candorfoods.in",
+    "Suresh Luthra": "suresh@candorfoods.in",
+    "Swadhin Joshi": "swadhin.joshi@candorfoods.in",
 }
 
 # Constant CCs added to every RTV notification.
@@ -85,6 +87,34 @@ def _lookup_sales_poc_email(sales_poc: str | None) -> str | None:
         if name.lower() == key:
             return email
     return None
+
+
+def _name_for_email(email: str | None) -> str | None:
+    """Reverse lookup email -> known display name from the name maps."""
+    if not email:
+        return None
+    key = email.strip().lower()
+    for name, addr in {**SALES_POC_EMAILS, **BUSINESS_HEAD_EMAILS}.items():
+        if addr.lower() == key:
+            return name
+    return None
+
+
+def _derive_name_from_email(email: str) -> str:
+    """Best-effort name from an email local-part: b.hrithik -> 'B Hrithik'."""
+    local = email.split("@", 1)[0]
+    for ch in "._-":
+        local = local.replace(ch, " ")
+    parts = [p for p in local.split(" ") if p]
+    return " ".join(p.capitalize() for p in parts) or email
+
+
+def _format_actor(email: str | None) -> str:
+    """Render an actor for RTV mail as 'Name (email)'; '-' when empty."""
+    if not email or not email.strip():
+        return "-"
+    email = email.strip()
+    return f"{_name_for_email(email) or _derive_name_from_email(email)} ({email})"
 
 
 def _build_rtv_cc(
@@ -227,19 +257,18 @@ def _rtv_email_html(
     """
 
     header_fields = [
-        ("RTV ID", header.get("rtv_id", "")),
-        ("RTV Date", str(header.get("rtv_date", ""))),
+        ("Return ID", header.get("rtv_id", "")),
+        ("Return Date", str(header.get("rtv_date", ""))),
         ("Factory Unit", header.get("factory_unit", "")),
         ("Customer", header.get("customer", "")),
         ("Invoice Number", header.get("invoice_number", "") or "-"),
         ("Challan No", header.get("challan_no", "") or "-"),
         ("DN No", header.get("dn_no", "") or "-"),
-        ("Conversion", header.get("conversion", "0")),
         ("Sales POC", header.get("sales_poc", "") or "-"),
         ("Business Head", header.get("business_head", "") or "-"),
         ("Remark", header.get("remark", "") or "-"),
         ("Status", header.get("status", "")),
-        ("Created By", header.get("created_by", "") or "-"),
+        ("Created By", _format_actor(header.get("created_by"))),
     ]
 
     header_rows = ""
@@ -292,7 +321,7 @@ def _rtv_email_html(
 <body style="font-family:Arial,sans-serif;margin:0;padding:0;background:#f4f4f4;">
   <table width="100%" cellpadding="0" cellspacing="0" style="max-width:800px;margin:20px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
     <tr><td style="background:#29417A;color:#fff;padding:20px 24px;">
-      <h2 style="margin:0;">RTV {action}</h2>
+      <h2 style="margin:0;">Customer Returns {action}</h2>
       <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{header.get('rtv_id', '')} &mdash; {datetime.now().strftime('%d %b %Y, %I:%M %p')}</p>
     </td></tr>
     <tr><td style="padding:20px 24px;">
@@ -327,13 +356,13 @@ def _rtv_email_html(
 
     </td></tr>
     <tr><td style="background:#f8f9fa;padding:12px 24px;text-align:center;font-size:12px;color:#888;">
-      Candor Foods &mdash; IMS RTV Notification
+      Candor Foods &mdash; IMS Customer Returns Notification
     </td></tr>
   </table>
 </body></html>"""
 
     # Plain text fallback
-    plain_lines = [f"RTV {action}: {header.get('rtv_id', '')}"]
+    plain_lines = [f"Customer Returns {action}: {header.get('rtv_id', '')}"]
     plain_lines.append("")
     if extra_info:
         plain_lines.append(extra_info)
@@ -400,31 +429,24 @@ def _action_buttons_html(rtv_detail: dict, head_email: str) -> str:
 
 
 def notify_rtv_created(rtv_detail: dict) -> None:
-    """Send notification email when an RTV is created.
+    """Send the 'Created' notification for a customer return as ONE conversation.
 
-    This is an INFORMATION-ONLY broadcast (business head + pooja in TO, constant
-    CC + selected Sales POC + creator in CC) and deliberately carries NO action
-    buttons. The Approve / Reject / Hold buttons are sent in a SEPARATE email to
-    the assigned business head ONLY (see notify_rtv_action_required), so that no
-    other recipient on the TO/CC list can trigger an approval.
+    A single thread, never two disjoint mails:
+      * The assigned business head gets the email WITH the Approve / Reject / Hold
+        buttons (thread root). Only the business head receives the buttons.
+      * Everyone else (pooja + CC) gets the SAME email WITHOUT buttons, threaded
+        under that root, so the later 'Approved' mail lands in the trail for all.
+    If the return has no recognised business head, a single button-less broadcast
+    goes to everyone.
     """
     rtv_id = rtv_detail.get("rtv_id", "")
     bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
+    thread_id = _rtv_thread_key(rtv_id)
+    subject = f"Customer Returns Created: {rtv_id}"
+    lines = rtv_detail.get("lines", [])
+    boxes = rtv_detail.get("boxes", [])
 
-    html, plain = _rtv_email_html(
-        action="Created",
-        header=rtv_detail,
-        lines=rtv_detail.get("lines", []),
-        boxes=rtv_detail.get("boxes", []),
-        action_buttons=None,
-    )
-
-    to_list: list[str] = []
-    if bh_email:
-        to_list.append(bh_email)
-    to_list.append(RTV_NOTIFY_TO)
-
-    to_lower = {addr.strip().lower() for addr in to_list}
+    # CC = constant CC + selected/manual Sales POC + creator.
     cc_candidates: list[str] = list(RTV_CC_CONSTANT)
     poc_email = _lookup_sales_poc_email(rtv_detail.get("sales_poc"))
     if poc_email:
@@ -435,26 +457,57 @@ def notify_rtv_created(rtv_detail: dict) -> None:
     created_by = rtv_detail.get("created_by")
     if created_by:
         cc_candidates.append(created_by)
-    seen: set[str] = set()
-    cc: list[str] = []
-    for addr in cc_candidates:
-        normalized = addr.strip().lower()
-        if not normalized or normalized in seen or normalized in to_lower:
-            continue
-        seen.add(normalized)
-        cc.append(addr.strip())
 
-    _send_email_background(
-        subject=f"RTV Created: {rtv_id}",
-        html_body=html,
-        plain_body=plain,
-        to=to_list,
-        cc=cc,
-        message_id=_rtv_thread_key(rtv_id),
-    )
+    def _dedupe(addrs: list[str], exclude: set[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for addr in addrs:
+            n = addr.strip().lower()
+            if not n or n in seen or n in exclude:
+                continue
+            seen.add(n)
+            out.append(addr.strip())
+        return out
 
-    # Action buttons go to the business head ONLY, in a separate email.
-    notify_rtv_action_required(rtv_detail)
+    if bh_email:
+        # 1) Business head — WITH action buttons. This message is the thread root.
+        action_buttons = [
+            ("Approve", _build_rtv_action_url(rtv_id, bh_email, "approve"), "#27ae60"),
+            ("Reject",  _build_rtv_action_url(rtv_id, bh_email, "reject"),  "#c0392b"),
+            ("Hold",    _build_rtv_action_url(rtv_id, bh_email, "hold"),    "#e67e22"),
+        ]
+        html_bh, plain_bh = _rtv_email_html(
+            action="Created", header=rtv_detail, lines=lines, boxes=boxes,
+            extra_info="Please Approve / Reject / Hold this customer return using the buttons below.",
+            action_buttons=action_buttons,
+        )
+        _send_email_background(
+            subject=subject, html_body=html_bh, plain_body=plain_bh,
+            to=[bh_email], message_id=thread_id,
+        )
+
+        # 2) Everyone else — NO buttons, threaded under the same conversation so
+        #    the later status mail appears in their trail too.
+        cc = _dedupe(cc_candidates, {bh_email.strip().lower(), RTV_NOTIFY_TO.strip().lower()})
+        html_cc, plain_cc = _rtv_email_html(
+            action="Created", header=rtv_detail, lines=lines, boxes=boxes,
+            action_buttons=None,
+        )
+        _send_email_background(
+            subject=subject, html_body=html_cc, plain_body=plain_cc,
+            to=[RTV_NOTIFY_TO], cc=cc, in_reply_to=thread_id,
+        )
+    else:
+        # No mapped business head — single button-less broadcast to everyone.
+        cc = _dedupe(cc_candidates, {RTV_NOTIFY_TO.strip().lower()})
+        html, plain = _rtv_email_html(
+            action="Created", header=rtv_detail, lines=lines, boxes=boxes,
+            action_buttons=None,
+        )
+        _send_email_background(
+            subject=subject, html_body=html, plain_body=plain,
+            to=[RTV_NOTIFY_TO], cc=cc, message_id=thread_id,
+        )
 
 
 def notify_rtv_weight_discrepancy(rtv_detail: dict, summary: dict) -> None:
@@ -547,7 +600,7 @@ def notify_rtv_weight_discrepancy(rtv_detail: dict, summary: dict) -> None:
     to_list.append(RTV_NOTIFY_TO)
 
     _send_email_background(
-        subject=f"RTV Net-Weight Discrepancy: {rtv_id}",
+        subject=f"Customer Returns Net-Weight Discrepancy: {rtv_id}",
         html_body=html,
         plain_body=plain,
         to=to_list,
@@ -573,7 +626,7 @@ def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: st
         header=rtv_detail,
         lines=rtv_detail.get("lines", []),
         boxes=rtv_detail.get("boxes", []),
-        extra_info=f"{new_status} by: {actioned_by}",
+        extra_info=f"{new_status} by: {_format_actor(actioned_by)}",
     )
 
     bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
@@ -603,15 +656,13 @@ def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: st
         cc.append(addr.strip())
 
     _send_email_background(
-        subject=f"RTV {new_status}: {rtv_id}",
+        subject=f"Customer Returns {new_status}: {rtv_id}",
         html_body=html,
         plain_body=plain,
         to=to_list,
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
-    # Action-required email goes separately to the assigned business head only.
-    notify_rtv_action_required(rtv_detail)
 
 
 def notify_rtv_action_required(rtv_detail: dict) -> None:
@@ -664,7 +715,7 @@ def notify_rtv_action_required(rtv_detail: dict) -> None:
     )
 
     _send_email_background(
-        subject=f"ACTION REQUIRED — RTV {rtv_id} [{status}]",
+        subject=f"ACTION REQUIRED — Customer Returns {rtv_id} [{status}]",
         html_body=html,
         plain_body=plain,
         to=head_email,
@@ -678,7 +729,7 @@ def notify_rtv_rejected(rtv_detail: dict, rejected_by: str) -> None:
         header=rtv_detail,
         lines=rtv_detail.get("lines", []),
         boxes=rtv_detail.get("boxes", []),
-        extra_info=f"Rejected by: {rejected_by}",
+        extra_info=f"Rejected by: {_format_actor(rejected_by)}",
     )
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"), rtv_detail.get("created_by"), rejected_by,
@@ -686,7 +737,7 @@ def notify_rtv_rejected(rtv_detail: dict, rejected_by: str) -> None:
         sales_poc_email=rtv_detail.get("sales_poc_email"),
     )
     _send_email_background(
-        subject=f"RTV Rejected: {rtv_detail.get('rtv_id', '')}",
+        subject=f"Customer Returns Rejected: {rtv_detail.get('rtv_id', '')}",
         html_body=html,
         plain_body=plain,
         cc=cc,
@@ -701,7 +752,7 @@ def notify_rtv_held(rtv_detail: dict, held_by: str) -> None:
         header=rtv_detail,
         lines=rtv_detail.get("lines", []),
         boxes=rtv_detail.get("boxes", []),
-        extra_info=f"Placed on hold by: {held_by}. The business head can still approve or reject later.",
+        extra_info=f"Placed on hold by: {_format_actor(held_by)}. The business head can still approve or reject later.",
     )
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"), rtv_detail.get("created_by"), held_by,
@@ -709,14 +760,12 @@ def notify_rtv_held(rtv_detail: dict, held_by: str) -> None:
         sales_poc_email=rtv_detail.get("sales_poc_email"),
     )
     _send_email_background(
-        subject=f"RTV On Hold: {rtv_detail.get('rtv_id', '')}",
+        subject=f"Customer Returns On Hold: {rtv_detail.get('rtv_id', '')}",
         html_body=html,
         plain_body=plain,
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
-    # Resend action-required email so BH still has the buttons.
-    notify_rtv_action_required(rtv_detail)
 
 
 def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:
@@ -726,7 +775,7 @@ def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:
         header=rtv_detail,
         lines=rtv_detail.get("lines", []),
         boxes=rtv_detail.get("boxes", []),
-        extra_info=f"Approved by: {approved_by}",
+        extra_info=f"Approved by: {_format_actor(approved_by)}",
     )
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"),
@@ -736,7 +785,7 @@ def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:
         sales_poc_email=rtv_detail.get("sales_poc_email"),
     )
     _send_email_background(
-        subject=f"RTV Approved: {rtv_detail.get('rtv_id', '')}",
+        subject=f"Customer Returns Approved: {rtv_detail.get('rtv_id', '')}",
         html_body=html,
         plain_body=plain,
         cc=cc,
@@ -754,9 +803,9 @@ def notify_rtv_deleted(
 ) -> None:
     """Send notification email when an RTV is deleted."""
     header = {"rtv_id": rtv_id, "status": "Deleted", "business_head": business_head, "created_by": created_by}
-    extra = f"RTV {rtv_id} in {company} has been permanently deleted along with all its lines and boxes."
+    extra = f"Customer Returns {rtv_id} in {company} has been permanently deleted along with all its lines and boxes."
     if deleted_by:
-        extra += f" Deleted by: {deleted_by}."
+        extra += f" Deleted by: {_format_actor(deleted_by)}."
     html, plain = _rtv_email_html(
         action="Deleted",
         header=header,
@@ -766,7 +815,7 @@ def notify_rtv_deleted(
     )
     cc = _build_rtv_cc(business_head, created_by, deleted_by)
     _send_email_background(
-        subject=f"RTV Deleted: {rtv_id}",
+        subject=f"Customer Returns Deleted: {rtv_id}",
         html_body=html,
         plain_body=plain,
         cc=cc,
@@ -788,7 +837,7 @@ def notify_rtv_header_updated(rtv_detail: dict) -> None:
         sales_poc_email=rtv_detail.get("sales_poc_email"),
     )
     _send_email_background(
-        subject=f"RTV Updated: {rtv_detail.get('rtv_id', '')}",
+        subject=f"Customer Returns Updated: {rtv_detail.get('rtv_id', '')}",
         html_body=html,
         plain_body=plain,
         cc=cc,
@@ -1613,7 +1662,7 @@ def notify_rtv_lines_updated(rtv_detail: dict) -> None:
         sales_poc_email=rtv_detail.get("sales_poc_email"),
     )
     _send_email_background(
-        subject=f"RTV Lines Updated: {rtv_detail.get('rtv_id', '')}",
+        subject=f"Customer Returns Lines Updated: {rtv_detail.get('rtv_id', '')}",
         html_body=html,
         plain_body=plain,
         cc=cc,

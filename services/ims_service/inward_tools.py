@@ -846,252 +846,183 @@ def build_search_conditions(
 
 
 
+def tx_source_cte(company: Company) -> str:
+    """Like union_source_ctes but only the `all_tx` CTE — used when article/box
+    joins aren't needed (no text search), to avoid scanning ~100k box rows."""
+    prefix = "cfpl" if company == "CFPL" else "cdpl"
+    return f"""
+        all_tx AS (
+            SELECT {_TX_UNION_PROJ}, 'inward'::text AS _source
+            FROM {prefix}_transactions_v2
+            UNION ALL
+            SELECT {_TX_UNION_PROJ}, 'bulk_entry'::text AS _source
+            FROM {prefix}_bulk_entry_transactions
+        )
+    """
+
+
 def list_inward_records(
-
     company: Company,
-
     page: int,
-
     per_page: int,
-
     search: Optional[str],
-
     from_date: Optional[str],
-
     to_date: Optional[str],
-
     sort_by: Optional[str],
-
     sort_order: Optional[str],
-
     db: Session,
-
     status: Optional[str] = None,
-
     grn_status: Optional[str] = None,
-
     warehouse: Optional[str] = None,
-
 ) -> InwardListResponse:
 
     tables = table_names(company)
 
-
-
     normalized_from, normalized_to = validate_and_normalize_dates(from_date, to_date)
-
     where_sql, params = build_search_conditions(
-
         tables, search, normalized_from, normalized_to, warehouse=warehouse
-
     )
 
-
-
     if status:
-
         valid_statuses = ["pending", "approved"]
-
         if status not in valid_statuses:
-
             raise HTTPException(400, f"Invalid status. Allowed: {valid_statuses}")
-
         where_sql += " AND t.status = :status"
-
         params["status"] = status
 
-
-
     if grn_status:
-
         if grn_status == "completed":
-
             where_sql += " AND t.grn_number IS NOT NULL AND TRIM(t.grn_number) != ''"
-
         elif grn_status == "pending":
-
             where_sql += " AND (t.grn_number IS NULL OR TRIM(t.grn_number) = '')"
-
         else:
-
             raise HTTPException(400, "Invalid grn_status. Allowed: [completed, pending]")
 
-
-
     valid_sort_fields = ["entry_date", "transaction_no", "invoice_number", "po_number"]
-
     valid_sort_orders = ["asc", "desc"]
 
-
-
     if sort_by and sort_by not in valid_sort_fields:
-
         raise HTTPException(status_code=400, detail=f"Invalid sort field. Allowed: {valid_sort_fields}")
-
     if sort_order and sort_order not in valid_sort_orders:
-
         raise HTTPException(status_code=400, detail=f"Invalid sort order. Allowed: {valid_sort_orders}")
 
-
-
     sort_field = "COALESCE(entry_date, system_grn_date)" if (not sort_by or sort_by == "entry_date") else sort_by
-
     sort_direction = sort_order or "desc"
-
-
-
-    union_ctes = union_source_ctes(company)
-
-
-
-    total = db.execute(
-
-        text(f"""
-
-            WITH {union_ctes}
-
-            SELECT COUNT(*) FROM (
-
-                SELECT DISTINCT t.transaction_no, t._source
-
-                FROM all_tx t
-
-                LEFT JOIN all_art a
-
-                    ON t.transaction_no = a.transaction_no AND t._source = a._source
-
-                LEFT JOIN all_box b
-
-                    ON t.transaction_no = b.transaction_no AND t._source = b._source
-
-                WHERE {where_sql}
-
-            ) x
-
-        """),
-
-        params,
-
-    ).scalar_one()
-
-
+    # `_source` is a deterministic final tiebreaker: a transaction_no can exist in
+    # both the inward and bulk_entry source tables, and without it their relative
+    # order is undefined — which can make a row jump pages or repeat across pages.
+    order_clause = f"{sort_field} {sort_direction.upper()} NULLS LAST, transaction_no DESC, _source ASC"
 
     offset = (page - 1) * per_page
 
-    order_clause = f"{sort_field} {sort_direction.upper()} NULLS LAST, transaction_no DESC"
+    union_ctes = union_source_ctes(company)
 
+    # When there is no text search, the WHERE clause only touches transaction
+    # columns (t.*), so the article/box joins are unnecessary for filtering and
+    # counting. Skipping them avoids fanning out across ~100k box rows on every
+    # call. The joins are only needed when `search` matches article/box fields.
+    needs_join = bool(search and search.strip())
 
+    art_box_join = """
+                LEFT JOIN all_art a
+                    ON t.transaction_no = a.transaction_no AND t._source = a._source
+                LEFT JOIN all_box b
+                    ON t.transaction_no = b.transaction_no AND t._source = b._source"""
+
+    # ---- Count of matching transactions ----
+    if needs_join:
+        total = db.execute(
+            text(f"""
+                WITH {union_ctes}
+                SELECT COUNT(*) FROM (
+                    SELECT DISTINCT t.transaction_no, t._source
+                    FROM all_tx t{art_box_join}
+                    WHERE {where_sql}
+                ) x
+            """),
+            params,
+        ).scalar_one()
+    else:
+        total = db.execute(
+            text(f"""
+                WITH {tx_source_cte(company)}
+                SELECT COUNT(*) FROM all_tx t
+                WHERE {where_sql}
+            """),
+            params,
+        ).scalar_one()
+
+    # ---- Page the transaction ids BEFORE the heavy aggregation ----
+    # Only this page's transactions (~per_page rows) are then aggregated, instead
+    # of aggregating every transaction's articles/boxes and discarding all but one
+    # page at the end.
+    if needs_join:
+        paged_select = f"""
+                SELECT transaction_no, _source FROM (
+                    SELECT DISTINCT
+                        t.transaction_no, t._source,
+                        t.entry_date, t.system_grn_date, t.invoice_number, t.po_number
+                    FROM all_tx t{art_box_join}
+                    WHERE {where_sql}
+                ) d
+                ORDER BY {order_clause}
+                LIMIT :limit OFFSET :offset"""
+    else:
+        paged_select = f"""
+                SELECT transaction_no, _source
+                FROM all_tx t
+                WHERE {where_sql}
+                ORDER BY {order_clause}
+                LIMIT :limit OFFSET :offset"""
 
     records = db.execute(
-
         text(f"""
-
             WITH {union_ctes},
-
-            filtered_transactions AS (
-
-                SELECT DISTINCT t.transaction_no, t._source
-
-                FROM all_tx t
-
-                LEFT JOIN all_art a
-
-                    ON t.transaction_no = a.transaction_no AND t._source = a._source
-
-                LEFT JOIN all_box b
-
-                    ON t.transaction_no = b.transaction_no AND t._source = b._source
-
-                WHERE {where_sql}
-
+            paged_transactions AS (
+                {paged_select}
             ),
-
             transaction_data AS (
-
                 SELECT
-
                     t.transaction_no,
-
                     t._source,
-
                     t.entry_date,
-
                     t.system_grn_date,
-
                     t.status,
-
                     t.invoice_number,
-
                     t.po_number,
-
                     t.vendor_supplier_name,
-
                     t.customer_party_name,
-
                     t.total_amount,
-
                     t.warehouse,
-
                     t.vehicle_number,
-
                     t.transporter_name,
-
                     t.lr_number,
-
                     t.challan_number,
-
                     t.grn_number,
-
                     t.grn_quantity,
-
                     t.approval_authority,
-
                     t.source_location,
-
                     t.destination_location,
-
                     t.remark,
-
                     SUM(a.net_weight) AS net_weight,
-
                     SUM(a.total_weight) AS total_weight,
-
                     STRING_AGG(DISTINCT a.item_description, chr(10) ORDER BY a.item_description) AS article_descriptions,
-
                     STRING_AGG(DISTINCT
-
                         CASE
-
                             WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
-
                             THEN CONCAT(a.quantity_units::text, ' ', a.uom)
-
                             WHEN a.quantity_units IS NOT NULL
-
                             THEN a.quantity_units::text
-
                             ELSE NULL
-
                         END, ', '
-
                         ORDER BY CASE
-
                             WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
-
                             THEN CONCAT(a.quantity_units::text, ' ', a.uom)
-
                             WHEN a.quantity_units IS NOT NULL
-
                             THEN a.quantity_units::text
-
                             ELSE NULL
-
                         END
-
                     ) FILTER (WHERE a.quantity_units IS NOT NULL) AS article_quantities,
-
-                    -- Combined per-item label: "ItemName (X.XX kg)"
-                    -- ORDER BY must repeat the full DISTINCT expression (PostgreSQL DISTINCT+ORDER BY constraint)
                     STRING_AGG(DISTINCT
                         a.item_description ||
                         CASE
@@ -1115,234 +1046,108 @@ def list_inward_records(
                             ELSE ''
                         END
                     ) FILTER (WHERE a.item_description IS NOT NULL) AS article_items_with_qty,
-
                     COUNT(DISTINCT b.box_number) AS box_count,
-
                     STRING_AGG(DISTINCT b.article_description, ', ' ORDER BY b.article_description) AS box_descriptions
-
                 FROM all_tx t
-
-                INNER JOIN filtered_transactions ft
-
+                INNER JOIN paged_transactions ft
                     ON t.transaction_no = ft.transaction_no AND t._source = ft._source
-
                 LEFT JOIN all_art a
-
                     ON t.transaction_no = a.transaction_no AND t._source = a._source
-
                 LEFT JOIN all_box b
-
                     ON t.transaction_no = b.transaction_no AND t._source = b._source
-
                 GROUP BY t.transaction_no, t._source, t.entry_date, t.system_grn_date, t.status, t.invoice_number, t.po_number, t.vendor_supplier_name, t.customer_party_name, t.total_amount, t.warehouse, t.vehicle_number, t.transporter_name, t.lr_number, t.challan_number, t.grn_number, t.grn_quantity, t.approval_authority, t.source_location, t.destination_location, t.remark
-
             )
-
             SELECT
-
                 td.transaction_no,
-
                 td._source AS source,
-
                 COALESCE(td.entry_date, td.system_grn_date) AS entry_date,
-
                 td.status,
-
                 td.invoice_number,
-
                 td.po_number,
-
                 td.vendor_supplier_name,
-
                 td.customer_party_name,
-
                 td.total_amount,
-
                 td.warehouse,
-
                 td.approval_authority,
-
                 td.vehicle_number,
-
                 td.transporter_name,
-
                 td.lr_number,
-
                 td.challan_number,
-
                 td.grn_number,
-
                 td.grn_quantity,
-
                 td.system_grn_date,
-
                 td.source_location,
-
                 td.destination_location,
-
                 td.remark,
-
                 td.box_count,
-
                 COALESCE(td.article_descriptions, td.box_descriptions) AS item_descriptions_text,
-
                 CASE
-
                     WHEN td.article_quantities IS NOT NULL THEN td.article_quantities
-
                     WHEN td.box_count > 0 THEN CONCAT(td.box_count::text, ' BOX')
-
                     ELSE NULL
-
                 END AS quantities_and_uoms_text,
-
                 td.article_items_with_qty AS article_items_with_qty_text,
-
-                td.vehicle_number,
-
-                td.transporter_name,
-
-                td.lr_number,
-
-                td.challan_number,
-
-                td.grn_number,
-
-                td.grn_quantity,
-
-                td.system_grn_date,
-
-                td.approval_authority,
-
-                td.source_location,
-
-                td.destination_location,
-
-                td.remark,
-
                 td.net_weight,
-
                 td.total_weight,
-
-                td.box_count,
-
                 CASE
-
                     WHEN td._source = 'inward' THEN EXISTS (
-
                         SELECT 1 FROM box_edit_logs el WHERE el.transaction_no = td.transaction_no
-
                     )
-
                     ELSE FALSE
-
                 END AS has_edits
-
             FROM transaction_data td
-
             ORDER BY {order_clause}
-
-            LIMIT :limit OFFSET :offset
-
         """),
-
         {**params, "limit": per_page, "offset": offset},
-
     ).fetchall()
 
-
-
     formatted = []
-
     for record in records:
-
         item_descriptions = []
-
         if record.item_descriptions_text and record.item_descriptions_text.strip():
-
             item_descriptions = [d.strip() for d in record.item_descriptions_text.split("\n") if d.strip()]
 
-
-
         quantities_and_uoms = []
-
         if record.quantities_and_uoms_text and record.quantities_and_uoms_text.strip():
-
             quantities_and_uoms = [q.strip() for q in record.quantities_and_uoms_text.split(",") if q.strip()]
 
-        # Combined per-item "Name (X kg)" list — newline-separated so commas in names are safe
         article_items_with_qty: list[str] = []
         raw_items_qty = getattr(record, "article_items_with_qty_text", None)
         if raw_items_qty and raw_items_qty.strip():
             article_items_with_qty = [x.strip() for x in raw_items_qty.split("\n") if x.strip()]
 
-
-
         formatted.append(
-
             InwardListItem(
-
                 transaction_no=record.transaction_no or "",
-
                 entry_date=format_date_for_frontend(record.entry_date) or "",
-
                 status=record.status or "pending",
-
                 invoice_number=record.invoice_number,
-
                 po_number=record.po_number,
-
                 vendor_supplier_name=record.vendor_supplier_name,
-
                 customer_party_name=record.customer_party_name,
-
                 total_amount=float(record.total_amount) if record.total_amount is not None else None,
-
                 warehouse=record.warehouse,
-
                 source=record.source or "inward",
-
                 item_descriptions=item_descriptions,
-
                 quantities_and_uoms=quantities_and_uoms,
-
                 article_items_with_qty=article_items_with_qty,
-
                 has_edits=record.has_edits,
-
                 approval_authority=record.approval_authority,
-
                 vehicle_number=record.vehicle_number,
-
                 transporter_name=record.transporter_name,
-
                 lr_number=record.lr_number,
-
                 challan_number=record.challan_number,
-
                 grn_number=record.grn_number,
-
                 grn_quantity=float(record.grn_quantity) if record.grn_quantity is not None else None,
-
                 system_grn_date=format_date_for_frontend(record.system_grn_date),
-
                 source_location=record.source_location,
-
                 destination_location=record.destination_location,
-
                 remark=record.remark,
-
                 net_weight=float(record.net_weight) if record.net_weight is not None else None,
-
                 total_weight=float(record.total_weight) if record.total_weight is not None else None,
-
                 box_count=int(record.box_count) if record.box_count is not None else None,
-
             )
-
         )
-
-
 
     return InwardListResponse(records=formatted, total=total, page=page, per_page=per_page)
 

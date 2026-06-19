@@ -2759,6 +2759,18 @@ def list_transfer_ins(
     clauses = ["1=1"]
     params: dict = {}
 
+    # Defense-in-depth: never surface cold-owned receipts in the interunit Transfer-IN
+    # list. A cold receive is scanned through an interunit staging header (same id), then
+    # finalize_cold_transfer_in builds the cold_transfer_in_headers row and purges the
+    # staging on completion. But while the receipt is still in progress (staging 'Pending')
+    # — or if it was abandoned mid-scan, or finalized before that purge existed — the
+    # staging row lingers and would otherwise show up here as a phantom interunit receipt.
+    # Exclude any staging header that has a matching cold header (id + transfer_out_id).
+    clauses.append("""NOT EXISTS (
+        SELECT 1 FROM cold_transfer_in_headers c
+        WHERE c.id = h.id AND c.transfer_out_id = h.transfer_out_id
+    )""")
+
     if receiving_warehouse:
         clauses.append("h.receiving_warehouse = :rw")
         params["rw"] = receiving_warehouse.upper()

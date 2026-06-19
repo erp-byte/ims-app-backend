@@ -276,6 +276,7 @@ class RTVListItem(RTVHeaderResponse):
     items_count: int = 0
     boxes_count: int = 0
     total_qty: int = 0
+    total_net_weight: float = 0  # Σ of box net weights (kg) — the actual returned weight.
 
 
 class RTVListResponse(BaseModel):

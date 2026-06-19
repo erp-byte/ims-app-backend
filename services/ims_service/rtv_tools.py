@@ -437,14 +437,12 @@ def list_rtvs(
                    h.invoice_number, h.challan_no, h.dn_no, h.conversion,
                    h.sales_poc, h.business_head, h.remark, h.status, h.created_by, h.created_ts, h.updated_at,
                    h.vehicle_number, h.transporter_name, h.driver_name, h.inward_manager,
-                   COUNT(DISTINCT l.id) AS items_count,
-                   COUNT(DISTINCT b.id) AS boxes_count,
-                   COALESCE(SUM(l.qty), 0) AS total_qty
+                   (SELECT COUNT(*) FROM {tables['lines']} l WHERE l.header_id = h.id) AS items_count,
+                   (SELECT COUNT(*) FROM {tables['boxes']} b WHERE b.header_id = h.id) AS boxes_count,
+                   (SELECT COALESCE(SUM(l.qty), 0) FROM {tables['lines']} l WHERE l.header_id = h.id) AS total_qty,
+                   (SELECT COALESCE(SUM(b.net_weight), 0) FROM {tables['boxes']} b WHERE b.header_id = h.id) AS total_net_weight
             FROM {tables['header']} h
-            LEFT JOIN {tables['lines']} l ON h.id = l.header_id
-            LEFT JOIN {tables['boxes']} b ON h.id = b.header_id
             WHERE {where}
-            GROUP BY h.id
             ORDER BY h.{sort_by} {direction}
             LIMIT :limit OFFSET :offset
         """),
@@ -457,6 +455,7 @@ def list_rtvs(
         item["items_count"] = row.items_count or 0
         item["boxes_count"] = row.boxes_count or 0
         item["total_qty"] = int(row.total_qty or 0)
+        item["total_net_weight"] = float(row.total_net_weight or 0)
         records.append(item)
 
     return {

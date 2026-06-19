@@ -7,11 +7,13 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
+from shared.canonicalize import canonical_warehouse
 from services.ims_service.inward_models import Company
 from services.ims_service.rtv_models import (
     RTVCreate,
     RTVHeaderUpdate,
     RTVBoxUpsertRequest,
+    RTVBulkBoxUpdateRequest,
     RTVLinesUpdateRequest,
     RTVApprovalRequest,
     RTVBoxEditLogRequest,
@@ -36,7 +38,106 @@ def rtv_table_names(company: Company) -> dict:
 
 
 def _generate_rtv_id() -> str:
-    return f"RTV-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    # Prefix is "CR-" (Customer Return). NOT "RTV-": downstream sale/production
+    # systems read "RTV" as Return-To-Vendor (the opposite flow), which
+    # mis-routes these inbound customer returns. Forward-only — legacy RTV-*
+    # ids and their already-printed QR labels stay valid.
+    return f"CR-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+
+def _canonical_factory_unit(raw):
+    """Map a factory_unit string to its canonical warehouse code, or return it
+    unchanged if unrecognized (display-time mapping handles legacy values)."""
+    if not raw:
+        return raw
+    return canonical_warehouse(raw, raw) or raw
+
+
+# Cold-stock mirror: RTV cold returns also belong to cold-storage inventory.
+_RTV_COLD_UNIT_MAP = {
+    "Savla D-39": "D-39",
+    "Savla D-514": "D-514",
+    "Rishi": "Rishi",
+    "Supreme": "Supreme",
+}
+
+
+def sync_cold_stocks_from_rtv(company: Company, rtv_id_int: int, db: Session) -> int:
+    """Mirror an RTV's cold boxes into {prefix}_cold_stocks so the returned lots
+    show in the cold-storage inventory + dashboard. Idempotent: owns only the rows
+    it auto-creates (inward_transaction_no = the RTV id, auto_created_from_inward=true) —
+    deletes them then re-inserts one row per box with a box_id. Only cold warehouses
+    are mirrored; a dry/unknown warehouse just clears stale auto rows and inserts
+    nothing. Does NOT commit (caller owns the transaction). The DB trigger fills
+    canonical_warehouse/group/subgroup on insert."""
+    tables = rtv_table_names(company)
+    prefix = "cfpl" if company == "CFPL" else "cdpl"
+    cold = f"{prefix}_cold_stocks"
+
+    header = db.execute(
+        text(f"SELECT factory_unit, customer, rtv_id, rtv_date FROM {tables['header']} WHERE id = :hid"),
+        {"hid": rtv_id_int},
+    ).fetchone()
+    if not header:
+        return 0
+
+    rtv_str = header.rtv_id or ""
+    wh = _canonical_factory_unit(header.factory_unit)
+
+    # Always clear our own auto rows first (warehouse change / re-submit safe).
+    db.execute(
+        text(f"DELETE FROM {cold} WHERE inward_transaction_no = :tx AND auto_created_from_inward = true"),
+        {"tx": rtv_str},
+    )
+
+    unit = _RTV_COLD_UNIT_MAP.get(wh)
+    if unit is None:
+        return 0  # not a cold warehouse — nothing mirrored
+
+    inserted = db.execute(
+        text(f"""
+            INSERT INTO {cold} (
+                inward_dt, unit, inward_no, cold_item_mark, vakkal, lot_no,
+                no_of_cartons, weight_kg, total_inventory_kgs, group_name,
+                item_description, storage_location, exporter, last_purchase_rate,
+                box_id, transaction_no, item_subgroup, item_mark, value,
+                inward_transaction_no, auto_created_from_inward, spl_remarks,
+                canonical_warehouse, canonical_group, canonical_subgroup
+            )
+            SELECT
+                :rtv_date, :unit, :rtv_str,
+                COALESCE(b.item_mark, l.item_mark), COALESCE(b.vakkal, l.vakkal),
+                COALESCE(b.lot_number, l.lot_number),
+                1, b.net_weight, b.net_weight, l.item_category,
+                l.item_description, :wh, :exporter, l.rate,
+                b.box_id, :rtv_str, l.sub_category, COALESCE(b.item_mark, l.item_mark),
+                ROUND(COALESCE(b.net_weight, 0) * COALESCE(l.rate, 0), 2),
+                :rtv_str, true, COALESCE(b.spl_remarks, l.spl_remarks),
+                :wh, l.item_category, l.sub_category
+            FROM {tables['boxes']} b
+            JOIN LATERAL (
+                SELECT l2.item_category, l2.sub_category, l2.item_description,
+                       l2.rate, l2.lot_number, l2.item_mark, l2.spl_remarks, l2.vakkal
+                FROM {tables['lines']} l2
+                WHERE l2.header_id = b.header_id
+                  AND l2.item_description = b.article_description
+                ORDER BY l2.id
+                LIMIT 1
+            ) l ON true
+            WHERE b.header_id = :hid
+              AND b.box_id IS NOT NULL
+        """),
+        {
+            "hid": rtv_id_int,
+            "unit": unit,
+            "wh": wh,
+            "rtv_str": rtv_str,
+            "rtv_date": header.rtv_date,
+            "exporter": header.customer,
+        },
+    ).rowcount
+
+    return inserted
 
 
 def _convert_date(date_str: str):
@@ -86,6 +187,10 @@ def _map_line_row(row) -> dict:
         "value": str(row.value) if row.value is not None else "0",
         "net_weight": str(row.net_weight) if row.net_weight is not None else "0",
         "carton_weight": str(row.carton_weight) if row.carton_weight is not None else "0",
+        "lot_number": getattr(row, "lot_number", None),
+        "item_mark": getattr(row, "item_mark", None),
+        "spl_remarks": getattr(row, "spl_remarks", None),
+        "vakkal": getattr(row, "vakkal", None),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -102,6 +207,9 @@ def _map_box_row(row) -> dict:
         "uom": row.uom or None,
         "conversion": str(row.conversion) if row.conversion is not None else None,
         "lot_number": row.lot_number,
+        "item_mark": getattr(row, "item_mark", None),
+        "spl_remarks": getattr(row, "spl_remarks", None),
+        "vakkal": getattr(row, "vakkal", None),
         "net_weight": str(row.net_weight) if row.net_weight is not None else "0",
         "gross_weight": str(row.gross_weight) if row.gross_weight is not None else "0",
         "count": row.count,
@@ -115,6 +223,7 @@ def _fetch_lines(db: Session, tables: dict, header_id: int) -> list:
         text(f"""
             SELECT id, header_id, material_type, item_category, sub_category,
                    item_description, uom, qty, rate, value, net_weight, carton_weight,
+                   lot_number, item_mark, spl_remarks, vakkal,
                    created_at, updated_at
             FROM {tables['lines']}
             WHERE header_id = :hid
@@ -129,7 +238,8 @@ def _fetch_boxes(db: Session, tables: dict, header_id: int) -> list:
     rows = db.execute(
         text(f"""
             SELECT id, header_id, rtv_line_id, box_number, box_id,
-                   article_description, uom, conversion, lot_number, net_weight, gross_weight,
+                   article_description, uom, conversion, lot_number,
+                   item_mark, spl_remarks, vakkal, net_weight, gross_weight,
                    count, created_at, updated_at
             FROM {tables['boxes']}
             WHERE header_id = :hid
@@ -193,7 +303,7 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
         """),
         {
             "rtv_id": rtv_id,
-            "factory_unit": data.header.factory_unit,
+            "factory_unit": _canonical_factory_unit(data.header.factory_unit),
             "customer": data.header.customer,
             "invoice_number": data.header.invoice_number,
             "challan_no": data.header.challan_no,
@@ -225,12 +335,15 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             text(f"""
                 INSERT INTO {tables['lines']}
                     (header_id, material_type, item_category, sub_category,
-                     item_description, uom, qty, rate, value, net_weight, carton_weight)
+                     item_description, uom, qty, rate, value, net_weight, carton_weight,
+                     lot_number, item_mark, spl_remarks, vakkal)
                 VALUES
                     (:header_id, :material_type, :item_category, :sub_category,
-                     :item_description, :uom, :qty, :rate, :value, :net_weight, :carton_weight)
+                     :item_description, :uom, :qty, :rate, :value, :net_weight, :carton_weight,
+                     :lot_number, :item_mark, :spl_remarks, :vakkal)
                 RETURNING id, header_id, material_type, item_category, sub_category,
                           item_description, uom, qty, rate, value, net_weight, carton_weight,
+                          lot_number, item_mark, spl_remarks, vakkal,
                           created_at, updated_at
             """),
             {
@@ -245,6 +358,10 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
                 "value": value_f,
                 "net_weight": net_weight_f,
                 "carton_weight": carton_weight_f,
+                "lot_number": line.lot_number,
+                "item_mark": line.item_mark,
+                "spl_remarks": line.spl_remarks,
+                "vakkal": line.vakkal,
             },
         ).fetchone()
         lines.append(_map_line_row(row))
@@ -322,14 +439,12 @@ def list_rtvs(
                    h.invoice_number, h.challan_no, h.dn_no, h.conversion,
                    h.sales_poc, h.sales_poc_email, h.business_head, h.remark, h.status, h.created_by, h.created_ts, h.updated_at,
                    h.vehicle_number, h.transporter_name, h.driver_name, h.inward_manager,
-                   COUNT(DISTINCT l.id) AS items_count,
-                   COUNT(DISTINCT b.id) AS boxes_count,
-                   COALESCE(SUM(l.qty), 0) AS total_qty
+                   (SELECT COUNT(*) FROM {tables['lines']} l WHERE l.header_id = h.id) AS items_count,
+                   (SELECT COUNT(*) FROM {tables['boxes']} b WHERE b.header_id = h.id) AS boxes_count,
+                   (SELECT COALESCE(SUM(l.qty), 0) FROM {tables['lines']} l WHERE l.header_id = h.id) AS total_qty,
+                   (SELECT COALESCE(SUM(b.net_weight), 0) FROM {tables['boxes']} b WHERE b.header_id = h.id) AS total_net_weight
             FROM {tables['header']} h
-            LEFT JOIN {tables['lines']} l ON h.id = l.header_id
-            LEFT JOIN {tables['boxes']} b ON h.id = b.header_id
             WHERE {where}
-            GROUP BY h.id
             ORDER BY h.{sort_by} {direction}
             LIMIT :limit OFFSET :offset
         """),
@@ -342,6 +457,7 @@ def list_rtvs(
         item["items_count"] = row.items_count or 0
         item["boxes_count"] = row.boxes_count or 0
         item["total_qty"] = int(row.total_qty or 0)
+        item["total_net_weight"] = float(row.total_net_weight or 0)
         records.append(item)
 
     return {
@@ -518,6 +634,9 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
         "net_weight": float(payload.net_weight) if payload.net_weight is not None else None,
         "gross_weight": float(payload.gross_weight) if payload.gross_weight is not None else None,
         "lot_number": payload.lot_number,
+        "item_mark": payload.item_mark,
+        "spl_remarks": payload.spl_remarks,
+        "vakkal": payload.vakkal,
         "count": payload.count,
     }
 
@@ -531,6 +650,9 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
                     net_weight = COALESCE(:net_weight, net_weight),
                     gross_weight = COALESCE(:gross_weight, gross_weight),
                     lot_number = COALESCE(:lot_number, lot_number),
+                    item_mark = COALESCE(:item_mark, item_mark),
+                    spl_remarks = COALESCE(:spl_remarks, spl_remarks),
+                    vakkal = COALESCE(:vakkal, vakkal),
                     count = COALESCE(:count, count),
                     rtv_line_id = :line_id, updated_at = NOW()
                 WHERE header_id = :hid
@@ -556,6 +678,9 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
                         net_weight = COALESCE(:net_weight, net_weight),
                         gross_weight = COALESCE(:gross_weight, gross_weight),
                         lot_number = COALESCE(:lot_number, lot_number),
+                        item_mark = COALESCE(:item_mark, item_mark),
+                        spl_remarks = COALESCE(:spl_remarks, spl_remarks),
+                        vakkal = COALESCE(:vakkal, vakkal),
                         count = COALESCE(:count, count),
                         box_id = :box_id, rtv_line_id = :line_id, updated_at = NOW()
                     WHERE header_id = :hid
@@ -570,10 +695,12 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
                     INSERT INTO {tables['boxes']}
                         (header_id, rtv_line_id, box_number, box_id,
                          article_description, uom, conversion, lot_number,
+                         item_mark, spl_remarks, vakkal,
                          net_weight, gross_weight, count)
                     VALUES
                         (:hid, :line_id, :box_num, :box_id,
                          :art_desc, :uom, :conversion, :lot_number,
+                         :item_mark, :spl_remarks, :vakkal,
                          :net_weight, :gross_weight, :count)
                 """),
                 params,
@@ -586,6 +713,109 @@ def upsert_rtv_box(company: Company, rtv_id_int: int, payload: RTVBoxUpsertReque
         "rtv_id": header.rtv_id,
         "article_description": payload.article_description,
         "box_number": payload.box_number,
+    }
+
+
+def bulk_save_boxes(
+    company: Company, rtv_id_int: int, data, db: Session, notify_discrepancy: bool = True
+) -> dict:
+    """State-aware full sync of the box set for a CR. Insert new, update existing
+    (preserving box_id), delete boxes no longer present. Persists cold fields."""
+    # NOTE: notify_discrepancy is reserved for a future net-weight discrepancy
+    # notification and is currently a no-op (Phase 1).
+    tables = rtv_table_names(company)
+
+    header = db.execute(
+        text(f"SELECT id, rtv_id FROM {tables['header']} WHERE id = :hid"),
+        {"hid": rtv_id_int},
+    ).fetchone()
+    if not header:
+        raise HTTPException(404, "RTV not found")
+
+    existing_rows = db.execute(
+        text(f"""SELECT box_number, box_id, article_description
+                 FROM {tables['boxes']} WHERE header_id = :hid"""),
+        {"hid": rtv_id_int},
+    ).fetchall()
+    existing_keys = {(r.article_description, r.box_number): r.box_id for r in existing_rows}
+
+    _seen = {}
+    for b in data.boxes:
+        _seen[(b.article_description, b.box_number)] = b   # keep last occurrence
+    incoming_boxes = list(_seen.values())
+    incoming_keys = set(_seen.keys())
+
+    inserted = updated = 0
+    for b in incoming_boxes:
+        line = db.execute(
+            text(f"SELECT id FROM {tables['lines']} WHERE header_id = :hid AND item_description = :art LIMIT 1"),
+            {"hid": rtv_id_int, "art": b.article_description},
+        ).fetchone()
+        params = {
+            "hid": rtv_id_int,
+            "line_id": line.id if line else None,
+            "art_desc": b.article_description,
+            "box_num": b.box_number,
+            "uom": b.uom,
+            "conversion": b.conversion,
+            "lot_number": b.lot_number,
+            "item_mark": b.item_mark,
+            "spl_remarks": b.spl_remarks,
+            "vakkal": b.vakkal,
+            "net_weight": float(b.net_weight) if b.net_weight is not None else None,
+            "gross_weight": float(b.gross_weight) if b.gross_weight is not None else None,
+            "count": b.count,
+        }
+        if (b.article_description, b.box_number) in existing_keys:
+            db.execute(text(f"""
+                UPDATE {tables['boxes']}
+                SET uom = COALESCE(:uom, uom),
+                    conversion = COALESCE(:conversion, conversion),
+                    lot_number = COALESCE(:lot_number, lot_number),
+                    item_mark = COALESCE(:item_mark, item_mark),
+                    spl_remarks = COALESCE(:spl_remarks, spl_remarks),
+                    vakkal = COALESCE(:vakkal, vakkal),
+                    net_weight = COALESCE(:net_weight, net_weight),
+                    gross_weight = COALESCE(:gross_weight, gross_weight),
+                    count = COALESCE(:count, count),
+                    rtv_line_id = :line_id, updated_at = NOW()
+                WHERE header_id = :hid AND article_description = :art_desc AND box_number = :box_num
+            """), params)
+            updated += 1
+        else:
+            base = str(int(time.time() * 1000))[-8:]
+            params["box_id"] = f"{base}-{b.box_number}-{inserted}"
+            db.execute(text(f"""
+                INSERT INTO {tables['boxes']}
+                    (header_id, rtv_line_id, box_number, box_id, article_description,
+                     uom, conversion, lot_number, item_mark, spl_remarks, vakkal,
+                     net_weight, gross_weight, count)
+                VALUES
+                    (:hid, :line_id, :box_num, :box_id, :art_desc,
+                     :uom, :conversion, :lot_number, :item_mark, :spl_remarks, :vakkal,
+                     :net_weight, :gross_weight, :count)
+            """), params)
+            inserted += 1
+
+    deleted = 0
+    for (art, num) in existing_keys.keys() - incoming_keys:
+        db.execute(
+            text(f"""DELETE FROM {tables['boxes']}
+                     WHERE header_id = :hid AND article_description = :art AND box_number = :num"""),
+            {"hid": rtv_id_int, "art": art, "num": num},
+        )
+        deleted += 1
+
+    # Mirror cold boxes into cold-storage inventory (same transaction).
+    sync_cold_stocks_from_rtv(company, rtv_id_int, db)
+
+    return {
+        "status": "synced",
+        "rtv_id": header.rtv_id,
+        "inserted": inserted,
+        "updated": updated,
+        "unchanged": 0,
+        "deleted": deleted,
     }
 
 
@@ -626,10 +856,12 @@ def update_rtv_lines(
             text(f"""
                 INSERT INTO {tables['lines']}
                     (header_id, material_type, item_category, sub_category,
-                     item_description, uom, qty, rate, value, net_weight, carton_weight)
+                     item_description, uom, qty, rate, value, net_weight, carton_weight,
+                     lot_number, item_mark, spl_remarks, vakkal)
                 VALUES
                     (:header_id, :material_type, :item_category, :sub_category,
-                     :item_description, :uom, :qty, :rate, :value, :net_weight, :carton_weight)
+                     :item_description, :uom, :qty, :rate, :value, :net_weight, :carton_weight,
+                     :lot_number, :item_mark, :spl_remarks, :vakkal)
             """),
             {
                 "header_id": header_id,
@@ -643,6 +875,10 @@ def update_rtv_lines(
                 "value": value_f,
                 "net_weight": net_weight_f,
                 "carton_weight": carton_weight_f,
+                "lot_number": line.lot_number,
+                "item_mark": line.item_mark,
+                "spl_remarks": line.spl_remarks,
+                "vakkal": line.vakkal,
             },
         )
 
@@ -691,6 +927,9 @@ def approve_rtv(
             if field == "conversion":
                 update_parts.append(f"{field} = :{field}")
                 params[field] = float(value) if value else 0
+            elif field == "factory_unit":
+                update_parts.append(f"{field} = :{field}")
+                params[field] = _canonical_factory_unit(value)
             else:
                 update_parts.append(f"{field} = :{field}")
                 params[field] = value
@@ -734,7 +973,7 @@ def approve_rtv(
 
     # 3) Upsert boxes if provided (preserve existing box_ids)
     if payload.boxes:
-        for b in payload.boxes:
+        for _i, b in enumerate(payload.boxes):
             box_params = {
                 "hid": rtv_id_int,
                 "art_desc": b.article_description,
@@ -744,6 +983,10 @@ def approve_rtv(
                 "net_weight": float(b.net_weight) if b.net_weight is not None else None,
                 "gross_weight": float(b.gross_weight) if b.gross_weight is not None else None,
                 "count": b.count,
+                "lot_number": b.lot_number,
+                "item_mark": b.item_mark,
+                "spl_remarks": b.spl_remarks,
+                "vakkal": b.vakkal,
             }
 
             existing_box = db.execute(
@@ -764,6 +1007,10 @@ def approve_rtv(
                             net_weight = COALESCE(:net_weight, net_weight),
                             gross_weight = COALESCE(:gross_weight, gross_weight),
                             count = COALESCE(:count, count),
+                            lot_number = COALESCE(:lot_number, lot_number),
+                            item_mark = COALESCE(:item_mark, item_mark),
+                            spl_remarks = COALESCE(:spl_remarks, spl_remarks),
+                            vakkal = COALESCE(:vakkal, vakkal),
                             updated_at = NOW()
                         WHERE header_id = :hid
                           AND article_description = :art_desc AND box_number = :box_num
@@ -771,17 +1018,24 @@ def approve_rtv(
                     box_params,
                 )
             else:
+                base = str(int(time.time() * 1000))[-8:]
+                box_params["box_id"] = f"{base}-{b.box_number}-{_i}"
                 db.execute(
                     text(f"""
                         INSERT INTO {tables['boxes']}
-                            (header_id, box_number, article_description,
-                             uom, conversion, net_weight, gross_weight, count)
+                            (header_id, box_number, box_id, article_description,
+                             uom, conversion, lot_number, item_mark, spl_remarks, vakkal,
+                             net_weight, gross_weight, count)
                         VALUES
-                            (:hid, :box_num, :art_desc,
-                             :uom, :conversion, :net_weight, :gross_weight, :count)
+                            (:hid, :box_num, :box_id, :art_desc,
+                             :uom, :conversion, :lot_number, :item_mark, :spl_remarks, :vakkal,
+                             :net_weight, :gross_weight, :count)
                     """),
                     box_params,
                 )
+
+    # Mirror cold boxes into cold-storage inventory (same transaction).
+    sync_cold_stocks_from_rtv(company, rtv_id_int, db)
 
     return {
         "status": "approved",

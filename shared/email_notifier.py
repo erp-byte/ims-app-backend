@@ -159,6 +159,16 @@ def _rtv_thread_key(rtv_id: str | None) -> str | None:
     return f"RTV-{rtv_id}@candorfoods.in" if rtv_id else None
 
 
+def _rtv_subject(rtv_id: str | None, *, reply: bool = False) -> str:
+    """One subject per return so every mail threads into a single Gmail
+    conversation. Gmail groups by (normalized subject + References); a changing
+    subject splits the thread, so the action (Created / Approved / Rejected /
+    ...) is shown in the banner, NOT the subject. Replies carry the "Re:" prefix
+    Gmail strips before matching."""
+    base = f"Customer Returns Created: {rtv_id or ''}"
+    return f"Re: {base}" if reply else base
+
+
 def _send_email_background(
     subject: str,
     html_body: str,
@@ -442,7 +452,7 @@ def notify_rtv_created(rtv_detail: dict) -> None:
     rtv_id = rtv_detail.get("rtv_id", "")
     bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     thread_id = _rtv_thread_key(rtv_id)
-    subject = f"Customer Returns Created: {rtv_id}"
+    subject = _rtv_subject(rtv_id)
     lines = rtv_detail.get("lines", [])
     boxes = rtv_detail.get("boxes", [])
 
@@ -600,7 +610,7 @@ def notify_rtv_weight_discrepancy(rtv_detail: dict, summary: dict) -> None:
     to_list.append(RTV_NOTIFY_TO)
 
     _send_email_background(
-        subject=f"Customer Returns Net-Weight Discrepancy: {rtv_id}",
+        subject=_rtv_subject(rtv_id, reply=True),
         html_body=html,
         plain_body=plain,
         to=to_list,
@@ -656,7 +666,7 @@ def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: st
         cc.append(addr.strip())
 
     _send_email_background(
-        subject=f"Customer Returns {new_status}: {rtv_id}",
+        subject=_rtv_subject(rtv_id, reply=True),
         html_body=html,
         plain_body=plain,
         to=to_list,
@@ -715,7 +725,7 @@ def notify_rtv_action_required(rtv_detail: dict) -> None:
     )
 
     _send_email_background(
-        subject=f"ACTION REQUIRED — Customer Returns {rtv_id} [{status}]",
+        subject=_rtv_subject(rtv_id, reply=True),
         html_body=html,
         plain_body=plain,
         to=head_email,
@@ -737,7 +747,7 @@ def notify_rtv_rejected(rtv_detail: dict, rejected_by: str) -> None:
         sales_poc_email=rtv_detail.get("sales_poc_email"),
     )
     _send_email_background(
-        subject=f"Customer Returns Rejected: {rtv_detail.get('rtv_id', '')}",
+        subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
         cc=cc,
@@ -760,7 +770,7 @@ def notify_rtv_held(rtv_detail: dict, held_by: str) -> None:
         sales_poc_email=rtv_detail.get("sales_poc_email"),
     )
     _send_email_background(
-        subject=f"Customer Returns On Hold: {rtv_detail.get('rtv_id', '')}",
+        subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
         cc=cc,
@@ -785,7 +795,7 @@ def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:
         sales_poc_email=rtv_detail.get("sales_poc_email"),
     )
     _send_email_background(
-        subject=f"Customer Returns Approved: {rtv_detail.get('rtv_id', '')}",
+        subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
         cc=cc,
@@ -815,7 +825,7 @@ def notify_rtv_deleted(
     )
     cc = _build_rtv_cc(business_head, created_by, deleted_by)
     _send_email_background(
-        subject=f"Customer Returns Deleted: {rtv_id}",
+        subject=_rtv_subject(rtv_id, reply=True),
         html_body=html,
         plain_body=plain,
         cc=cc,
@@ -837,7 +847,7 @@ def notify_rtv_header_updated(rtv_detail: dict) -> None:
         sales_poc_email=rtv_detail.get("sales_poc_email"),
     )
     _send_email_background(
-        subject=f"Customer Returns Updated: {rtv_detail.get('rtv_id', '')}",
+        subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
         cc=cc,
@@ -1662,7 +1672,7 @@ def notify_rtv_lines_updated(rtv_detail: dict) -> None:
         sales_poc_email=rtv_detail.get("sales_poc_email"),
     )
     _send_email_background(
-        subject=f"Customer Returns Lines Updated: {rtv_detail.get('rtv_id', '')}",
+        subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
         cc=cc,

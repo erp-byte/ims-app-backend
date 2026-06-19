@@ -44,6 +44,9 @@ def test_bulk_save_inserts_and_deletes():
     assert res["deleted"] >= 1
     ins = [(s, p) for s, p in db.calls if "INTO" in s and "rtv_boxes" in s]
     assert any("item_mark" in s for s, _ in ins), "cold fields not in bulk INSERT"
+    # Saving the box set marks the CR Submitted (only from Approved/Submitted).
+    assert any("status = 'Submitted'" in s and "Approved" in s for s, _ in db.calls), \
+        "bulk save must transition the CR to Submitted"
     print("test_bulk_save_inserts_and_deletes: PASS")
 
 

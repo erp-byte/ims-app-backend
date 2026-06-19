@@ -803,6 +803,16 @@ def bulk_save_boxes(
         )
         deleted += 1
 
+    # Warehouse has saved the box-entry set — mark the CR Submitted (the final-save
+    # state, distinct from the business-head "Approved"). Only from a post-approval
+    # state, so Pending/Hold/Rejected are never silently flipped.
+    db.execute(
+        text(f"""UPDATE {tables['header']}
+                 SET status = 'Submitted', updated_at = NOW()
+                 WHERE id = :hid AND status IN ('Approved', 'Submitted')"""),
+        {"hid": rtv_id_int},
+    )
+
     # Mirror cold boxes into cold-storage inventory (same transaction).
     sync_cold_stocks_from_rtv(company, rtv_id_int, db)
 

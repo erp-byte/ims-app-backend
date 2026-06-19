@@ -405,39 +405,6 @@ def _rtv_email_html(
     return html, "\n".join(plain_lines)
 
 
-def _action_buttons_html(rtv_detail: dict, head_email: str) -> str:
-    """Render the Approve / Reject / Hold button row for the action-required email.
-
-    Buttons hit the live /rtv/action endpoint, which re-validates the email
-    against the business head stored on the RTV. This email is sent to the
-    business head ONLY, so no other recipient ever receives a tappable button.
-    """
-    rtv_id = rtv_detail.get("rtv_id", "") or ""
-    if not rtv_id:
-        return ""
-
-    approve = _build_rtv_action_url(rtv_id, head_email, "approve")
-    reject = _build_rtv_action_url(rtv_id, head_email, "reject")
-    hold = _build_rtv_action_url(rtv_id, head_email, "hold")
-
-    btn_style = (
-        "display:inline-block;padding:12px 28px;margin:0 6px;border-radius:6px;"
-        "color:#fff;text-decoration:none;font-weight:bold;font-size:14px;"
-        "font-family:Arial,sans-serif;"
-    )
-    return f"""
-    <table style="margin:18px 0;width:100%;border-collapse:collapse;">
-      <tr><td style="text-align:center;padding:18px;background:#f8f9fa;border-radius:8px;">
-        <p style="margin:0 0 12px;font-size:13px;color:#555;">
-          Action required by <strong>{head_email}</strong>
-        </p>
-        <a href="{approve}" style="{btn_style}background:#16a34a;">&#10003; Approve</a>
-        <a href="{reject}" style="{btn_style}background:#dc2626;">&#10007; Reject</a>
-        <a href="{hold}" style="{btn_style}background:#f59e0b;">&#9208; Hold</a>
-      </td></tr>
-    </table>"""
-
-
 def notify_rtv_created(rtv_detail: dict) -> None:
     """Send the 'Created' notification for a customer return as ONE conversation.
 
@@ -672,63 +639,6 @@ def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: st
         to=to_list,
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
-    )
-
-
-def notify_rtv_action_required(rtv_detail: dict) -> None:
-    """Send an action-required email with Approve/Reject/Hold buttons to the assigned business head ONLY.
-
-    No other recipient receives these buttons, so only the business head can
-    trigger an Approve / Reject / Hold. The buttons hit /rtv/action, which also
-    re-validates the email against the business head stored on the RTV.
-    """
-    head_email = _lookup_business_head_email(rtv_detail.get("business_head"))
-    if not head_email:
-        logger.info(
-            "Skipping action-required email for %s: business_head %r is not mapped",
-            rtv_detail.get("rtv_id"), rtv_detail.get("business_head"),
-        )
-        return
-
-    rtv_id = rtv_detail.get("rtv_id", "") or ""
-    if not rtv_id:
-        logger.warning(
-            "Skipping action-required email: missing rtv_id in detail (business_head=%r)",
-            rtv_detail.get("business_head"),
-        )
-        return
-
-    status = rtv_detail.get("status", "Pending")
-    action_html = _action_buttons_html(rtv_detail, head_email)
-    base_html, base_plain = _rtv_email_html(
-        action=f"Action Required ({status})",
-        header=rtv_detail,
-        lines=rtv_detail.get("lines", []),
-        boxes=rtv_detail.get("boxes", []),
-        extra_info=(
-            "Please choose an action below. Approve to confirm; Reject to deny; "
-            "Hold to defer (you'll receive another action email so you can finalize later)."
-        ),
-    )
-    # Inject the buttons right after the opening content cell.
-    html = base_html.replace(
-        '<tr><td style="padding:20px 24px;">',
-        f'<tr><td style="padding:20px 24px;">{action_html}',
-        1,
-    )
-    plain = (
-        f"{base_plain}\n\n"
-        f"--- ACTION LINKS ---\n"
-        f"Approve: {_build_rtv_action_url(rtv_id, head_email, 'approve')}\n"
-        f"Reject:  {_build_rtv_action_url(rtv_id, head_email, 'reject')}\n"
-        f"Hold:    {_build_rtv_action_url(rtv_id, head_email, 'hold')}\n"
-    )
-
-    _send_email_background(
-        subject=_rtv_subject(rtv_id, reply=True),
-        html_body=html,
-        plain_body=plain,
-        to=head_email,
     )
 
 
@@ -1676,6 +1586,7 @@ def notify_rtv_lines_updated(rtv_detail: dict) -> None:
         html_body=html,
         plain_body=plain,
         cc=cc,
+        in_reply_to=_rtv_thread_key(rtv_detail.get('rtv_id', '')),
     )
 
 

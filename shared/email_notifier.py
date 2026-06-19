@@ -1607,7 +1607,11 @@ def notify_rtv_lines_updated(rtv_detail: dict) -> None:
         lines=rtv_detail.get("lines", []),
         boxes=rtv_detail.get("boxes", []),
     )
-    cc = _build_rtv_cc(rtv_detail.get("business_head"), rtv_detail.get("created_by"))
+    cc = _build_rtv_cc(
+        rtv_detail.get("business_head"), rtv_detail.get("created_by"),
+        sales_poc=rtv_detail.get("sales_poc"),
+        sales_poc_email=rtv_detail.get("sales_poc_email"),
+    )
     _send_email_background(
         subject=f"RTV Lines Updated: {rtv_detail.get('rtv_id', '')}",
         html_body=html,

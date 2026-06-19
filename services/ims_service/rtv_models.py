@@ -23,6 +23,7 @@ class RTVHeaderCreate(BaseModel):
     dn_no: Optional[str] = None
     conversion: Optional[str] = "0"
     sales_poc: Optional[str] = None
+    sales_poc_email: Optional[str] = None
     business_head: Optional[str] = None
     remark: Optional[str] = None
     vehicle_number: Optional[str] = None
@@ -63,6 +64,7 @@ class RTVHeaderUpdate(BaseModel):
     dn_no: Optional[str] = None
     conversion: Optional[str] = None
     sales_poc: Optional[str] = None
+    sales_poc_email: Optional[str] = None
     business_head: Optional[str] = None
     remark: Optional[str] = None
     status: Optional[str] = None
@@ -98,6 +100,7 @@ class RTVApprovalHeaderFields(BaseModel):
     dn_no: Optional[str] = None
     conversion: Optional[str] = None
     sales_poc: Optional[str] = None
+    sales_poc_email: Optional[str] = None
     business_head: Optional[str] = None
     remark: Optional[str] = None
 
@@ -206,6 +209,7 @@ class RTVHeaderResponse(BaseModel):
     dn_no: Optional[str] = None
     conversion: Optional[str] = None
     sales_poc: Optional[str] = None
+    sales_poc_email: Optional[str] = None
     business_head: Optional[str] = None
     remark: Optional[str] = None
     vehicle_number: Optional[str] = None

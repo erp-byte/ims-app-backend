@@ -41,7 +41,6 @@ from services.ims_service.rtv_tools import (
     set_rtv_status,
     apply_rtv_email_action,
 )
-from services.ims_service.rtv_approval_token import verify_action_token, JWTError
 from shared.email_notifier import (
     notify_rtv_created,
     notify_rtv_approved,

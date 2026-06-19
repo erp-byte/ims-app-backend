@@ -58,6 +58,7 @@ def _map_header_row(row) -> dict:
         "dn_no": row.dn_no,
         "conversion": str(row.conversion) if row.conversion is not None else "0",
         "sales_poc": row.sales_poc,
+        "sales_poc_email": getattr(row, "sales_poc_email", None),
         "business_head": getattr(row, "business_head", None),
         "remark": row.remark,
         "status": row.status or "Pending",
@@ -176,18 +177,18 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             INSERT INTO {tables['header']}
                 (rtv_id, rtv_date, factory_unit, customer,
                  invoice_number, challan_no, dn_no, conversion,
-                 sales_poc, business_head, remark,
+                 sales_poc, sales_poc_email, business_head, remark,
                  vehicle_number, transporter_name, driver_name, inward_manager,
                  status, created_by, created_ts)
             VALUES
                 (:rtv_id, NOW(), :factory_unit, :customer,
                  :invoice_number, :challan_no, :dn_no, :conversion,
-                 :sales_poc, :business_head, :remark,
+                 :sales_poc, :sales_poc_email, :business_head, :remark,
                  :vehicle_number, :transporter_name, :driver_name, :inward_manager,
                  'Pending', :created_by, NOW())
             RETURNING id, rtv_id, rtv_date, factory_unit, customer,
                       invoice_number, challan_no, dn_no, conversion,
-                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at,
+                      sales_poc, sales_poc_email, business_head, remark, status, created_by, created_ts, updated_at,
                       vehicle_number, transporter_name, driver_name, inward_manager
         """),
         {
@@ -199,6 +200,7 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             "dn_no": data.header.dn_no,
             "conversion": float(data.header.conversion) if data.header.conversion else 0,
             "sales_poc": data.header.sales_poc,
+            "sales_poc_email": data.header.sales_poc_email,
             "business_head": data.header.business_head,
             "remark": data.header.remark,
             "vehicle_number": data.header.vehicle_number,
@@ -318,7 +320,7 @@ def list_rtvs(
         text(f"""
             SELECT h.id, h.rtv_id, h.rtv_date, h.factory_unit, h.customer,
                    h.invoice_number, h.challan_no, h.dn_no, h.conversion,
-                   h.sales_poc, h.business_head, h.remark, h.status, h.created_by, h.created_ts, h.updated_at,
+                   h.sales_poc, h.sales_poc_email, h.business_head, h.remark, h.status, h.created_by, h.created_ts, h.updated_at,
                    h.vehicle_number, h.transporter_name, h.driver_name, h.inward_manager,
                    COUNT(DISTINCT l.id) AS items_count,
                    COUNT(DISTINCT b.id) AS boxes_count,
@@ -358,7 +360,7 @@ def get_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
         text(f"""
             SELECT id, rtv_id, rtv_date, factory_unit, customer,
                    invoice_number, challan_no, dn_no, conversion,
-                   sales_poc, business_head, remark, status, created_by, created_ts, updated_at,
+                   sales_poc, sales_poc_email, business_head, remark, status, created_by, created_ts, updated_at,
                    vehicle_number, transporter_name, driver_name, inward_manager
             FROM {tables['header']}
             WHERE id = :hid
@@ -395,6 +397,7 @@ def update_rtv(company: Company, rtv_id_int: int, data: RTVHeaderUpdate, db: Ses
         "challan_no": data.challan_no,
         "dn_no": data.dn_no,
         "sales_poc": data.sales_poc,
+        "sales_poc_email": data.sales_poc_email,
         "business_head": data.business_head,
         "remark": data.remark,
         "status": data.status,
@@ -426,7 +429,7 @@ def update_rtv(company: Company, rtv_id_int: int, data: RTVHeaderUpdate, db: Ses
             WHERE id = :hid
             RETURNING id, rtv_id, rtv_date, factory_unit, customer,
                       invoice_number, challan_no, dn_no, conversion,
-                      sales_poc, business_head, remark, status, created_by, created_ts, updated_at,
+                      sales_poc, sales_poc_email, business_head, remark, status, created_by, created_ts, updated_at,
                       vehicle_number, transporter_name, driver_name, inward_manager
         """),
         params,

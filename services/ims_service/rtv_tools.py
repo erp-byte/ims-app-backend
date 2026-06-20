@@ -564,6 +564,13 @@ def delete_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
     if not existing:
         raise HTTPException(404, "RTV not found")
 
+    lines_count = db.execute(
+        text(f"SELECT COUNT(*) FROM {tables['lines']} WHERE header_id = :hid"), {"hid": rtv_id_int}
+    ).scalar() or 0
+    boxes_count = db.execute(
+        text(f"SELECT COUNT(*) FROM {tables['boxes']} WHERE header_id = :hid"), {"hid": rtv_id_int}
+    ).scalar() or 0
+
     # CASCADE handles children, but explicit delete for clarity
     db.execute(
         text(f"DELETE FROM {tables['boxes']} WHERE header_id = :hid"),
@@ -584,6 +591,8 @@ def delete_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
         "rtv_id": existing.rtv_id,
         "business_head": existing.business_head,
         "created_by": existing.created_by,
+        "lines_count": int(lines_count),
+        "boxes_count": int(boxes_count),
     }
 
 
@@ -897,6 +906,148 @@ def update_rtv_lines(
         "rtv_id": existing.rtv_id,
         "lines_count": len(data.lines),
     }
+
+
+# ══════════════════════════════════════════════
+#  Consolidated save (header + lines + boxes -> one mail)
+# ══════════════════════════════════════════════
+
+
+def _to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm(v) -> str:
+    """Normalize a value for change comparison: None/'' equal; numbers compared loosely."""
+    if v is None:
+        return ""
+    f = _to_float(str(v).strip())
+    return f"{f:g}" if f is not None else str(v).strip()
+
+
+def rtv_box_summary_and_short(detail: dict) -> tuple[dict, dict]:
+    """Per-article box summary + short/short-weight flags for a CR detail.
+    expected line net = qty x uom (unit weight); expected box net = count x uom."""
+    lines = detail.get("lines", []) or []
+    boxes = detail.get("boxes", []) or []
+    line_by_art: dict = {}
+    for l in lines:
+        line_by_art.setdefault(l.get("item_description"), l)
+
+    box_summary: dict = {}
+    for b in boxes:
+        art = b.get("article_description", "") or ""
+        s = box_summary.setdefault(art, {"boxes": 0, "total_net": 0.0})
+        s["boxes"] += 1
+        s["total_net"] += _to_float(b.get("net_weight")) or 0.0
+
+    article_short = []
+    for art, s in box_summary.items():
+        l = line_by_art.get(art)
+        if not l:
+            continue
+        uom, qty = _to_float(l.get("uom")), _to_float(l.get("qty"))
+        if uom is None or qty is None:
+            continue
+        expected = uom * qty
+        if expected > 0 and s["total_net"] + 1e-6 < expected:
+            article_short.append({
+                "article": art, "expected": expected,
+                "actual": s["total_net"], "shortfall": expected - s["total_net"],
+            })
+
+    short_boxes = []
+    for b in boxes:
+        art = b.get("article_description", "") or ""
+        l = line_by_art.get(art)
+        if not l:
+            continue
+        uom = _to_float(l.get("uom"))
+        cnt = b.get("count")
+        nw = _to_float(b.get("net_weight"))
+        if uom is None or cnt is None or nw is None:
+            continue
+        expected_box = uom * float(cnt)
+        if expected_box > 0 and nw + 1e-6 < expected_box:
+            short_boxes.append({
+                "article": art, "box_number": b.get("box_number"),
+                "expected": expected_box, "actual": nw,
+            })
+
+    return box_summary, {"articles": article_short, "boxes": short_boxes}
+
+
+_HEADER_DIFF_LABELS = {
+    "factory_unit": "Factory Unit", "customer": "Customer",
+    "invoice_number": "Invoice Number", "challan_no": "Challan No",
+    "dn_no": "DN No", "sales_poc": "Sales POC", "sales_poc_email": "Sales POC Email",
+    "business_head": "Business Head", "remark": "Remark", "conversion": "Conversion",
+    "vehicle_number": "Vehicle Number", "transporter_name": "Transporter",
+    "driver_name": "Driver", "inward_manager": "Inward Manager",
+}
+_LINE_DIFF_FIELDS = [
+    ("qty", "Qty"), ("rate", "Rate"), ("value", "Value"), ("net_weight", "Net Wt"),
+    ("uom", "UOM"), ("item_category", "Category"), ("sub_category", "Sub Category"),
+    ("lot_number", "Lot"), ("item_mark", "Item Mark"), ("vakkal", "Vakkal"),
+]
+
+
+def save_rtv(company: Company, rtv_id_int: int, data, db: Session) -> tuple[dict, dict]:
+    """Apply header + lines + boxes in ONE transaction; return (new_detail, summary).
+    The endpoint sends a single 'Updated' mail from the summary. get_db commits."""
+    old = get_rtv(company, rtv_id_int, db)
+
+    header_changes = []
+    if data.header is not None:
+        provided = data.header.model_dump(exclude_unset=True)
+        provided.pop("status", None)  # status is managed by the box-save flow; never diffed here
+        if provided:
+            update_rtv(company, rtv_id_int, data.header, db)
+            for field, new_val in provided.items():
+                if _norm(old.get(field)) != _norm(new_val):
+                    header_changes.append({
+                        "field": field, "label": _HEADER_DIFF_LABELS.get(field, field),
+                        "old": old.get(field), "new": new_val,
+                    })
+
+    line_changes = {"added": [], "removed": [], "changed": []}
+    if data.lines:
+        old_lines = {l.get("item_description"): l for l in old.get("lines", [])}
+        new_lines = {l.item_description: l for l in data.lines}
+        update_rtv_lines(company, rtv_id_int, RTVLinesUpdateRequest(lines=data.lines), db)
+        for desc, nl in new_lines.items():
+            if desc not in old_lines:
+                line_changes["added"].append(desc)
+                continue
+            ol = old_lines[desc]
+            for f, lbl in _LINE_DIFF_FIELDS:
+                if _norm(ol.get(f)) != _norm(getattr(nl, f, None)):
+                    line_changes["changed"].append({
+                        "item": desc, "label": lbl,
+                        "old": ol.get(f), "new": getattr(nl, f, None),
+                    })
+        for desc in old_lines:
+            if desc not in new_lines:
+                line_changes["removed"].append(desc)
+
+    box_changes = {"added": 0, "updated": 0, "deleted": 0}
+    if data.boxes is not None:
+        res = bulk_save_boxes(company, rtv_id_int, RTVBulkBoxUpdateRequest(boxes=data.boxes), db)
+        box_changes = {"added": res.get("inserted", 0), "updated": res.get("updated", 0), "deleted": res.get("deleted", 0)}
+
+    new = get_rtv(company, rtv_id_int, db)
+    box_summary, short = rtv_box_summary_and_short(new)
+    summary = {
+        "header_changes": header_changes,
+        "line_changes": line_changes,
+        "box_changes": box_changes,
+        "box_summary": box_summary,
+        "short": short,
+    }
+    return new, summary
 
 
 # ══════════════════════════════════════════════

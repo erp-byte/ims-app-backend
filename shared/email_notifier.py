@@ -314,7 +314,20 @@ def _rtv_email_html(
 
     extra_section = ""
     if extra_info:
-        extra_section = f'<p style="color:#555;margin:16px 0;">{extra_info}</p>'
+        # Prominent, action-coloured banner so "Approved/Rejected/Held by: <name>"
+        # stands out for every recipient (was a dim grey line before).
+        _extra_palette = {
+            "Approved": ("#1e7e44", "#eafaf1", "#27ae60"),  # (text, bg, border)
+            "Rejected": ("#a82315", "#fdecea", "#c0392b"),
+            "On Hold":  ("#9a6212", "#fff4e5", "#e67e22"),
+            "Deleted":  ("#a82315", "#fdecea", "#c0392b"),
+        }
+        _txt, _bg, _border = _extra_palette.get(action, ("#1f4e79", "#eef4fb", "#29417A"))
+        extra_section = (
+            f'<div style="margin:18px 0;padding:14px 18px;background:{_bg};'
+            f'border-left:5px solid {_border};border-radius:6px;">'
+            f'<span style="font-size:18px;font-weight:bold;color:{_txt};">{extra_info}</span></div>'
+        )
 
     buttons_section = ""
     if action_buttons:
@@ -728,10 +741,18 @@ def notify_rtv_deleted(
     *,
     business_head: str | None = None,
     created_by: str | None = None,
+    lines_count: int | None = None,
+    boxes_count: int | None = None,
 ) -> None:
     """Send notification email when an RTV is deleted."""
     header = {"rtv_id": rtv_id, "status": "Deleted", "business_head": business_head, "created_by": created_by}
-    extra = f"Customer Returns {rtv_id} in {company} has been permanently deleted along with all its lines and boxes."
+    removed = []
+    if lines_count is not None:
+        removed.append(f"{lines_count} line item{'s' if lines_count != 1 else ''}")
+    if boxes_count is not None:
+        removed.append(f"{boxes_count} box{'es' if boxes_count != 1 else ''}")
+    removed_txt = f" Removed: {', '.join(removed)}." if removed else " along with all its lines and boxes."
+    extra = f"Customer Returns {rtv_id} in {company} has been permanently deleted.{removed_txt}"
     if deleted_by:
         extra += f" Deleted by: {_format_actor(deleted_by)}."
     html, plain = _rtv_email_html(
@@ -769,6 +790,259 @@ def notify_rtv_header_updated(rtv_detail: dict) -> None:
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
+        html_body=html,
+        plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
+        cc=cc,
+        in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
+    )
+
+
+# ── Consolidated "Updated" mail (one save -> one mail) ──────────────
+
+_UPD_HEADER_FIELDS = [
+    ("rtv_id", "Return ID"), ("rtv_date", "Return Date"),
+    ("factory_unit", "Factory Unit"), ("customer", "Customer"),
+    ("invoice_number", "Invoice Number"), ("challan_no", "Challan No"),
+    ("dn_no", "DN No"), ("sales_poc", "Sales POC"),
+    ("business_head", "Business Head"), ("remark", "Remark"),
+    ("status", "Status"), ("created_by", "Created By"),
+]
+
+
+def _esc(v) -> str:
+    return escape(str(v if v is not None else ""))
+
+
+def _fmt_kg(v) -> str:
+    try:
+        return f"{float(v):g}"
+    except (TypeError, ValueError):
+        return str(v if v is not None else "")
+
+
+def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
+    """Render the consolidated 'Updated' mail: what-changed + highlighted header/line
+    rows (old -> new) + box summary + short/short-weight. No full boxes table."""
+    rtv_id = detail.get("rtv_id", "")
+    hchanges = summary.get("header_changes", []) or []
+    lchanges = summary.get("line_changes", {}) or {}
+    bchanges = summary.get("box_changes", {}) or {}
+    box_summary = summary.get("box_summary", {}) or {}
+    short = summary.get("short", {}) or {}
+    AMBER = "background:#fff7ed;"
+
+    def _delta(old, new):
+        return f"<s style='color:#999;'>{_esc(old) or '&mdash;'}</s> &rarr; <strong>{_esc(new) or '&mdash;'}</strong>"
+
+    # ── What-changed block ──
+    bullets = []
+    for c in hchanges:
+        bullets.append(f"<li>{_esc(c['label'])}: {_delta(c['old'], c['new'])}</li>")
+    for item in lchanges.get("added", []):
+        bullets.append(f"<li>Line added: <strong>{_esc(item)}</strong></li>")
+    for item in lchanges.get("removed", []):
+        bullets.append(f"<li>Line removed: <strong>{_esc(item)}</strong></li>")
+    for c in lchanges.get("changed", []):
+        bullets.append(f"<li>{_esc(c['item'])} &mdash; {_esc(c['label'])}: {_delta(c['old'], c['new'])}</li>")
+    box_bits = []
+    if bchanges.get("added"):
+        box_bits.append(f"{bchanges['added']} added")
+    if bchanges.get("deleted"):
+        box_bits.append(f"{bchanges['deleted']} removed")
+    if bchanges.get("updated"):
+        box_bits.append(f"{bchanges['updated']} saved")
+    if box_bits:
+        bullets.append(f"<li>Boxes: {_esc(', '.join(box_bits))}</li>")
+    if not bullets:
+        bullets.append("<li>Box weights / data re-saved (no header or line field changes).</li>")
+    what_changed = (
+        "<div style='margin:0 0 18px;padding:12px 14px;border-left:4px solid #29417A;background:#f0f4fa;'>"
+        "<div style='font-weight:bold;color:#29417A;margin-bottom:6px;'>What changed</div>"
+        f"<ul style='margin:0;padding-left:18px;font-size:13px;line-height:1.6;'>{''.join(bullets)}</ul></div>"
+    )
+
+    # ── Header table (highlight changed) ──
+    changed_fields = {c["field"]: c for c in hchanges}
+    header_rows = ""
+    for key, label in _UPD_HEADER_FIELDS:
+        if key in changed_fields:
+            c = changed_fields[key]
+            val, row_style = _delta(c["old"], c["new"]), AMBER
+        else:
+            raw = detail.get(key)
+            if key == "created_by":
+                raw = _format_actor(raw)
+            val, row_style = (_esc(raw) or "-"), ""
+        header_rows += (
+            f"<tr style='{row_style}'>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;font-weight:bold;background:#f8f9fa;width:160px;'>{_esc(label)}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;'>{val}</td></tr>"
+        )
+
+    # ── Line items table (highlight changed/added) ──
+    changed_items = {c["item"] for c in lchanges.get("changed", [])} | set(lchanges.get("added", []))
+    line_rows = ""
+    for l in detail.get("lines", []) or []:
+        hl = AMBER if l.get("item_description") in changed_items else ""
+        cells = "".join(
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;{align}'>{_esc(l.get(k))}</td>"
+            for k, align in [
+                ("material_type", ""), ("item_category", ""), ("sub_category", ""),
+                ("item_description", ""), ("uom", ""),
+                ("qty", "text-align:right;"), ("rate", "text-align:right;"),
+                ("value", "text-align:right;"), ("net_weight", "text-align:right;"),
+            ]
+        )
+        line_rows += f"<tr style='{hl}'>{cells}</tr>"
+
+    # ── Box summary (per article; no per-box table) ──
+    box_section = ""
+    if box_summary:
+        rows, tot_boxes, tot_net = "", 0, 0.0
+        for art, s in box_summary.items():
+            tot_boxes += s["boxes"]
+            tot_net += s["total_net"]
+            rows += (
+                f"<tr><td style='padding:6px 10px;border:1px solid #e0e0e0;'>{_esc(art)}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{s['boxes']}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(s['total_net'])}</td></tr>"
+            )
+        rows += (
+            f"<tr style='background:#e8edf5;font-weight:bold;'>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;'>Total</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{tot_boxes}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(tot_net)}</td></tr>"
+        )
+        box_section = (
+            "<h3 style='color:#29417A;margin:24px 0 8px;'>Box Summary</h3>"
+            "<table style='border-collapse:collapse;width:100%;font-size:13px;'>"
+            "<thead><tr style='background:#29417A;color:#fff;'>"
+            "<th style='padding:8px 10px;text-align:left;'>Article</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Boxes</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Total Net Wt</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table>"
+        )
+
+    # ── Short / short-weight ──
+    arts = short.get("articles", []) or []
+    sboxes = short.get("boxes", []) or []
+    short_section = ""
+    if arts or sboxes:
+        art_tbl = ""
+        if arts:
+            r = "".join(
+                f"<tr><td style='padding:6px 10px;border:1px solid #fed7aa;'>{_esc(a['article'])}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;'>{_fmt_kg(a['expected'])}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;'>{_fmt_kg(a['actual'])}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;color:#c0392b;font-weight:bold;'>-{_fmt_kg(a['shortfall'])}</td></tr>"
+                for a in arts
+            )
+            art_tbl = (
+                "<table style='border-collapse:collapse;width:100%;font-size:13px;margin-bottom:10px;'>"
+                "<thead><tr style='background:#e67e22;color:#fff;'>"
+                "<th style='padding:8px 10px;text-align:left;'>Article (short total)</th>"
+                "<th style='padding:8px 10px;text-align:right;'>Expected</th>"
+                "<th style='padding:8px 10px;text-align:right;'>Actual</th>"
+                "<th style='padding:8px 10px;text-align:right;'>Short by</th></tr></thead>"
+                f"<tbody>{r}</tbody></table>"
+            )
+        box_tbl = ""
+        if sboxes:
+            r = "".join(
+                f"<tr><td style='padding:6px 10px;border:1px solid #fed7aa;'>{_esc(b['article'])}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:center;'>#{_esc(b['box_number'])}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;'>{_fmt_kg(b['expected'])}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;color:#c0392b;font-weight:bold;'>{_fmt_kg(b['actual'])}</td></tr>"
+                for b in sboxes
+            )
+            box_tbl = (
+                "<table style='border-collapse:collapse;width:100%;font-size:13px;'>"
+                "<thead><tr style='background:#e67e22;color:#fff;'>"
+                "<th style='padding:8px 10px;text-align:left;'>Article</th>"
+                "<th style='padding:8px 10px;text-align:center;'>Box</th>"
+                "<th style='padding:8px 10px;text-align:right;'>Expected</th>"
+                "<th style='padding:8px 10px;text-align:right;'>Actual (short)</th></tr></thead>"
+                f"<tbody>{r}</tbody></table>"
+            )
+        short_section = (
+            "<h3 style='color:#c0392b;margin:24px 0 8px;'>&#9888; Short / Short-Weight</h3>"
+            f"{art_tbl}{box_tbl}"
+        )
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Arial,sans-serif;margin:0;padding:0;background:#f4f4f4;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="max-width:800px;margin:20px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+    <tr><td style="background:#29417A;color:#fff;padding:20px 24px;">
+      <h2 style="margin:0;">Customer Returns Updated</h2>
+      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{_esc(rtv_id)} &mdash; {datetime.now().strftime('%d %b %Y, %I:%M %p')}</p>
+    </td></tr>
+    <tr><td style="padding:20px 24px;">
+      {what_changed}
+      <h3 style="color:#29417A;margin:0 0 8px;">Header Details</h3>
+      <table style="border-collapse:collapse;width:100%;font-size:13px;"><tbody>{header_rows}</tbody></table>
+      <h3 style="color:#29417A;margin:24px 0 8px;">Line Items</h3>
+      <table style="border-collapse:collapse;width:100%;font-size:13px;">
+        <thead><tr style="background:#29417A;color:#fff;">
+          <th style="padding:8px 10px;text-align:left;">Material</th>
+          <th style="padding:8px 10px;text-align:left;">Category</th>
+          <th style="padding:8px 10px;text-align:left;">Sub Category</th>
+          <th style="padding:8px 10px;text-align:left;">Description</th>
+          <th style="padding:8px 10px;text-align:left;">UOM</th>
+          <th style="padding:8px 10px;text-align:right;">Qty</th>
+          <th style="padding:8px 10px;text-align:right;">Rate</th>
+          <th style="padding:8px 10px;text-align:right;">Value</th>
+          <th style="padding:8px 10px;text-align:right;">Net Wt</th>
+        </tr></thead>
+        <tbody>{line_rows}</tbody>
+      </table>
+      {box_section}
+      {short_section}
+    </td></tr>
+    <tr><td style="background:#f8f9fa;padding:12px 24px;text-align:center;font-size:12px;color:#888;">
+      Candor Foods &mdash; IMS Customer Returns Notification
+    </td></tr>
+  </table>
+</body></html>"""
+
+    pl = [f"Customer Returns Updated: {rtv_id}", "", "What changed:"]
+    for c in hchanges:
+        pl.append(f"  - {c['label']}: {c['old']} -> {c['new']}")
+    for item in lchanges.get("added", []):
+        pl.append(f"  - Line added: {item}")
+    for item in lchanges.get("removed", []):
+        pl.append(f"  - Line removed: {item}")
+    for c in lchanges.get("changed", []):
+        pl.append(f"  - {c['item']} {c['label']}: {c['old']} -> {c['new']}")
+    if box_bits:
+        pl.append(f"  - Boxes: {', '.join(box_bits)}")
+    if box_summary:
+        pl.append("")
+        pl.append("Box summary:")
+        for art, s in box_summary.items():
+            pl.append(f"  {art}: {s['boxes']} boxes, {_fmt_kg(s['total_net'])} kg")
+    if arts or sboxes:
+        pl.append("")
+        pl.append("Short / short-weight:")
+        for a in arts:
+            pl.append(f"  {a['article']}: expected {_fmt_kg(a['expected'])}, actual {_fmt_kg(a['actual'])}, short {_fmt_kg(a['shortfall'])}")
+        for b in sboxes:
+            pl.append(f"  {b['article']} box #{b['box_number']}: expected {_fmt_kg(b['expected'])}, actual {_fmt_kg(b['actual'])}")
+    return html, "\n".join(pl)
+
+
+def notify_rtv_updated(rtv_detail: dict, summary: dict) -> None:
+    """Send ONE consolidated 'Updated' mail (replaces the separate header/lines mails)."""
+    html, plain = _rtv_updated_html(rtv_detail, summary)
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
+    cc = _build_rtv_cc(
+        rtv_detail.get("business_head"), rtv_detail.get("created_by"),
+        sales_poc=rtv_detail.get("sales_poc"),
+        sales_poc_email=rtv_detail.get("sales_poc_email"),
+    )
+    _send_email_background(
+        subject=_rtv_subject(rtv_detail.get("rtv_id", ""), reply=True),
         html_body=html,
         plain_body=plain,
         to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],

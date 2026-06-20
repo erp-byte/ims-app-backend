@@ -558,7 +558,7 @@ def delete_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
     tables = rtv_table_names(company)
 
     existing = db.execute(
-        text(f"SELECT id, rtv_id, business_head, created_by FROM {tables['header']} WHERE id = :hid"),
+        text(f"SELECT id, rtv_id, business_head, created_by, factory_unit FROM {tables['header']} WHERE id = :hid"),
         {"hid": rtv_id_int},
     ).fetchone()
     if not existing:
@@ -591,6 +591,7 @@ def delete_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
         "rtv_id": existing.rtv_id,
         "business_head": existing.business_head,
         "created_by": existing.created_by,
+        "factory_unit": existing.factory_unit,
         "lines_count": int(lines_count),
         "boxes_count": int(boxes_count),
     }

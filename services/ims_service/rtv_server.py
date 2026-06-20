@@ -383,6 +383,7 @@ def delete_rtv_endpoint(
         deleted_by=deleted_by,
         lines_count=result.get("lines_count"),
         boxes_count=result.get("boxes_count"),
+        factory_unit=result.get("factory_unit"),
     )
     return result
 

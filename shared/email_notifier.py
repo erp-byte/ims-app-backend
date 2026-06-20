@@ -5,6 +5,7 @@ from email.message import EmailMessage
 from html import escape
 from urllib.parse import quote
 
+from shared.canonicalize import canonical_warehouse
 from shared.config_loader import settings
 from shared.logger import get_logger
 
@@ -66,7 +67,28 @@ RTV_CC_CONSTANT = [
     "satyendra@candorfoods.in",
     "sachin.more@candorfoods.in",
     "dipesh.sharma@ofbusiness.in",
+    "yash@candorfoods.in",   # Yash Gawdi — mandatory CC on every customer-return mail
 ]
+
+# Warehouse (factory_unit) -> additional CC recipient, layered on top of the
+# constant CC. W202 and all cold storages route to Vaibhav; A185/A68 to their
+# stores owners. Unlisted warehouses add no extra CC. Matching is tolerant of
+# alias/hyphen/space variants (e.g. "A-68" == "A68", "Savla D-39" -> cold).
+def _warehouse_cc_email(factory_unit: str | None) -> str | None:
+    if not factory_unit:
+        return None
+    canon = canonical_warehouse(factory_unit, None) or str(factory_unit)
+    low = canon.strip().lower()
+    if any(k in low for k in ("savla", "rishi", "supreme", "eskimo")):
+        return "vaibhav.kumkar@candorfoods.in"          # cold storages
+    code = low.replace("-", "").replace(" ", "")
+    if code == "w202":
+        return "vaibhav.kumkar@candorfoods.in"
+    if code == "a185":
+        return "stores-a185@candorfoods.in"             # Sumit Baikar
+    if code == "a68":
+        return "pankaj.ranga@candorfoods.in"
+    return None
 
 
 def _lookup_business_head_email(business_head: str | None) -> str | None:
@@ -122,14 +144,17 @@ def _build_rtv_cc(
     *actors: str | None,
     sales_poc: str | None = None,
     sales_poc_email: str | None = None,
+    factory_unit: str | None = None,
 ) -> list[str]:
-    """Build CC list: selected Sales POC + constant CC + entry-maker(s).
+    """Build CC list: selected Sales POC + constant CC + entry-maker(s) +
+    the warehouse-specific recipient for ``factory_unit``.
 
     The business head goes in TO (not CC), so ``business_head`` is used only to
     EXCLUDE that address from CC (e.g. when the approver/rejecter is the BH).
     ``sales_poc`` is resolved against the SALES_POC_EMAILS map (dropdown picks);
     ``sales_poc_email`` is a manually entered address (the "Other" option) and is
-    added as-is. Duplicates and the TO address (pooja) are removed; empties skipped.
+    added as-is. ``factory_unit`` adds the warehouse owner (see _warehouse_cc_email).
+    Duplicates and the TO address (pooja) are removed; empties skipped.
     """
     cc: list[str] = []
     poc_email = _lookup_sales_poc_email(sales_poc)
@@ -141,6 +166,9 @@ def _build_rtv_cc(
     for actor in actors:
         if actor:
             cc.append(actor)
+    wh_cc = _warehouse_cc_email(factory_unit)
+    if wh_cc:
+        cc.append(wh_cc)
 
     head_email = (_lookup_business_head_email(business_head) or "").strip().lower()
     seen: set[str] = set()
@@ -449,6 +477,9 @@ def notify_rtv_created(rtv_detail: dict) -> None:
     created_by = rtv_detail.get("created_by")
     if created_by:
         cc_candidates.append(created_by)
+    wh_cc = _warehouse_cc_email(rtv_detail.get("factory_unit"))
+    if wh_cc:
+        cc_candidates.append(wh_cc)
 
     def _dedupe(addrs: list[str], exclude: set[str]) -> list[str]:
         seen: set[str] = set()
@@ -600,6 +631,7 @@ def notify_rtv_weight_discrepancy(rtv_detail: dict, summary: dict) -> None:
             business_head, created_by,
             sales_poc=rtv_detail.get("sales_poc"),
             sales_poc_email=rtv_detail.get("sales_poc_email"),
+            factory_unit=rtv_detail.get("factory_unit"),
         ),
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
@@ -638,6 +670,9 @@ def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: st
     created_by = rtv_detail.get("created_by")
     if created_by:
         cc_candidates.append(created_by)
+    wh_cc = _warehouse_cc_email(rtv_detail.get("factory_unit"))
+    if wh_cc:
+        cc_candidates.append(wh_cc)
     seen: set[str] = set()
     cc: list[str] = []
     for addr in cc_candidates:
@@ -671,6 +706,7 @@ def notify_rtv_rejected(rtv_detail: dict, rejected_by: str) -> None:
         rtv_detail.get("business_head"), rtv_detail.get("created_by"), rejected_by,
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
@@ -696,6 +732,7 @@ def notify_rtv_held(rtv_detail: dict, held_by: str) -> None:
         rtv_detail.get("business_head"), rtv_detail.get("created_by"), held_by,
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
@@ -723,6 +760,7 @@ def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:
         approved_by,
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
@@ -743,9 +781,11 @@ def notify_rtv_deleted(
     created_by: str | None = None,
     lines_count: int | None = None,
     boxes_count: int | None = None,
+    factory_unit: str | None = None,
 ) -> None:
     """Send notification email when an RTV is deleted."""
-    header = {"rtv_id": rtv_id, "status": "Deleted", "business_head": business_head, "created_by": created_by}
+    header = {"rtv_id": rtv_id, "status": "Deleted", "business_head": business_head,
+              "created_by": created_by, "factory_unit": factory_unit}
     removed = []
     if lines_count is not None:
         removed.append(f"{lines_count} line item{'s' if lines_count != 1 else ''}")
@@ -763,7 +803,7 @@ def notify_rtv_deleted(
         extra_info=extra,
     )
     bh_email = _lookup_business_head_email(business_head)
-    cc = _build_rtv_cc(business_head, created_by, deleted_by)
+    cc = _build_rtv_cc(business_head, created_by, deleted_by, factory_unit=factory_unit)
     _send_email_background(
         subject=_rtv_subject(rtv_id, reply=True),
         html_body=html,
@@ -787,6 +827,7 @@ def notify_rtv_header_updated(rtv_detail: dict) -> None:
         rtv_detail.get("business_head"), rtv_detail.get("created_by"),
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
@@ -1040,6 +1081,7 @@ def notify_rtv_updated(rtv_detail: dict, summary: dict) -> None:
         rtv_detail.get("business_head"), rtv_detail.get("created_by"),
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get("rtv_id", ""), reply=True),
@@ -1867,6 +1909,7 @@ def notify_rtv_lines_updated(rtv_detail: dict) -> None:
         rtv_detail.get("business_head"), rtv_detail.get("created_by"),
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),

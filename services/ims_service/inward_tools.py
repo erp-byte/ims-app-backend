@@ -1004,58 +1004,70 @@ def list_inward_records(
                     t.source_location,
                     t.destination_location,
                     t.remark,
-                    SUM(a.net_weight) AS net_weight,
-                    SUM(a.total_weight) AS total_weight,
-                    STRING_AGG(DISTINCT a.item_description, chr(10) ORDER BY a.item_description) AS article_descriptions,
-                    STRING_AGG(DISTINCT
-                        CASE
-                            WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
-                            THEN CONCAT(a.quantity_units::text, ' ', a.uom)
-                            WHEN a.quantity_units IS NOT NULL
-                            THEN a.quantity_units::text
-                            ELSE NULL
-                        END, ', '
-                        ORDER BY CASE
-                            WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
-                            THEN CONCAT(a.quantity_units::text, ' ', a.uom)
-                            WHEN a.quantity_units IS NOT NULL
-                            THEN a.quantity_units::text
-                            ELSE NULL
-                        END
-                    ) FILTER (WHERE a.quantity_units IS NOT NULL) AS article_quantities,
-                    STRING_AGG(DISTINCT
-                        a.item_description ||
-                        CASE
-                            WHEN a.net_weight IS NOT NULL AND a.net_weight > 0
-                            THEN ' (' || ROUND(a.net_weight::numeric, 2)::text || ' kg)'
-                            WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
-                            THEN ' (' || a.quantity_units::text || ' ' || a.uom || ')'
-                            WHEN a.quantity_units IS NOT NULL
-                            THEN ' (' || a.quantity_units::text || ')'
-                            ELSE ''
-                        END,
-                        chr(10)
-                        ORDER BY a.item_description ||
-                        CASE
-                            WHEN a.net_weight IS NOT NULL AND a.net_weight > 0
-                            THEN ' (' || ROUND(a.net_weight::numeric, 2)::text || ' kg)'
-                            WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
-                            THEN ' (' || a.quantity_units::text || ' ' || a.uom || ')'
-                            WHEN a.quantity_units IS NOT NULL
-                            THEN ' (' || a.quantity_units::text || ')'
-                            ELSE ''
-                        END
-                    ) FILTER (WHERE a.item_description IS NOT NULL) AS article_items_with_qty,
-                    COUNT(DISTINCT b.box_number) AS box_count,
-                    STRING_AGG(DISTINCT b.article_description, ', ' ORDER BY b.article_description) AS box_descriptions
+                    art.net_weight,
+                    art.total_weight,
+                    art.article_descriptions,
+                    art.article_quantities,
+                    art.article_items_with_qty,
+                    bx.box_count,
+                    bx.box_descriptions
                 FROM all_tx t
                 INNER JOIN paged_transactions ft
                     ON t.transaction_no = ft.transaction_no AND t._source = ft._source
-                LEFT JOIN all_art a
-                    ON t.transaction_no = a.transaction_no AND t._source = a._source
-                LEFT JOIN all_box b
-                    ON t.transaction_no = b.transaction_no AND t._source = b._source
-                GROUP BY t.transaction_no, t._source, t.entry_date, t.system_grn_date, t.status, t.invoice_number, t.po_number, t.vendor_supplier_name, t.customer_party_name, t.total_amount, t.warehouse, t.vehicle_number, t.transporter_name, t.lr_number, t.challan_number, t.grn_number, t.grn_quantity, t.approval_authority, t.source_location, t.destination_location, t.remark
+                LEFT JOIN LATERAL (
+                    SELECT
+                        SUM(a.net_weight) AS net_weight,
+                        SUM(a.total_weight) AS total_weight,
+                        STRING_AGG(DISTINCT a.item_description, chr(10) ORDER BY a.item_description) AS article_descriptions,
+                        STRING_AGG(DISTINCT
+                            CASE
+                                WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
+                                THEN CONCAT(a.quantity_units::text, ' ', a.uom)
+                                WHEN a.quantity_units IS NOT NULL
+                                THEN a.quantity_units::text
+                                ELSE NULL
+                            END, ', '
+                            ORDER BY CASE
+                                WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
+                                THEN CONCAT(a.quantity_units::text, ' ', a.uom)
+                                WHEN a.quantity_units IS NOT NULL
+                                THEN a.quantity_units::text
+                                ELSE NULL
+                            END
+                        ) FILTER (WHERE a.quantity_units IS NOT NULL) AS article_quantities,
+                        STRING_AGG(DISTINCT
+                            a.item_description ||
+                            CASE
+                                WHEN a.net_weight IS NOT NULL AND a.net_weight > 0
+                                THEN ' (' || ROUND(a.net_weight::numeric, 2)::text || ' kg)'
+                                WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
+                                THEN ' (' || a.quantity_units::text || ' ' || a.uom || ')'
+                                WHEN a.quantity_units IS NOT NULL
+                                THEN ' (' || a.quantity_units::text || ')'
+                                ELSE ''
+                            END,
+                            chr(10)
+                            ORDER BY a.item_description ||
+                            CASE
+                                WHEN a.net_weight IS NOT NULL AND a.net_weight > 0
+                                THEN ' (' || ROUND(a.net_weight::numeric, 2)::text || ' kg)'
+                                WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL
+                                THEN ' (' || a.quantity_units::text || ' ' || a.uom || ')'
+                                WHEN a.quantity_units IS NOT NULL
+                                THEN ' (' || a.quantity_units::text || ')'
+                                ELSE ''
+                            END
+                        ) FILTER (WHERE a.item_description IS NOT NULL) AS article_items_with_qty
+                    FROM all_art a
+                    WHERE a.transaction_no = t.transaction_no AND a._source = t._source
+                ) art ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COUNT(DISTINCT b.box_number) AS box_count,
+                        STRING_AGG(DISTINCT b.article_description, ', ' ORDER BY b.article_description) AS box_descriptions
+                    FROM all_box b
+                    WHERE b.transaction_no = t.transaction_no AND b._source = t._source
+                ) bx ON TRUE
             )
             SELECT
                 td.transaction_no,

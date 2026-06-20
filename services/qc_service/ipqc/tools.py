@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
+from shared.timezone import now_ist, fmt_ist
 
 logger = get_logger("qc.ipqc")
 
@@ -58,8 +59,10 @@ def _safe_str(val):
 
 
 def _generate_ipqc_no(db: Session) -> str:
-    """Atomically generate the next IPQC number for today: IPQC-YYYYMMDD-XXXX."""
-    today = date.today()
+    """Atomically generate the next IPQC number for today: IPQC-YYYYMMDD-XXXX.
+    'today' is the IST business day so the id + daily sequence bucket on the
+    Indian calendar (server runs UTC)."""
+    today = now_ist().date()
     row = db.execute(
         text(
             "INSERT INTO ipqc_daily_sequence (seq_date, last_seq) "
@@ -95,9 +98,9 @@ def _map_ipqc_row(row) -> dict:
         "articles": articles,
         "checked_by": row.checked_by,
         "approved_by": row.approved_by,
-        "approved_at": _safe_str(row.approved_at),
-        "created_at": _safe_str(row.created_at),
-        "updated_at": _safe_str(row.updated_at),
+        "approved_at": fmt_ist(row.approved_at, "%Y-%m-%d %H:%M:%S"),
+        "created_at": fmt_ist(row.created_at, "%Y-%m-%d %H:%M:%S"),
+        "updated_at": fmt_ist(row.updated_at, "%Y-%m-%d %H:%M:%S"),
     }
 
 

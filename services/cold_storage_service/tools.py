@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
+from shared.timezone import now_ist, fmt_ist
 
 logger = get_logger("cold_storage")
 
@@ -505,9 +506,10 @@ def get_cold_storage_summary(
 
 
 def approve_cold_storage(record_id: int, approved_by: str, db: Session) -> dict:
-    from datetime import datetime
+    from datetime import datetime, timezone
 
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.strftime("%Y-%m-%d %H:%M:%S")  # stored UTC (unchanged)
 
     row = db.execute(
         text(
@@ -529,7 +531,7 @@ def approve_cold_storage(record_id: int, approved_by: str, db: Session) -> dict:
         "status": "approved",
         "id": record_id,
         "approved_by": approved_by,
-        "approved_at": now,
+        "approved_at": fmt_ist(now_dt, "%Y-%m-%d %H:%M:%S"),  # show IST (DB keeps UTC)
     }
 
 
@@ -612,7 +614,7 @@ def create_direct_out(payload, db: Session) -> dict:
     table = _direct_out_table(company)
     stocks_table = f"{company.lower()}_cold_stocks"
 
-    transaction_no = f"DO-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    transaction_no = f"DO-{now_ist().strftime('%Y%m%d%H%M%S')}"
     lines_list = [l.model_dump() for l in payload.lines]
     total_issue_qty = sum(float(l.issue_qty or 0) for l in payload.lines)
 

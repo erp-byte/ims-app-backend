@@ -8,6 +8,7 @@ from urllib.parse import quote
 from shared.canonicalize import canonical_warehouse
 from shared.config_loader import settings
 from shared.logger import get_logger
+from shared.timezone import now_ist, fmt_ist
 
 logger = get_logger("email.notifier")
 
@@ -298,7 +299,7 @@ def _rtv_email_html(
 
     header_fields = [
         ("Return ID", header.get("rtv_id", "")),
-        ("Return Date", str(header.get("rtv_date", ""))),
+        ("Return Date", fmt_ist(header.get("rtv_date")) or "-"),
         ("Factory Unit", header.get("factory_unit", "")),
         ("Customer", header.get("customer", "")),
         ("Invoice Number", header.get("invoice_number", "") or "-"),
@@ -375,7 +376,7 @@ def _rtv_email_html(
   <table width="100%" cellpadding="0" cellspacing="0" style="max-width:800px;margin:20px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
     <tr><td style="background:#29417A;color:#fff;padding:20px 24px;">
       <h2 style="margin:0;">Customer Returns {action}</h2>
-      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{header.get('rtv_id', '')} &mdash; {datetime.now().strftime('%d %b %Y, %I:%M %p')}</p>
+      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{header.get('rtv_id', '')} &mdash; {now_ist().strftime('%d %b %Y, %I:%M %p')}</p>
     </td></tr>
     <tr><td style="padding:20px 24px;">
 
@@ -914,6 +915,8 @@ def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
             raw = detail.get(key)
             if key == "created_by":
                 raw = _format_actor(raw)
+            elif key == "rtv_date":
+                raw = fmt_ist(raw)
             val, row_style = (_esc(raw) or "-"), ""
         header_rows += (
             f"<tr style='{row_style}'>"
@@ -1017,7 +1020,7 @@ def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
   <table width="100%" cellpadding="0" cellspacing="0" style="max-width:800px;margin:20px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
     <tr><td style="background:#29417A;color:#fff;padding:20px 24px;">
       <h2 style="margin:0;">Customer Returns Updated</h2>
-      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{_esc(rtv_id)} &mdash; {datetime.now().strftime('%d %b %Y, %I:%M %p')}</p>
+      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{_esc(rtv_id)} &mdash; {now_ist().strftime('%d %b %Y, %I:%M %p')}</p>
     </td></tr>
     <tr><td style="padding:20px 24px;">
       {what_changed}
@@ -1130,7 +1133,7 @@ def _jw_wrap(title: str, subtitle: str, body_html: str) -> str:
   <table width="100%" cellpadding="0" cellspacing="0" style="max-width:860px;margin:20px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
     <tr><td style="background:#29417A;color:#fff;padding:20px 24px;">
       <h2 style="margin:0;">{title}</h2>
-      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{subtitle} &mdash; {datetime.now().strftime('%d %b %Y, %I:%M %p')}</p>
+      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{subtitle} &mdash; {now_ist().strftime('%d %b %Y, %I:%M %p')}</p>
     </td></tr>
     <tr><td style="padding:20px 24px;">{body_html}</td></tr>
     <tr><td style="background:#f8f9fa;padding:12px 24px;text-align:center;font-size:12px;color:#888;">
@@ -2020,7 +2023,7 @@ def send_job_work_weekly_digest() -> None:
             <td style="padding:6px 10px;border:1px solid #e0e0e0;color:#c0392b;font-weight:bold;">{loss_pct:.1f}%</td>
         </tr>"""
 
-    today = datetime.now().strftime("%d %b %Y")
+    today = now_ist().strftime("%d %b %Y")
 
     excess_section = ""
     if excess_rows:
@@ -2099,7 +2102,7 @@ def notify_inward_deleted(
     items: list | None = None,
 ) -> None:
     """Send notification to b.hrithik when an inward transaction is deleted."""
-    deleted_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    deleted_at = now_ist().strftime("%d %b %Y, %I:%M %p")
     rows = [
         ("Transaction No", transaction_no),
         ("Company", company),

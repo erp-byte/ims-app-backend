@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
 from shared.canonicalize import canonical_warehouse
+from shared.timezone import now_ist
 from services.ims_service.inward_models import Company
 from services.ims_service.rtv_models import (
     RTVCreate,
@@ -42,7 +43,8 @@ def _generate_rtv_id() -> str:
     # systems read "RTV" as Return-To-Vendor (the opposite flow), which
     # mis-routes these inbound customer returns. Forward-only — legacy RTV-*
     # ids and their already-printed QR labels stay valid.
-    return f"CR-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    # IST timestamp so the embedded time reads as local (audit-correct).
+    return f"CR-{now_ist().strftime('%Y%m%d%H%M%S')}"
 
 
 def _canonical_factory_unit(raw):

@@ -4,6 +4,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
+from shared.timezone import fmt_ist
 from services.qc_service.ipqc.jwt_utils import create_ipqc_token
 
 logger = get_logger("qc.ipqc.users")
@@ -56,8 +57,8 @@ def create_user(data, db: Session) -> dict:
         "display_name": row.display_name,
         "is_admin": row.is_admin,
         "is_active": row.is_active,
-        "created_at": _safe_str(row.created_at),
-        "updated_at": _safe_str(row.updated_at),
+        "created_at": fmt_ist(row.created_at, "%Y-%m-%d %H:%M:%S"),
+        "updated_at": fmt_ist(row.updated_at, "%Y-%m-%d %H:%M:%S"),
     }
 
 
@@ -149,8 +150,8 @@ def list_users(db: Session) -> list:
             "display_name": r.display_name,
             "is_admin": r.is_admin,
             "is_active": r.is_active,
-            "created_at": _safe_str(r.created_at),
-            "updated_at": _safe_str(r.updated_at),
+            "created_at": fmt_ist(r.created_at, "%Y-%m-%d %H:%M:%S"),
+            "updated_at": fmt_ist(r.updated_at, "%Y-%m-%d %H:%M:%S"),
         }
         for r in rows
     ]

@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from shared.database import get_db
+from shared.timezone import now_ist
 from services.ims_service.inward_models import Company
 from services.ims_service.rtv_models import (
     RTVCreate,
@@ -164,7 +165,7 @@ def export_rtv_endpoint(
     wb.save(buf)
     buf.seek(0)
 
-    filename = f"rtv_{company}_{date.today().strftime('%Y%m%d')}.xlsx"
+    filename = f"rtv_{company}_{now_ist().strftime('%Y%m%d')}.xlsx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

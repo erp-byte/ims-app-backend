@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
+from shared.timezone import now_ist
 
 logger = get_logger("inward_server")
 
@@ -350,7 +351,7 @@ def export_inward_endpoint(
     wb.save(buf)
     buf.seek(0)
 
-    filename = f"inward_{company}_{date.today().strftime('%Y%m%d')}.xlsx"
+    filename = f"inward_{company}_{now_ist().strftime('%Y%m%d')}.xlsx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

@@ -333,6 +333,30 @@ def finalize_cold_transfer_in(
         transfer_out_id=transfer_out_id,
     )
     out_status, in_status = _reconcile_statuses(db, transfer_out_id, header_id)
+
+    # Once the cold receipt is fully received, the cold_transfer_in_headers row
+    # (created above with id = header_id) is the system of record. Purge the
+    # interunit staging header + its acknowledged boxes that the scan/acknowledge
+    # phase created under the same id — otherwise the completed cold receipt also
+    # lingers in interunit_transfer_in_header, polluting the interunit Transfer-IN
+    # views and tripping stuck-receipt checks (mirrors the purge in
+    # delete_cold_transfer_in). Gate on 'Received': while still 'Pending' (boxes in
+    # transit, multi-session receive) the staging MUST stay so the next session
+    # resumes on the same id instead of spawning a duplicate cold header. Guard on
+    # transfer_out_id so a standalone cold header (create path, cold-sequence id)
+    # can't wipe an unrelated interunit receipt that happens to share the id.
+    if in_status == "Received":
+        _staging = db.execute(text(
+            "SELECT id FROM interunit_transfer_in_header WHERE id = :hid AND transfer_out_id = :oid"
+        ), {"hid": header_id, "oid": transfer_out_id}).fetchone()
+        if _staging is not None:
+            db.execute(text(
+                "DELETE FROM interunit_transfer_in_boxes WHERE header_id = :hid"
+            ), {"hid": header_id})
+            db.execute(text(
+                "DELETE FROM interunit_transfer_in_header WHERE id = :hid"
+            ), {"hid": header_id})
+
     db.commit()
     return ColdTransferInCreateResponse(
         header_id=header_id,

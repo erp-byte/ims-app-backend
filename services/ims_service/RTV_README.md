@@ -56,7 +56,8 @@
 | `challan_no`       | `string`          | No                 | Yes      |                                      |
 | `dn_no`            | `string`          | No                 | Yes      |                                      |
 | `conversion`       | `string`          | No                 | Yes      | Default `"0"`. Stored as float in DB |
-| `sales_poc`        | `string`          | No                 | Yes      |                                      |
+| `sales_poc`        | `string`          | No                 | Yes      | Dropdown name, or free text          |
+| `sales_poc_email`  | `string`          | No                 | Yes      | Manual "Other" POC email; added to mail CC |
 | `remark`           | `string`          | No                 | Yes      |                                      |
 | `status`           | `string`          | Auto (`"Pending"`) | No       | `"Pending"` / `"Approved"`           |
 | `created_by`       | `string`          | Query param        | Yes      | Email of creator                     |

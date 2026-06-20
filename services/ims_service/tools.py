@@ -17,7 +17,7 @@ IMS_MODULES = [
     ("transfer",         "Transfer"),
     ("consumption",      "Consumption"),
     ("inventory-ledger", "Inventory Ledger"),
-    ("reordering",       "Reordering"),
+    ("reordering",       "Customer Returns"),
     ("outward",          "Outward"),
     ("reports",          "Reports"),
     ("settings",         "Settings"),

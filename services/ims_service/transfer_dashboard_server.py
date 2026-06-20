@@ -90,12 +90,21 @@ async def get_all_data(db: Session = Depends(get_db)):
         for rec in records:
             rec["box_count"] = box_counts.get(rec["transfer_id"], 0)
 
-        # Transfer-in status per transfer
-        tin_sql = text("""
-            SELECT transfer_out_id, status AS tin_status
-            FROM interunit_transfer_in_header
-        """)
-        tin_map = {int(r.transfer_out_id): r.tin_status for r in db.execute(tin_sql).fetchall()}
+        # Transfer-in status per transfer. Cold receipts live in cold_transfer_in_headers
+        # (the interunit staging header is purged once a cold receive finalizes), so fold
+        # BOTH sources in and let the cold status win — otherwise a completed cold receive
+        # would read as "Not Received" here.
+        tin_map: dict = {}
+        for r in db.execute(text(
+            "SELECT transfer_out_id, status FROM interunit_transfer_in_header"
+        )).fetchall():
+            if r.transfer_out_id is not None:
+                tin_map[int(r.transfer_out_id)] = r.status
+        for r in db.execute(text(
+            "SELECT transfer_out_id, status FROM cold_transfer_in_headers"
+        )).fetchall():
+            if r.transfer_out_id is not None:
+                tin_map[int(r.transfer_out_id)] = r.status
         for rec in records:
             rec["received_status"] = tin_map.get(rec["transfer_id"], "Not Received")
 

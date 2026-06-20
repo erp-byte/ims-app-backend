@@ -67,6 +67,10 @@ def _run_startup_migrations():
             ALTER TABLE interunit_transfer_in_boxes
             ADD COLUMN IF NOT EXISTS line_index INTEGER
         """))
+        db.execute(text("""
+            ALTER TABLE interunit_transfers_lines
+            ADD COLUMN IF NOT EXISTS vakkal VARCHAR(100)
+        """))
         db.commit()
 
         # Separate try/catch for cold storage table columns (table may not exist yet)
@@ -165,6 +169,21 @@ def _run_startup_migrations():
             db.commit()
         except Exception:
             db.rollback()
+
+        # RTV header columns (logistics fields + manual Sales POC email).
+        # Mirrors migrations/2026-06-09_rtv_header_logistics_fields.sql and
+        # migrations/2026-06-18_rtv_sales_poc_email.sql so the schema self-heals
+        # at boot and deploys are order-independent (no manual migrate step).
+        for _rtv_tbl in ("cfpl_rtv_header", "cdpl_rtv_header"):
+            try:
+                db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS vehicle_number   varchar"))
+                db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS transporter_name varchar"))
+                db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS driver_name      varchar"))
+                db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS inward_manager   varchar"))
+                db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS sales_poc_email  varchar"))
+                db.commit()
+            except Exception:
+                db.rollback()
 
         logger.info("Startup migrations completed")
     except Exception as exc:

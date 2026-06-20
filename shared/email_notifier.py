@@ -949,13 +949,13 @@ def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
             tot_net += s["total_net"]
             rows += (
                 f"<tr><td style='padding:6px 10px;border:1px solid #e0e0e0;'>{_esc(art)}</td>"
-                f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{s['boxes']}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(s['boxes'])}</td>"
                 f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(s['total_net'])}</td></tr>"
             )
         rows += (
             f"<tr style='background:#e8edf5;font-weight:bold;'>"
             f"<td style='padding:6px 10px;border:1px solid #e0e0e0;'>Total</td>"
-            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{tot_boxes}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(tot_boxes)}</td>"
             f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(tot_net)}</td></tr>"
         )
         box_section = (
@@ -1065,7 +1065,7 @@ def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
         pl.append("")
         pl.append("Box summary:")
         for art, s in box_summary.items():
-            pl.append(f"  {art}: {s['boxes']} boxes, {_fmt_kg(s['total_net'])} kg")
+            pl.append(f"  {art}: {_fmt_kg(s['boxes'])} boxes, {_fmt_kg(s['total_net'])} kg")
     if arts or sboxes:
         pl.append("")
         pl.append("Short / short-weight:")

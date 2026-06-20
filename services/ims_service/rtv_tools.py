@@ -933,29 +933,40 @@ def _norm(v) -> str:
 
 def rtv_box_summary_and_short(detail: dict) -> tuple[dict, dict]:
     """Per-article box summary + short/short-weight flags for a CR detail.
-    expected line net = qty x uom (unit weight); expected box net = count x uom."""
+
+    A box row carries ``count`` (number of units it represents; defaults to 1)
+    and a per-unit ``net_weight``, mirroring the approve-screen rule
+    ``conversion = count x uom``. Totals therefore aggregate BY COUNT, not by row:
+        boxes  = Sum(count)
+        weight = Sum(count x net_weight)
+    For ordinary count=1 rows this is identical to (#rows, Sum(net_weight)).
+    Expected weight uses the line's per-unit ``uom``: Sum(count x uom)."""
     lines = detail.get("lines", []) or []
     boxes = detail.get("boxes", []) or []
     line_by_art: dict = {}
     for l in lines:
         line_by_art.setdefault(l.get("item_description"), l)
 
-    box_summary: dict = {}
+    def _box_count(b) -> float:
+        c = _to_float(b.get("count"))
+        return c if (c is not None and c > 0) else 1.0
+
+    box_summary: dict = {}          # art -> {boxes, total_net}
+    expected_by_art: dict = {}      # art -> Sum(count x uom)
     for b in boxes:
         art = b.get("article_description", "") or ""
-        s = box_summary.setdefault(art, {"boxes": 0, "total_net": 0.0})
-        s["boxes"] += 1
-        s["total_net"] += _to_float(b.get("net_weight")) or 0.0
+        cnt = _box_count(b)
+        nw = _to_float(b.get("net_weight")) or 0.0
+        uom = _to_float((line_by_art.get(art) or {}).get("uom"))
+        s = box_summary.setdefault(art, {"boxes": 0.0, "total_net": 0.0})
+        s["boxes"] += cnt
+        s["total_net"] += cnt * nw
+        if uom is not None:
+            expected_by_art[art] = expected_by_art.get(art, 0.0) + cnt * uom
 
     article_short = []
     for art, s in box_summary.items():
-        l = line_by_art.get(art)
-        if not l:
-            continue
-        uom, qty = _to_float(l.get("uom")), _to_float(l.get("qty"))
-        if uom is None or qty is None:
-            continue
-        expected = uom * qty
+        expected = expected_by_art.get(art, 0.0)
         if expected > 0 and s["total_net"] + 1e-6 < expected:
             article_short.append({
                 "article": art, "expected": expected,
@@ -969,15 +980,15 @@ def rtv_box_summary_and_short(detail: dict) -> tuple[dict, dict]:
         if not l:
             continue
         uom = _to_float(l.get("uom"))
-        cnt = b.get("count")
         nw = _to_float(b.get("net_weight"))
-        if uom is None or cnt is None or nw is None:
+        if uom is None or nw is None:
             continue
-        expected_box = uom * float(cnt)
-        if expected_box > 0 and nw + 1e-6 < expected_box:
+        cnt = _box_count(b)
+        # per-unit net below the expected per-unit weight (uom) => underweight row
+        if nw + 1e-6 < uom:
             short_boxes.append({
                 "article": art, "box_number": b.get("box_number"),
-                "expected": expected_box, "actual": nw,
+                "expected": uom * cnt, "actual": nw * cnt,
             })
 
     return box_summary, {"articles": article_short, "boxes": short_boxes}

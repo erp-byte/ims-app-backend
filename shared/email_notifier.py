@@ -123,16 +123,15 @@ def _build_rtv_cc(
     sales_poc: str | None = None,
     sales_poc_email: str | None = None,
 ) -> list[str]:
-    """Build CC list: business head email + selected Sales POC + constant CC + entry-maker(s).
+    """Build CC list: selected Sales POC + constant CC + entry-maker(s).
 
+    The business head goes in TO (not CC), so ``business_head`` is used only to
+    EXCLUDE that address from CC (e.g. when the approver/rejecter is the BH).
     ``sales_poc`` is resolved against the SALES_POC_EMAILS map (dropdown picks);
     ``sales_poc_email`` is a manually entered address (the "Other" option) and is
-    added as-is. Duplicates and the TO address are removed. Empty values skipped.
+    added as-is. Duplicates and the TO address (pooja) are removed; empties skipped.
     """
     cc: list[str] = []
-    head_email = _lookup_business_head_email(business_head)
-    if head_email:
-        cc.append(head_email)
     poc_email = _lookup_sales_poc_email(sales_poc)
     if poc_email:
         cc.append(poc_email)
@@ -143,11 +142,14 @@ def _build_rtv_cc(
         if actor:
             cc.append(actor)
 
+    head_email = (_lookup_business_head_email(business_head) or "").strip().lower()
     seen: set[str] = set()
     deduped: list[str] = []
     for addr in cc:
         normalized = addr.strip().lower()
-        if not normalized or normalized in seen or normalized == RTV_NOTIFY_TO.lower():
+        if (not normalized or normalized in seen
+                or normalized == RTV_NOTIFY_TO.lower()
+                or (head_email and normalized == head_email)):
             continue
         seen.add(normalized)
         deduped.append(addr.strip())
@@ -651,6 +653,7 @@ def notify_rtv_rejected(rtv_detail: dict, rejected_by: str) -> None:
         boxes=rtv_detail.get("boxes", []),
         extra_info=f"Rejected by: {_format_actor(rejected_by)}",
     )
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"), rtv_detail.get("created_by"), rejected_by,
         sales_poc=rtv_detail.get("sales_poc"),
@@ -660,6 +663,7 @@ def notify_rtv_rejected(rtv_detail: dict, rejected_by: str) -> None:
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
@@ -674,6 +678,7 @@ def notify_rtv_held(rtv_detail: dict, held_by: str) -> None:
         boxes=rtv_detail.get("boxes", []),
         extra_info=f"Placed on hold by: {_format_actor(held_by)}. The business head can still approve or reject later.",
     )
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"), rtv_detail.get("created_by"), held_by,
         sales_poc=rtv_detail.get("sales_poc"),
@@ -683,6 +688,7 @@ def notify_rtv_held(rtv_detail: dict, held_by: str) -> None:
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
@@ -697,6 +703,7 @@ def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:
         boxes=rtv_detail.get("boxes", []),
         extra_info=f"Approved by: {_format_actor(approved_by)}",
     )
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"),
         rtv_detail.get("created_by"),
@@ -708,6 +715,7 @@ def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
@@ -733,11 +741,13 @@ def notify_rtv_deleted(
         boxes=[],
         extra_info=extra,
     )
+    bh_email = _lookup_business_head_email(business_head)
     cc = _build_rtv_cc(business_head, created_by, deleted_by)
     _send_email_background(
         subject=_rtv_subject(rtv_id, reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_id),
     )
@@ -751,6 +761,7 @@ def notify_rtv_header_updated(rtv_detail: dict) -> None:
         lines=[],
         boxes=[],
     )
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"), rtv_detail.get("created_by"),
         sales_poc=rtv_detail.get("sales_poc"),
@@ -760,6 +771,7 @@ def notify_rtv_header_updated(rtv_detail: dict) -> None:
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
@@ -1576,6 +1588,7 @@ def notify_rtv_lines_updated(rtv_detail: dict) -> None:
         lines=rtv_detail.get("lines", []),
         boxes=rtv_detail.get("boxes", []),
     )
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"), rtv_detail.get("created_by"),
         sales_poc=rtv_detail.get("sales_poc"),
@@ -1585,6 +1598,7 @@ def notify_rtv_lines_updated(rtv_detail: dict) -> None:
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get('rtv_id', '')),
     )

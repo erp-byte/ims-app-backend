@@ -865,7 +865,10 @@ def list_job_work_records(
                 WHERE ir.header_id = h.id) as last_receipt_date,
                (SELECT COUNT(*)
                 FROM jb_work_inward_receipt ir
-                WHERE ir.header_id = h.id) as receipt_count
+                WHERE ir.header_id = h.id) as receipt_count,
+               (SELECT string_agg(DISTINCT UPPER(l7.item_category), ', ')
+                FROM jb_materialout_lines l7
+                WHERE l7.header_id = h.id AND l7.item_category IS NOT NULL AND l7.item_category <> '') as item_groups
         FROM jb_materialout_header h
         {where_sql}
         ORDER BY h.created_at DESC
@@ -913,6 +916,7 @@ def list_job_work_records(
             "actual_loss_pct": loss_pct,
             "last_receipt_date": str(r[23]) if r[23] else "",
             "receipt_count": int(r[24] or 0),
+            "item_groups": r[25] or "",
         })
 
     return {"records": records, "total": total, "total_pages": total_pages, "page": page}
@@ -1049,7 +1053,8 @@ def search_material_out(
                ir.inward_warehouse,
                COALESCE(SUM(il.finished_goods_kgs), 0) as total_fg,
                COALESCE(SUM(il.waste_kgs), 0) as total_waste,
-               COALESCE(SUM(il.rejection_kgs), 0) as total_rejection
+               COALESCE(SUM(il.rejection_kgs), 0) as total_rejection,
+               ir.id
         FROM jb_work_inward_receipt ir
         LEFT JOIN jb_work_inward_lines il ON il.inward_receipt_id = ir.id
         WHERE ir.header_id = :header_id
@@ -1058,6 +1063,7 @@ def search_material_out(
     """), {"header_id": header_id}).fetchall()
     for ir_row in ir_rows:
         prior_irs.append({
+            "id": ir_row[9],
             "ir_number": ir_row[0] or "",
             "challan_no": ir_row[1] or "",
             "receipt_date": ir_row[2] or "",
@@ -2502,6 +2508,7 @@ def job_work_dashboard(
     sub_category: str = Query(""),       # process type filter
     item: str = Query(""),               # item description filter
     vendor: str = Query(""),             # vendor/party filter
+    group: str = Query(""),              # inventory group filter (item_category); "UNGROUPED" for blanks
     db: Session = Depends(get_db),
 ):
     _ensure_tables(db)
@@ -2524,10 +2531,28 @@ def job_work_dashboard(
 
     where_h = "WHERE 1=1" + ("".join(f" AND {c}" for c in date_conditions))
 
-    item_join = ""
+    # Combined line-filter join (item description AND/OR inventory group) used by
+    # header-level aggregations; keeps DISTINCT h.id counts correct.
+    filter_conds = []
     if item:
-        item_join = " JOIN jb_materialout_lines l_filter ON l_filter.header_id = h.id AND LOWER(l_filter.item_description) LIKE LOWER(:item_filter)"
+        filter_conds.append("LOWER(l_filter.item_description) LIKE LOWER(:item_filter)")
         params["item_filter"] = f"%{item}%"
+    if group:
+        if group.strip().upper() == "UNGROUPED":
+            filter_conds.append("(l_filter.item_category IS NULL OR l_filter.item_category = '')")
+        else:
+            filter_conds.append("UPPER(l_filter.item_category) = UPPER(:group_filter)")
+            params["group_filter"] = group.strip()
+    item_join = (" JOIN jb_materialout_lines l_filter ON l_filter.header_id = h.id AND " + " AND ".join(filter_conds)) if filter_conds else ""
+    # Inline predicate for queries that already JOIN jb_materialout_lines AS l directly.
+    li_where = ""
+    if item:
+        li_where += " AND LOWER(l.item_description) LIKE LOWER(:item_filter)"
+    if group:
+        if group.strip().upper() == "UNGROUPED":
+            li_where += " AND (l.item_category IS NULL OR l.item_category = '')"
+        else:
+            li_where += " AND UPPER(l.item_category) = UPPER(:group_filter)"
 
     # ── 1. Summary KPIs ──
     summary = db.execute(text(f"""
@@ -2639,7 +2664,7 @@ def job_work_dashboard(
         FROM jb_materialout_header h
         JOIN jb_materialout_lines l ON l.header_id = h.id
         {where_h}
-        {"AND LOWER(l.item_description) LIKE LOWER(:item_filter)" if item else ""}
+        {li_where}
         GROUP BY l.item_description
         ORDER BY dispatched_kgs DESC
     """), params).fetchall()
@@ -2647,6 +2672,28 @@ def job_work_dashboard(
     by_item = [
         {"item": r[0] or "Unknown", "jwo_count": r[1], "dispatched_kgs": round(float(r[2] or 0), 2), "total_boxes": int(r[3] or 0)}
         for r in item_rows
+    ]
+
+    # ── 6b. By Inventory Group (item_category) ──
+    group_rows = db.execute(text(f"""
+        SELECT
+            COALESCE(NULLIF(UPPER(l.item_category), ''), 'UNGROUPED') as grp,
+            COUNT(DISTINCT h.id) as jwo_count,
+            COALESCE(SUM(CAST(l.net_weight AS NUMERIC)), 0) as dispatched_kgs,
+            SUM(l.quantity_boxes) as total_boxes,
+            COUNT(DISTINCT l.item_description) as item_count
+        FROM jb_materialout_header h
+        JOIN jb_materialout_lines l ON l.header_id = h.id
+        {where_h}
+        {li_where}
+        GROUP BY COALESCE(NULLIF(UPPER(l.item_category), ''), 'UNGROUPED')
+        ORDER BY dispatched_kgs DESC
+    """), params).fetchall()
+
+    by_group = [
+        {"group": r[0] or "UNGROUPED", "jwo_count": r[1], "dispatched_kgs": round(float(r[2] or 0), 2),
+         "total_boxes": int(r[3] or 0), "item_count": int(r[4] or 0)}
+        for r in group_rows
     ]
 
     # ── 7. Monthly Trend ──
@@ -2679,7 +2726,7 @@ def job_work_dashboard(
         FROM jb_materialout_header h
         JOIN jb_materialout_lines l ON l.header_id = h.id
         {where_h}
-        {"AND LOWER(l.item_description) LIKE LOWER(:item_filter)" if item else ""}
+        {li_where}
         GROUP BY h.to_party, l.item_description
         ORDER BY dispatched_kgs DESC
         LIMIT 20
@@ -2694,6 +2741,7 @@ def job_work_dashboard(
     sub_cats = db.execute(text("SELECT DISTINCT sub_category FROM jb_materialout_header WHERE sub_category IS NOT NULL AND sub_category != '' ORDER BY sub_category")).fetchall()
     vendors_list = db.execute(text("SELECT DISTINCT to_party FROM jb_materialout_header WHERE to_party IS NOT NULL AND to_party != '' ORDER BY to_party")).fetchall()
     items_list = db.execute(text("SELECT DISTINCT item_description FROM jb_materialout_lines WHERE item_description IS NOT NULL AND item_description != '' ORDER BY item_description")).fetchall()
+    groups_list = db.execute(text("SELECT DISTINCT COALESCE(NULLIF(UPPER(item_category), ''), 'UNGROUPED') AS grp FROM jb_materialout_lines ORDER BY grp")).fetchall()
 
     return {
         "summary": {
@@ -2711,11 +2759,13 @@ def job_work_dashboard(
         "by_process": by_process,
         "by_vendor": by_vendor,
         "by_item": by_item,
+        "by_group": by_group,
         "monthly_trend": monthly_trend,
         "vendor_item_matrix": vendor_item_matrix,
         "filter_options": {
             "sub_categories": [r[0] for r in sub_cats],
             "vendors": [r[0] for r in vendors_list],
             "items": [r[0] for r in items_list],
+            "groups": [r[0] for r in groups_list],
         },
     }

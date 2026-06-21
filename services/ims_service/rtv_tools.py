@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
 from shared.canonicalize import canonical_warehouse
+from shared.timezone import now_ist
 from services.ims_service.inward_models import Company
 from services.ims_service.rtv_models import (
     RTVCreate,
@@ -42,7 +43,8 @@ def _generate_rtv_id() -> str:
     # systems read "RTV" as Return-To-Vendor (the opposite flow), which
     # mis-routes these inbound customer returns. Forward-only — legacy RTV-*
     # ids and their already-printed QR labels stay valid.
-    return f"CR-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    # IST timestamp so the embedded time reads as local (audit-correct).
+    return f"CR-{now_ist().strftime('%Y%m%d%H%M%S')}"
 
 
 def _canonical_factory_unit(raw):
@@ -108,10 +110,16 @@ def sync_cold_stocks_from_rtv(company: Company, rtv_id_int: int, db: Session) ->
                 :rtv_date, :unit, :rtv_str,
                 COALESCE(b.item_mark, l.item_mark), COALESCE(b.vakkal, l.vakkal),
                 COALESCE(b.lot_number, l.lot_number),
-                1, b.net_weight, b.net_weight, l.item_category,
+                -- no_of_cartons = count (units the row represents; default 1).
+                -- total_inventory_kgs = count x net_weight; weight_kg stays per-carton.
+                -- count<=0/NULL -> 1, so ordinary count=1 rows are byte-identical to before.
+                GREATEST(COALESCE(b.count, 1), 1),
+                b.net_weight,
+                b.net_weight * GREATEST(COALESCE(b.count, 1), 1),
+                l.item_category,
                 l.item_description, :wh, :exporter, l.rate,
                 b.box_id, :rtv_str, l.sub_category, COALESCE(b.item_mark, l.item_mark),
-                ROUND(COALESCE(b.net_weight, 0) * COALESCE(l.rate, 0), 2),
+                ROUND(COALESCE(b.net_weight, 0) * GREATEST(COALESCE(b.count, 1), 1) * COALESCE(l.rate, 0), 2),
                 :rtv_str, true, COALESCE(b.spl_remarks, l.spl_remarks),
                 :wh, l.item_category, l.sub_category
             FROM {tables['boxes']} b
@@ -558,11 +566,18 @@ def delete_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
     tables = rtv_table_names(company)
 
     existing = db.execute(
-        text(f"SELECT id, rtv_id, business_head, created_by FROM {tables['header']} WHERE id = :hid"),
+        text(f"SELECT id, rtv_id, business_head, created_by, factory_unit FROM {tables['header']} WHERE id = :hid"),
         {"hid": rtv_id_int},
     ).fetchone()
     if not existing:
         raise HTTPException(404, "RTV not found")
+
+    lines_count = db.execute(
+        text(f"SELECT COUNT(*) FROM {tables['lines']} WHERE header_id = :hid"), {"hid": rtv_id_int}
+    ).scalar() or 0
+    boxes_count = db.execute(
+        text(f"SELECT COUNT(*) FROM {tables['boxes']} WHERE header_id = :hid"), {"hid": rtv_id_int}
+    ).scalar() or 0
 
     # CASCADE handles children, but explicit delete for clarity
     db.execute(
@@ -584,6 +599,9 @@ def delete_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
         "rtv_id": existing.rtv_id,
         "business_head": existing.business_head,
         "created_by": existing.created_by,
+        "factory_unit": existing.factory_unit,
+        "lines_count": int(lines_count),
+        "boxes_count": int(boxes_count),
     }
 
 
@@ -897,6 +915,156 @@ def update_rtv_lines(
         "rtv_id": existing.rtv_id,
         "lines_count": len(data.lines),
     }
+
+
+# ══════════════════════════════════════════════
+#  Consolidated save (header + lines + boxes -> one mail)
+# ══════════════════════════════════════════════
+
+
+def _to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm(v) -> str:
+    """Normalize a value for change comparison: None/'' equal; numbers compared loosely."""
+    if v is None:
+        return ""
+    f = _to_float(str(v).strip())
+    return f"{f:g}" if f is not None else str(v).strip()
+
+
+def rtv_box_summary_and_short(detail: dict) -> tuple[dict, list]:
+    """Per-article box summary (what was received) + short-weight breakdown.
+
+    A box row's ``count`` is the number of boxes it represents (default 1) with a
+    per-box net/gross weight. Per article we total:
+        boxes        = Sum(count)
+        total_net    = Sum(count x net_weight)
+        total_gross  = Sum(count x gross_weight)
+        full         = Sum(count) for rows at/above the expected per-box weight (uom)
+        short        = Sum(count) for rows below it
+        expected     = Sum(count x uom)
+    For ordinary count=1 rows the totals equal (#rows, Sum(net), Sum(gross)).
+    The returned short list (one entry per article that has any short box) drives
+    the "<full> full, <short> short -- received vs expected" line in the mail."""
+    lines = detail.get("lines", []) or []
+    boxes = detail.get("boxes", []) or []
+    line_by_art: dict = {}
+    for l in lines:
+        line_by_art.setdefault(l.get("item_description"), l)
+
+    def _box_count(b) -> float:
+        c = _to_float(b.get("count"))
+        return c if (c is not None and c > 0) else 1.0
+
+    box_summary: dict = {}
+    for b in boxes:
+        art = b.get("article_description", "") or ""
+        cnt = _box_count(b)
+        nw = _to_float(b.get("net_weight")) or 0.0
+        gw = _to_float(b.get("gross_weight")) or 0.0
+        uom = _to_float((line_by_art.get(art) or {}).get("uom"))
+        s = box_summary.setdefault(art, {
+            "boxes": 0.0, "total_net": 0.0, "total_gross": 0.0,
+            "full": 0.0, "short": 0.0, "expected": 0.0,
+        })
+        s["boxes"] += cnt
+        s["total_net"] += cnt * nw
+        s["total_gross"] += cnt * gw
+        if uom is not None and uom > 0:
+            s["expected"] += cnt * uom
+            if nw + 1e-6 < uom:        # per-box net below the expected per-box weight
+                s["short"] += cnt
+            else:
+                s["full"] += cnt
+        else:
+            s["full"] += cnt            # no expected weight to judge against
+
+    short = []
+    for art, s in box_summary.items():
+        if s["short"] > 0:
+            short.append({
+                "article": art,
+                "full": s["full"], "short": s["short"],
+                "received": s["total_net"], "expected": s["expected"],
+                "shortfall": max(s["expected"] - s["total_net"], 0.0),
+            })
+
+    return box_summary, short
+
+
+_HEADER_DIFF_LABELS = {
+    "factory_unit": "Factory Unit", "customer": "Customer",
+    "invoice_number": "Invoice Number", "challan_no": "Challan No",
+    "dn_no": "DN No", "sales_poc": "Sales POC", "sales_poc_email": "Sales POC Email",
+    "business_head": "Business Head", "remark": "Remark", "conversion": "Conversion",
+    "vehicle_number": "Vehicle Number", "transporter_name": "Transporter",
+    "driver_name": "Driver", "inward_manager": "Inward Manager",
+}
+_LINE_DIFF_FIELDS = [
+    ("qty", "Qty"), ("rate", "Rate"), ("value", "Value"), ("net_weight", "Net Wt"),
+    ("uom", "UOM"), ("item_category", "Category"), ("sub_category", "Sub Category"),
+    ("lot_number", "Lot"), ("item_mark", "Item Mark"), ("vakkal", "Vakkal"),
+]
+
+
+def save_rtv(company: Company, rtv_id_int: int, data, db: Session) -> tuple[dict, dict]:
+    """Apply header + lines + boxes in ONE transaction; return (new_detail, summary).
+    The endpoint sends a single 'Updated' mail from the summary. get_db commits."""
+    old = get_rtv(company, rtv_id_int, db)
+
+    header_changes = []
+    if data.header is not None:
+        provided = data.header.model_dump(exclude_unset=True)
+        provided.pop("status", None)  # status is managed by the box-save flow; never diffed here
+        if provided:
+            update_rtv(company, rtv_id_int, data.header, db)
+            for field, new_val in provided.items():
+                if _norm(old.get(field)) != _norm(new_val):
+                    header_changes.append({
+                        "field": field, "label": _HEADER_DIFF_LABELS.get(field, field),
+                        "old": old.get(field), "new": new_val,
+                    })
+
+    line_changes = {"added": [], "removed": [], "changed": []}
+    if data.lines:
+        old_lines = {l.get("item_description"): l for l in old.get("lines", [])}
+        new_lines = {l.item_description: l for l in data.lines}
+        update_rtv_lines(company, rtv_id_int, RTVLinesUpdateRequest(lines=data.lines), db)
+        for desc, nl in new_lines.items():
+            if desc not in old_lines:
+                line_changes["added"].append(desc)
+                continue
+            ol = old_lines[desc]
+            for f, lbl in _LINE_DIFF_FIELDS:
+                if _norm(ol.get(f)) != _norm(getattr(nl, f, None)):
+                    line_changes["changed"].append({
+                        "item": desc, "label": lbl,
+                        "old": ol.get(f), "new": getattr(nl, f, None),
+                    })
+        for desc in old_lines:
+            if desc not in new_lines:
+                line_changes["removed"].append(desc)
+
+    box_changes = {"added": 0, "updated": 0, "deleted": 0}
+    if data.boxes is not None:
+        res = bulk_save_boxes(company, rtv_id_int, RTVBulkBoxUpdateRequest(boxes=data.boxes), db)
+        box_changes = {"added": res.get("inserted", 0), "updated": res.get("updated", 0), "deleted": res.get("deleted", 0)}
+
+    new = get_rtv(company, rtv_id_int, db)
+    box_summary, short = rtv_box_summary_and_short(new)
+    summary = {
+        "header_changes": header_changes,
+        "line_changes": line_changes,
+        "box_changes": box_changes,
+        "box_summary": box_summary,
+        "short": short,
+    }
+    return new, summary
 
 
 # ══════════════════════════════════════════════

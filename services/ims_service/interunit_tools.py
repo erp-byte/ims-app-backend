@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from shared.logger import get_logger
+from shared.timezone import now_ist
 from services.ims_service.interunit_models import (
     RequestCreate, RequestUpdate, TransferCreate, TransferInCreate,
     PendingTransferInCreate, PendingBoxAcknowledge, FinalizeTransferIn,
@@ -114,7 +115,7 @@ def _ensure_interunit_schema(db: Session) -> None:
 
 
 def _generate_request_no() -> str:
-    return f"REQ{datetime.now().strftime('%Y%m%d%H%M')}"
+    return f"REQ{now_ist().strftime('%Y%m%d%H%M')}"
 
 
 def _convert_date(date_str: str):
@@ -492,7 +493,7 @@ def delete_request(request_id: int, db: Session) -> dict:
 
 
 def _generate_challan_no() -> str:
-    return f"TRANS{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    return f"TRANS{now_ist().strftime('%Y%m%d%H%M%S')}"
 
 
 def _map_transfer_line(row) -> dict:
@@ -3036,7 +3037,7 @@ def generate_transfer_in_qrs(transfer_in_id: int, db: Session) -> dict:
     if not boxes:
         raise HTTPException(400, "No acknowledged boxes found for this Transfer-IN")
 
-    inward_txn_no = f"TR-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    inward_txn_no = f"TR-{now_ist().strftime('%Y%m%d%H%M%S')}"
     base = str(int(time.time() * 1000))[-8:]
 
     result_boxes = []

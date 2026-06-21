@@ -30,6 +30,7 @@ from services.ims_service.pending_stock_tools import (
     unpick_to_pending,
 )
 from shared.logger import get_logger
+from shared.timezone import now_ist
 
 logger = get_logger("ims.cold_transfer_out")
 
@@ -124,7 +125,7 @@ def _parse_trf_date(raw: Optional[str]):
                 return datetime.strptime(s, fmt).date()
             except ValueError:
                 continue
-    return datetime.now().date()
+    return now_ist().date()
 
 
 def create_cold_transfer_out(

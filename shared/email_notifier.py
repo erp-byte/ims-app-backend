@@ -5,8 +5,10 @@ from email.message import EmailMessage
 from html import escape
 from urllib.parse import quote
 
+from shared.canonicalize import canonical_warehouse
 from shared.config_loader import settings
 from shared.logger import get_logger
+from shared.timezone import now_ist, fmt_ist
 
 logger = get_logger("email.notifier")
 
@@ -66,7 +68,28 @@ RTV_CC_CONSTANT = [
     "satyendra@candorfoods.in",
     "sachin.more@candorfoods.in",
     "dipesh.sharma@ofbusiness.in",
+    "yash@candorfoods.in",   # Yash Gawdi — mandatory CC on every customer-return mail
 ]
+
+# Warehouse (factory_unit) -> additional CC recipient, layered on top of the
+# constant CC. W202 and all cold storages route to Vaibhav; A185/A68 to their
+# stores owners. Unlisted warehouses add no extra CC. Matching is tolerant of
+# alias/hyphen/space variants (e.g. "A-68" == "A68", "Savla D-39" -> cold).
+def _warehouse_cc_email(factory_unit: str | None) -> str | None:
+    if not factory_unit:
+        return None
+    canon = canonical_warehouse(factory_unit, None) or str(factory_unit)
+    low = canon.strip().lower()
+    if any(k in low for k in ("savla", "rishi", "supreme", "eskimo")):
+        return "vaibhav.kumkar@candorfoods.in"          # cold storages
+    code = low.replace("-", "").replace(" ", "")
+    if code == "w202":
+        return "vaibhav.kumkar@candorfoods.in"
+    if code == "a185":
+        return "stores-a185@candorfoods.in"             # Sumit Baikar
+    if code == "a68":
+        return "pankaj.ranga@candorfoods.in"
+    return None
 
 
 def _lookup_business_head_email(business_head: str | None) -> str | None:
@@ -122,17 +145,19 @@ def _build_rtv_cc(
     *actors: str | None,
     sales_poc: str | None = None,
     sales_poc_email: str | None = None,
+    factory_unit: str | None = None,
 ) -> list[str]:
-    """Build CC list: business head email + selected Sales POC + constant CC + entry-maker(s).
+    """Build CC list: selected Sales POC + constant CC + entry-maker(s) +
+    the warehouse-specific recipient for ``factory_unit``.
 
+    The business head goes in TO (not CC), so ``business_head`` is used only to
+    EXCLUDE that address from CC (e.g. when the approver/rejecter is the BH).
     ``sales_poc`` is resolved against the SALES_POC_EMAILS map (dropdown picks);
     ``sales_poc_email`` is a manually entered address (the "Other" option) and is
-    added as-is. Duplicates and the TO address are removed. Empty values skipped.
+    added as-is. ``factory_unit`` adds the warehouse owner (see _warehouse_cc_email).
+    Duplicates and the TO address (pooja) are removed; empties skipped.
     """
     cc: list[str] = []
-    head_email = _lookup_business_head_email(business_head)
-    if head_email:
-        cc.append(head_email)
     poc_email = _lookup_sales_poc_email(sales_poc)
     if poc_email:
         cc.append(poc_email)
@@ -142,12 +167,18 @@ def _build_rtv_cc(
     for actor in actors:
         if actor:
             cc.append(actor)
+    wh_cc = _warehouse_cc_email(factory_unit)
+    if wh_cc:
+        cc.append(wh_cc)
 
+    head_email = (_lookup_business_head_email(business_head) or "").strip().lower()
     seen: set[str] = set()
     deduped: list[str] = []
     for addr in cc:
         normalized = addr.strip().lower()
-        if not normalized or normalized in seen or normalized == RTV_NOTIFY_TO.lower():
+        if (not normalized or normalized in seen
+                or normalized == RTV_NOTIFY_TO.lower()
+                or (head_email and normalized == head_email)):
             continue
         seen.add(normalized)
         deduped.append(addr.strip())
@@ -268,7 +299,7 @@ def _rtv_email_html(
 
     header_fields = [
         ("Return ID", header.get("rtv_id", "")),
-        ("Return Date", str(header.get("rtv_date", ""))),
+        ("Return Date", fmt_ist(header.get("rtv_date")) or "-"),
         ("Factory Unit", header.get("factory_unit", "")),
         ("Customer", header.get("customer", "")),
         ("Invoice Number", header.get("invoice_number", "") or "-"),
@@ -312,7 +343,20 @@ def _rtv_email_html(
 
     extra_section = ""
     if extra_info:
-        extra_section = f'<p style="color:#555;margin:16px 0;">{extra_info}</p>'
+        # Prominent, action-coloured banner so "Approved/Rejected/Held by: <name>"
+        # stands out for every recipient (was a dim grey line before).
+        _extra_palette = {
+            "Approved": ("#1e7e44", "#eafaf1", "#27ae60"),  # (text, bg, border)
+            "Rejected": ("#a82315", "#fdecea", "#c0392b"),
+            "On Hold":  ("#9a6212", "#fff4e5", "#e67e22"),
+            "Deleted":  ("#a82315", "#fdecea", "#c0392b"),
+        }
+        _txt, _bg, _border = _extra_palette.get(action, ("#1f4e79", "#eef4fb", "#29417A"))
+        extra_section = (
+            f'<div style="margin:18px 0;padding:14px 18px;background:{_bg};'
+            f'border-left:5px solid {_border};border-radius:6px;">'
+            f'<span style="font-size:18px;font-weight:bold;color:{_txt};">{extra_info}</span></div>'
+        )
 
     buttons_section = ""
     if action_buttons:
@@ -332,7 +376,7 @@ def _rtv_email_html(
   <table width="100%" cellpadding="0" cellspacing="0" style="max-width:800px;margin:20px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
     <tr><td style="background:#29417A;color:#fff;padding:20px 24px;">
       <h2 style="margin:0;">Customer Returns {action}</h2>
-      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{header.get('rtv_id', '')} &mdash; {datetime.now().strftime('%d %b %Y, %I:%M %p')}</p>
+      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{header.get('rtv_id', '')} &mdash; {now_ist().strftime('%d %b %Y, %I:%M %p')}</p>
     </td></tr>
     <tr><td style="padding:20px 24px;">
 
@@ -434,6 +478,9 @@ def notify_rtv_created(rtv_detail: dict) -> None:
     created_by = rtv_detail.get("created_by")
     if created_by:
         cc_candidates.append(created_by)
+    wh_cc = _warehouse_cc_email(rtv_detail.get("factory_unit"))
+    if wh_cc:
+        cc_candidates.append(wh_cc)
 
     def _dedupe(addrs: list[str], exclude: set[str]) -> list[str]:
         seen: set[str] = set()
@@ -585,6 +632,7 @@ def notify_rtv_weight_discrepancy(rtv_detail: dict, summary: dict) -> None:
             business_head, created_by,
             sales_poc=rtv_detail.get("sales_poc"),
             sales_poc_email=rtv_detail.get("sales_poc_email"),
+            factory_unit=rtv_detail.get("factory_unit"),
         ),
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
@@ -623,6 +671,9 @@ def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: st
     created_by = rtv_detail.get("created_by")
     if created_by:
         cc_candidates.append(created_by)
+    wh_cc = _warehouse_cc_email(rtv_detail.get("factory_unit"))
+    if wh_cc:
+        cc_candidates.append(wh_cc)
     seen: set[str] = set()
     cc: list[str] = []
     for addr in cc_candidates:
@@ -651,15 +702,18 @@ def notify_rtv_rejected(rtv_detail: dict, rejected_by: str) -> None:
         boxes=rtv_detail.get("boxes", []),
         extra_info=f"Rejected by: {_format_actor(rejected_by)}",
     )
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"), rtv_detail.get("created_by"), rejected_by,
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
@@ -674,15 +728,18 @@ def notify_rtv_held(rtv_detail: dict, held_by: str) -> None:
         boxes=rtv_detail.get("boxes", []),
         extra_info=f"Placed on hold by: {_format_actor(held_by)}. The business head can still approve or reject later.",
     )
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"), rtv_detail.get("created_by"), held_by,
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
@@ -697,17 +754,20 @@ def notify_rtv_approved(rtv_detail: dict, approved_by: str) -> None:
         boxes=rtv_detail.get("boxes", []),
         extra_info=f"Approved by: {_format_actor(approved_by)}",
     )
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"),
         rtv_detail.get("created_by"),
         approved_by,
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
@@ -720,10 +780,20 @@ def notify_rtv_deleted(
     *,
     business_head: str | None = None,
     created_by: str | None = None,
+    lines_count: int | None = None,
+    boxes_count: int | None = None,
+    factory_unit: str | None = None,
 ) -> None:
     """Send notification email when an RTV is deleted."""
-    header = {"rtv_id": rtv_id, "status": "Deleted", "business_head": business_head, "created_by": created_by}
-    extra = f"Customer Returns {rtv_id} in {company} has been permanently deleted along with all its lines and boxes."
+    header = {"rtv_id": rtv_id, "status": "Deleted", "business_head": business_head,
+              "created_by": created_by, "factory_unit": factory_unit}
+    removed = []
+    if lines_count is not None:
+        removed.append(f"{lines_count} line item{'s' if lines_count != 1 else ''}")
+    if boxes_count is not None:
+        removed.append(f"{boxes_count} box{'es' if boxes_count != 1 else ''}")
+    removed_txt = f" Removed: {', '.join(removed)}." if removed else " along with all its lines and boxes."
+    extra = f"Customer Returns {rtv_id} in {company} has been permanently deleted.{removed_txt}"
     if deleted_by:
         extra += f" Deleted by: {_format_actor(deleted_by)}."
     html, plain = _rtv_email_html(
@@ -733,11 +803,13 @@ def notify_rtv_deleted(
         boxes=[],
         extra_info=extra,
     )
-    cc = _build_rtv_cc(business_head, created_by, deleted_by)
+    bh_email = _lookup_business_head_email(business_head)
+    cc = _build_rtv_cc(business_head, created_by, deleted_by, factory_unit=factory_unit)
     _send_email_background(
         subject=_rtv_subject(rtv_id, reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_id),
     )
@@ -751,15 +823,255 @@ def notify_rtv_header_updated(rtv_detail: dict) -> None:
         lines=[],
         boxes=[],
     )
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"), rtv_detail.get("created_by"),
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
+        cc=cc,
+        in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
+    )
+
+
+# ── Consolidated "Updated" mail (one save -> one mail) ──────────────
+
+_UPD_HEADER_FIELDS = [
+    ("rtv_id", "Return ID"), ("rtv_date", "Return Date"),
+    ("factory_unit", "Factory Unit"), ("customer", "Customer"),
+    ("invoice_number", "Invoice Number"), ("challan_no", "Challan No"),
+    ("dn_no", "DN No"), ("sales_poc", "Sales POC"),
+    ("business_head", "Business Head"), ("remark", "Remark"),
+    ("status", "Status"), ("created_by", "Created By"),
+]
+
+
+def _esc(v) -> str:
+    return escape(str(v if v is not None else ""))
+
+
+def _fmt_kg(v) -> str:
+    try:
+        return f"{float(v):g}"
+    except (TypeError, ValueError):
+        return str(v if v is not None else "")
+
+
+def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
+    """Render the consolidated 'Updated' mail: what-changed + highlighted header/line
+    rows (old -> new) + box summary + short/short-weight. No full boxes table."""
+    rtv_id = detail.get("rtv_id", "")
+    hchanges = summary.get("header_changes", []) or []
+    lchanges = summary.get("line_changes", {}) or {}
+    bchanges = summary.get("box_changes", {}) or {}
+    box_summary = summary.get("box_summary", {}) or {}
+    short = summary.get("short", []) or []
+    AMBER = "background:#fff7ed;"
+
+    def _delta(old, new):
+        return f"<s style='color:#999;'>{_esc(old) or '&mdash;'}</s> &rarr; <strong>{_esc(new) or '&mdash;'}</strong>"
+
+    # ── What-changed block ──
+    bullets = []
+    for c in hchanges:
+        bullets.append(f"<li>{_esc(c['label'])}: {_delta(c['old'], c['new'])}</li>")
+    for item in lchanges.get("added", []):
+        bullets.append(f"<li>Line added: <strong>{_esc(item)}</strong></li>")
+    for item in lchanges.get("removed", []):
+        bullets.append(f"<li>Line removed: <strong>{_esc(item)}</strong></li>")
+    for c in lchanges.get("changed", []):
+        bullets.append(f"<li>{_esc(c['item'])} &mdash; {_esc(c['label'])}: {_delta(c['old'], c['new'])}</li>")
+    box_bits = []
+    if bchanges.get("added"):
+        box_bits.append(f"{bchanges['added']} added")
+    if bchanges.get("deleted"):
+        box_bits.append(f"{bchanges['deleted']} removed")
+    if bchanges.get("updated"):
+        box_bits.append(f"{bchanges['updated']} saved")
+    if box_bits:
+        bullets.append(f"<li>Boxes: {_esc(', '.join(box_bits))}</li>")
+    if not bullets:
+        bullets.append("<li>Box weights / data re-saved (no header or line field changes).</li>")
+    what_changed = (
+        "<div style='margin:0 0 18px;padding:12px 14px;border-left:4px solid #29417A;background:#f0f4fa;'>"
+        "<div style='font-weight:bold;color:#29417A;margin-bottom:6px;'>What changed</div>"
+        f"<ul style='margin:0;padding-left:18px;font-size:13px;line-height:1.6;'>{''.join(bullets)}</ul></div>"
+    )
+
+    # ── Header table (highlight changed) ──
+    changed_fields = {c["field"]: c for c in hchanges}
+    header_rows = ""
+    for key, label in _UPD_HEADER_FIELDS:
+        if key in changed_fields:
+            c = changed_fields[key]
+            val, row_style = _delta(c["old"], c["new"]), AMBER
+        else:
+            raw = detail.get(key)
+            if key == "created_by":
+                raw = _format_actor(raw)
+            elif key == "rtv_date":
+                raw = fmt_ist(raw)
+            val, row_style = (_esc(raw) or "-"), ""
+        header_rows += (
+            f"<tr style='{row_style}'>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;font-weight:bold;background:#f8f9fa;width:160px;'>{_esc(label)}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;'>{val}</td></tr>"
+        )
+
+    # ── Line items table (highlight changed/added) ──
+    changed_items = {c["item"] for c in lchanges.get("changed", [])} | set(lchanges.get("added", []))
+    line_rows = ""
+    for l in detail.get("lines", []) or []:
+        hl = AMBER if l.get("item_description") in changed_items else ""
+        cells = "".join(
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;{align}'>{_esc(l.get(k))}</td>"
+            for k, align in [
+                ("material_type", ""), ("item_category", ""), ("sub_category", ""),
+                ("item_description", ""), ("uom", ""),
+                ("qty", "text-align:right;"), ("rate", "text-align:right;"),
+                ("value", "text-align:right;"), ("net_weight", "text-align:right;"),
+            ]
+        )
+        line_rows += f"<tr style='{hl}'>{cells}</tr>"
+
+    # ── Box summary (per article; no per-box table) ──
+    box_section = ""
+    if box_summary:
+        rows, tot_boxes, tot_net, tot_gross = "", 0.0, 0.0, 0.0
+        for art, s in box_summary.items():
+            tot_boxes += s["boxes"]
+            tot_net += s["total_net"]
+            tot_gross += s.get("total_gross", 0.0)
+            rows += (
+                f"<tr><td style='padding:6px 10px;border:1px solid #e0e0e0;'>{_esc(art)}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(s['boxes'])}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(s['total_net'])}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(s.get('total_gross', 0.0))}</td></tr>"
+            )
+        rows += (
+            f"<tr style='background:#e8edf5;font-weight:bold;'>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;'>Total</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(tot_boxes)}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(tot_net)}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(tot_gross)}</td></tr>"
+        )
+        box_section = (
+            "<h3 style='color:#29417A;margin:24px 0 8px;'>Box Summary</h3>"
+            "<table style='border-collapse:collapse;width:100%;font-size:13px;'>"
+            "<thead><tr style='background:#29417A;color:#fff;'>"
+            "<th style='padding:8px 10px;text-align:left;'>Article</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Boxes</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Total Net Wt</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Total Gross Wt</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table>"
+        )
+
+    # ── Short-weight breakdown: "<full> full, <short> short -- received vs expected" ──
+    short_section = ""
+    if short:
+        r = "".join(
+            f"<tr><td style='padding:6px 10px;border:1px solid #fed7aa;'>{_esc(a['article'])}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:center;'>{_fmt_kg(a['full'])} full</td>"
+            f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:center;color:#c0392b;font-weight:bold;'>{_fmt_kg(a['short'])} short</td>"
+            f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;'>{_fmt_kg(a['received'])}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;'>{_fmt_kg(a['expected'])}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;color:#c0392b;font-weight:bold;'>-{_fmt_kg(a['shortfall'])}</td></tr>"
+            for a in short
+        )
+        short_section = (
+            "<h3 style='color:#c0392b;margin:24px 0 8px;'>&#9888; Short-Weight</h3>"
+            "<table style='border-collapse:collapse;width:100%;font-size:13px;'>"
+            "<thead><tr style='background:#e67e22;color:#fff;'>"
+            "<th style='padding:8px 10px;text-align:left;'>Article</th>"
+            "<th style='padding:8px 10px;text-align:center;'>Full</th>"
+            "<th style='padding:8px 10px;text-align:center;'>Short</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Received (Net)</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Expected</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Short by</th></tr></thead>"
+            f"<tbody>{r}</tbody></table>"
+        )
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Arial,sans-serif;margin:0;padding:0;background:#f4f4f4;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="max-width:800px;margin:20px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+    <tr><td style="background:#29417A;color:#fff;padding:20px 24px;">
+      <h2 style="margin:0;">Customer Returns Updated</h2>
+      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{_esc(rtv_id)} &mdash; {now_ist().strftime('%d %b %Y, %I:%M %p')}</p>
+    </td></tr>
+    <tr><td style="padding:20px 24px;">
+      {what_changed}
+      <h3 style="color:#29417A;margin:0 0 8px;">Header Details</h3>
+      <table style="border-collapse:collapse;width:100%;font-size:13px;"><tbody>{header_rows}</tbody></table>
+      <h3 style="color:#29417A;margin:24px 0 8px;">Line Items</h3>
+      <table style="border-collapse:collapse;width:100%;font-size:13px;">
+        <thead><tr style="background:#29417A;color:#fff;">
+          <th style="padding:8px 10px;text-align:left;">Material</th>
+          <th style="padding:8px 10px;text-align:left;">Category</th>
+          <th style="padding:8px 10px;text-align:left;">Sub Category</th>
+          <th style="padding:8px 10px;text-align:left;">Description</th>
+          <th style="padding:8px 10px;text-align:left;">UOM</th>
+          <th style="padding:8px 10px;text-align:right;">Qty</th>
+          <th style="padding:8px 10px;text-align:right;">Rate</th>
+          <th style="padding:8px 10px;text-align:right;">Value</th>
+          <th style="padding:8px 10px;text-align:right;">Net Wt</th>
+        </tr></thead>
+        <tbody>{line_rows}</tbody>
+      </table>
+      {box_section}
+      {short_section}
+    </td></tr>
+    <tr><td style="background:#f8f9fa;padding:12px 24px;text-align:center;font-size:12px;color:#888;">
+      Candor Foods &mdash; IMS Customer Returns Notification
+    </td></tr>
+  </table>
+</body></html>"""
+
+    pl = [f"Customer Returns Updated: {rtv_id}", "", "What changed:"]
+    for c in hchanges:
+        pl.append(f"  - {c['label']}: {c['old']} -> {c['new']}")
+    for item in lchanges.get("added", []):
+        pl.append(f"  - Line added: {item}")
+    for item in lchanges.get("removed", []):
+        pl.append(f"  - Line removed: {item}")
+    for c in lchanges.get("changed", []):
+        pl.append(f"  - {c['item']} {c['label']}: {c['old']} -> {c['new']}")
+    if box_bits:
+        pl.append(f"  - Boxes: {', '.join(box_bits)}")
+    if box_summary:
+        pl.append("")
+        pl.append("Box summary:")
+        for art, s in box_summary.items():
+            pl.append(f"  {art}: {_fmt_kg(s['boxes'])} boxes, net {_fmt_kg(s['total_net'])} kg, gross {_fmt_kg(s.get('total_gross', 0.0))} kg")
+    if short:
+        pl.append("")
+        pl.append("Short-weight:")
+        for a in short:
+            pl.append(f"  {a['article']}: {_fmt_kg(a['full'])} full, {_fmt_kg(a['short'])} short -- received {_fmt_kg(a['received'])} kg vs expected {_fmt_kg(a['expected'])} kg (short {_fmt_kg(a['shortfall'])})")
+    return html, "\n".join(pl)
+
+
+def notify_rtv_updated(rtv_detail: dict, summary: dict) -> None:
+    """Send ONE consolidated 'Updated' mail (replaces the separate header/lines mails)."""
+    html, plain = _rtv_updated_html(rtv_detail, summary)
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
+    cc = _build_rtv_cc(
+        rtv_detail.get("business_head"), rtv_detail.get("created_by"),
+        sales_poc=rtv_detail.get("sales_poc"),
+        sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
+    )
+    _send_email_background(
+        subject=_rtv_subject(rtv_detail.get("rtv_id", ""), reply=True),
+        html_body=html,
+        plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get("rtv_id", "")),
     )
@@ -802,7 +1114,7 @@ def _jw_wrap(title: str, subtitle: str, body_html: str) -> str:
   <table width="100%" cellpadding="0" cellspacing="0" style="max-width:860px;margin:20px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
     <tr><td style="background:#29417A;color:#fff;padding:20px 24px;">
       <h2 style="margin:0;">{title}</h2>
-      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{subtitle} &mdash; {datetime.now().strftime('%d %b %Y, %I:%M %p')}</p>
+      <p style="margin:4px 0 0;opacity:0.85;font-size:14px;">{subtitle} &mdash; {now_ist().strftime('%d %b %Y, %I:%M %p')}</p>
     </td></tr>
     <tr><td style="padding:20px 24px;">{body_html}</td></tr>
     <tr><td style="background:#f8f9fa;padding:12px 24px;text-align:center;font-size:12px;color:#888;">
@@ -1576,15 +1888,18 @@ def notify_rtv_lines_updated(rtv_detail: dict) -> None:
         lines=rtv_detail.get("lines", []),
         boxes=rtv_detail.get("boxes", []),
     )
+    bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     cc = _build_rtv_cc(
         rtv_detail.get("business_head"), rtv_detail.get("created_by"),
         sales_poc=rtv_detail.get("sales_poc"),
         sales_poc_email=rtv_detail.get("sales_poc_email"),
+        factory_unit=rtv_detail.get("factory_unit"),
     )
     _send_email_background(
         subject=_rtv_subject(rtv_detail.get('rtv_id', ''), reply=True),
         html_body=html,
         plain_body=plain,
+        to=[bh_email, RTV_NOTIFY_TO] if bh_email else [RTV_NOTIFY_TO],
         cc=cc,
         in_reply_to=_rtv_thread_key(rtv_detail.get('rtv_id', '')),
     )
@@ -1689,7 +2004,7 @@ def send_job_work_weekly_digest() -> None:
             <td style="padding:6px 10px;border:1px solid #e0e0e0;color:#c0392b;font-weight:bold;">{loss_pct:.1f}%</td>
         </tr>"""
 
-    today = datetime.now().strftime("%d %b %Y")
+    today = now_ist().strftime("%d %b %Y")
 
     excess_section = ""
     if excess_rows:
@@ -1768,7 +2083,7 @@ def notify_inward_deleted(
     items: list | None = None,
 ) -> None:
     """Send notification to b.hrithik when an inward transaction is deleted."""
-    deleted_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    deleted_at = now_ist().strftime("%d %b %Y, %I:%M %p")
     rows = [
         ("Transaction No", transaction_no),
         ("Company", company),

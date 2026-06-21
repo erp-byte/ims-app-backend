@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from shared.database import get_db
+from shared.timezone import now_ist
 from services.ims_service.inward_models import Company
 from services.ims_service.rtv_models import (
     RTVCreate,
@@ -22,6 +23,7 @@ from services.ims_service.rtv_models import (
     RTVBulkBoxUpdateResponse,
     RTVLinesUpdateRequest,
     RTVLinesUpdateResponse,
+    RTVSaveRequest,
     RTVApprovalRequest,
     RTVApprovalResponse,
     RTVBoxEditLogRequest,
@@ -38,6 +40,7 @@ from services.ims_service.rtv_tools import (
     upsert_rtv_box,
     bulk_save_boxes,
     update_rtv_lines,
+    save_rtv,
     approve_rtv,
     log_rtv_box_edits,
     export_rtv_records,
@@ -50,6 +53,7 @@ from shared.email_notifier import (
     notify_rtv_deleted,
     notify_rtv_header_updated,
     notify_rtv_lines_updated,
+    notify_rtv_updated,
     notify_rtv_status_changed,
 )
 
@@ -161,7 +165,7 @@ def export_rtv_endpoint(
     wb.save(buf)
     buf.seek(0)
 
-    filename = f"rtv_{company}_{date.today().strftime('%Y%m%d')}.xlsx"
+    filename = f"rtv_{company}_{now_ist().strftime('%Y%m%d')}.xlsx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -378,6 +382,9 @@ def delete_rtv_endpoint(
         business_head=result.get("business_head"),
         created_by=result.get("created_by"),
         deleted_by=deleted_by,
+        lines_count=result.get("lines_count"),
+        boxes_count=result.get("boxes_count"),
+        factory_unit=result.get("factory_unit"),
     )
     return result
 
@@ -433,5 +440,20 @@ def bulk_save_boxes_endpoint(
 ):
     result = bulk_save_boxes(company, rtv_id, payload, db, notify_discrepancy=notify_discrepancy)
     return result
+
+
+@router.put("/{company}/{rtv_id}/save", response_model=RTVWithDetails)
+def save_rtv_endpoint(
+    company: Company,
+    rtv_id: int,
+    payload: RTVSaveRequest,
+    db: Session = Depends(get_db),
+):
+    """Consolidated save: header + lines + boxes in one transaction, ONE 'Updated'
+    mail (change summary + highlights + box summary + short/short-weight)."""
+    detail, summary = save_rtv(company, rtv_id, payload, db)
+    detail["_company"] = company
+    notify_rtv_updated(detail, summary)
+    return detail
 
 

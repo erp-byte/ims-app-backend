@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from shared.database import get_db
 from shared.logger import get_logger
+from shared.timezone import now_ist
 
 logger = get_logger("cold_storage_server")
 
@@ -237,7 +238,7 @@ def download_cold_stocks_category_summary(
     num_fmt = '#,##0'
     rate_fmt = '#,##0.00'
 
-    today_str = date_type.today().strftime("%d-%b-%y")
+    today_str = now_ist().strftime("%d-%b-%y")
 
     def write_section(ws, start_col, category_label, data_rows):
         """Write one section (Dates or Other than Dates) starting at start_col."""
@@ -360,7 +361,7 @@ def download_cold_stocks_category_summary(
     wb.save(buf)
     buf.seek(0)
 
-    fname = f"cold_storage_summary_{date_type.today().strftime('%Y%m%d')}.xlsx"
+    fname = f"cold_storage_summary_{now_ist().strftime('%Y%m%d')}.xlsx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

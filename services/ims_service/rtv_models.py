@@ -247,6 +247,13 @@ class RTVBulkBoxUpdateResponse(BaseModel):
     deleted: int = 0
 
 
+class RTVSaveRequest(BaseModel):
+    """Single consolidated save (header + lines + boxes) -> ONE 'Updated' mail."""
+    header: Optional[RTVHeaderUpdate] = None
+    lines: Optional[List[RTVLineCreate]] = None
+    boxes: List[RTVBulkBoxItem] = Field(default_factory=list)
+
+
 class RTVHeaderResponse(BaseModel):
     id: int
     rtv_id: str

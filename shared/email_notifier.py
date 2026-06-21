@@ -35,7 +35,6 @@ BUSINESS_HEAD_EMAILS = {
     "Yash Gawdi": "yash@candorfoods.in",
     "Satyendra Garg": "satyendra@candorfoods.in",
     "R M Patil": "rmpatil@candorfoods.in",
-    "B Hrithik": "b.hrithik@candorfoods.in",  # TEMP: trial-only BH for click-testing — REVERT after testing
 }
 
 # Sales POC -> email map for RTV notifications. When a Sales POC is selected on an

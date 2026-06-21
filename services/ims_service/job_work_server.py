@@ -1046,13 +1046,14 @@ def search_material_out(
     prior_irs = []
     ir_rows = db.execute(text("""
         SELECT ir.ir_number, ir.challan_no, ir.receipt_date, ir.receipt_type, ir.created_at,
+               ir.inward_warehouse,
                COALESCE(SUM(il.finished_goods_kgs), 0) as total_fg,
                COALESCE(SUM(il.waste_kgs), 0) as total_waste,
                COALESCE(SUM(il.rejection_kgs), 0) as total_rejection
         FROM jb_work_inward_receipt ir
         LEFT JOIN jb_work_inward_lines il ON il.inward_receipt_id = ir.id
         WHERE ir.header_id = :header_id
-        GROUP BY ir.id, ir.ir_number, ir.challan_no, ir.receipt_date, ir.receipt_type, ir.created_at
+        GROUP BY ir.id, ir.ir_number, ir.challan_no, ir.receipt_date, ir.receipt_type, ir.created_at, ir.inward_warehouse
         ORDER BY ir.created_at ASC
     """), {"header_id": header_id}).fetchall()
     for ir_row in ir_rows:
@@ -1061,9 +1062,10 @@ def search_material_out(
             "challan_no": ir_row[1] or "",
             "receipt_date": ir_row[2] or "",
             "receipt_type": ir_row[3] or "partial",
-            "total_fg_kgs": round(float(ir_row[5]), 3),
-            "total_waste_kgs": round(float(ir_row[6]), 3),
-            "total_rejection_kgs": round(float(ir_row[7]), 3),
+            "inward_warehouse": ir_row[5] or "",
+            "total_fg_kgs": round(float(ir_row[6]), 3),
+            "total_waste_kgs": round(float(ir_row[7]), 3),
+            "total_rejection_kgs": round(float(ir_row[8]), 3),
         })
 
     # Get sub_category (process type) from the already-fetched row (index 7)
@@ -1782,7 +1784,9 @@ def get_material_in_detail(
     cum_accounted = cum_fg + cum_waste + cum_rejection
     cum_unaccounted = max(0, dispatched_kgs - cum_accounted)
     cum_loss_pct = round((cum_accounted - cum_fg) / dispatched_kgs * 100, 2) if dispatched_kgs > 0 else 0
-    remaining_kgs = max(0, dispatched_kgs - cum_fg)
+    # Remaining = what is still pending to come back = dispatched − everything accounted
+    # (FG + waste + rejection). Waste/rejection already returned, so they are NOT remaining.
+    remaining_kgs = cum_unaccounted
 
     return {
         "receipt": {

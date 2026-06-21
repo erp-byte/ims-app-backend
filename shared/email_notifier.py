@@ -871,7 +871,7 @@ def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
     lchanges = summary.get("line_changes", {}) or {}
     bchanges = summary.get("box_changes", {}) or {}
     box_summary = summary.get("box_summary", {}) or {}
-    short = summary.get("short", {}) or {}
+    short = summary.get("short", []) or []
     AMBER = "background:#fff7ed;"
 
     def _delta(old, new):
@@ -943,20 +943,23 @@ def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
     # ── Box summary (per article; no per-box table) ──
     box_section = ""
     if box_summary:
-        rows, tot_boxes, tot_net = "", 0, 0.0
+        rows, tot_boxes, tot_net, tot_gross = "", 0.0, 0.0, 0.0
         for art, s in box_summary.items():
             tot_boxes += s["boxes"]
             tot_net += s["total_net"]
+            tot_gross += s.get("total_gross", 0.0)
             rows += (
                 f"<tr><td style='padding:6px 10px;border:1px solid #e0e0e0;'>{_esc(art)}</td>"
                 f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(s['boxes'])}</td>"
-                f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(s['total_net'])}</td></tr>"
+                f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(s['total_net'])}</td>"
+                f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(s.get('total_gross', 0.0))}</td></tr>"
             )
         rows += (
             f"<tr style='background:#e8edf5;font-weight:bold;'>"
             f"<td style='padding:6px 10px;border:1px solid #e0e0e0;'>Total</td>"
             f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(tot_boxes)}</td>"
-            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(tot_net)}</td></tr>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(tot_net)}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #e0e0e0;text-align:right;'>{_fmt_kg(tot_gross)}</td></tr>"
         )
         box_section = (
             "<h3 style='color:#29417A;margin:24px 0 8px;'>Box Summary</h3>"
@@ -964,54 +967,34 @@ def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
             "<thead><tr style='background:#29417A;color:#fff;'>"
             "<th style='padding:8px 10px;text-align:left;'>Article</th>"
             "<th style='padding:8px 10px;text-align:right;'>Boxes</th>"
-            "<th style='padding:8px 10px;text-align:right;'>Total Net Wt</th></tr></thead>"
+            "<th style='padding:8px 10px;text-align:right;'>Total Net Wt</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Total Gross Wt</th></tr></thead>"
             f"<tbody>{rows}</tbody></table>"
         )
 
-    # ── Short / short-weight ──
-    arts = short.get("articles", []) or []
-    sboxes = short.get("boxes", []) or []
+    # ── Short-weight breakdown: "<full> full, <short> short -- received vs expected" ──
     short_section = ""
-    if arts or sboxes:
-        art_tbl = ""
-        if arts:
-            r = "".join(
-                f"<tr><td style='padding:6px 10px;border:1px solid #fed7aa;'>{_esc(a['article'])}</td>"
-                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;'>{_fmt_kg(a['expected'])}</td>"
-                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;'>{_fmt_kg(a['actual'])}</td>"
-                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;color:#c0392b;font-weight:bold;'>-{_fmt_kg(a['shortfall'])}</td></tr>"
-                for a in arts
-            )
-            art_tbl = (
-                "<table style='border-collapse:collapse;width:100%;font-size:13px;margin-bottom:10px;'>"
-                "<thead><tr style='background:#e67e22;color:#fff;'>"
-                "<th style='padding:8px 10px;text-align:left;'>Article (short total)</th>"
-                "<th style='padding:8px 10px;text-align:right;'>Expected</th>"
-                "<th style='padding:8px 10px;text-align:right;'>Actual</th>"
-                "<th style='padding:8px 10px;text-align:right;'>Short by</th></tr></thead>"
-                f"<tbody>{r}</tbody></table>"
-            )
-        box_tbl = ""
-        if sboxes:
-            r = "".join(
-                f"<tr><td style='padding:6px 10px;border:1px solid #fed7aa;'>{_esc(b['article'])}</td>"
-                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:center;'>#{_esc(b['box_number'])}</td>"
-                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;'>{_fmt_kg(b['expected'])}</td>"
-                f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;color:#c0392b;font-weight:bold;'>{_fmt_kg(b['actual'])}</td></tr>"
-                for b in sboxes
-            )
-            box_tbl = (
-                "<table style='border-collapse:collapse;width:100%;font-size:13px;'>"
-                "<thead><tr style='background:#e67e22;color:#fff;'>"
-                "<th style='padding:8px 10px;text-align:left;'>Article</th>"
-                "<th style='padding:8px 10px;text-align:center;'>Box</th>"
-                "<th style='padding:8px 10px;text-align:right;'>Expected</th>"
-                "<th style='padding:8px 10px;text-align:right;'>Actual (short)</th></tr></thead>"
-                f"<tbody>{r}</tbody></table>"
-            )
+    if short:
+        r = "".join(
+            f"<tr><td style='padding:6px 10px;border:1px solid #fed7aa;'>{_esc(a['article'])}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:center;'>{_fmt_kg(a['full'])} full</td>"
+            f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:center;color:#c0392b;font-weight:bold;'>{_fmt_kg(a['short'])} short</td>"
+            f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;'>{_fmt_kg(a['received'])}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;'>{_fmt_kg(a['expected'])}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #fed7aa;text-align:right;color:#c0392b;font-weight:bold;'>-{_fmt_kg(a['shortfall'])}</td></tr>"
+            for a in short
+        )
         short_section = (
-            "<h3 style='color:#c0392b;margin:24px 0 8px;'>&#9888; Short / Short-Weight</h3>"
-            f"{art_tbl}{box_tbl}"
+            "<h3 style='color:#c0392b;margin:24px 0 8px;'>&#9888; Short-Weight</h3>"
+            "<table style='border-collapse:collapse;width:100%;font-size:13px;'>"
+            "<thead><tr style='background:#e67e22;color:#fff;'>"
+            "<th style='padding:8px 10px;text-align:left;'>Article</th>"
+            "<th style='padding:8px 10px;text-align:center;'>Full</th>"
+            "<th style='padding:8px 10px;text-align:center;'>Short</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Received (Net)</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Expected</th>"
+            "<th style='padding:8px 10px;text-align:right;'>Short by</th></tr></thead>"
+            f"<tbody>{r}</tbody></table>"
         )
 
     html = f"""<!DOCTYPE html>
@@ -1065,14 +1048,12 @@ def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
         pl.append("")
         pl.append("Box summary:")
         for art, s in box_summary.items():
-            pl.append(f"  {art}: {_fmt_kg(s['boxes'])} boxes, {_fmt_kg(s['total_net'])} kg")
-    if arts or sboxes:
+            pl.append(f"  {art}: {_fmt_kg(s['boxes'])} boxes, net {_fmt_kg(s['total_net'])} kg, gross {_fmt_kg(s.get('total_gross', 0.0))} kg")
+    if short:
         pl.append("")
-        pl.append("Short / short-weight:")
-        for a in arts:
-            pl.append(f"  {a['article']}: expected {_fmt_kg(a['expected'])}, actual {_fmt_kg(a['actual'])}, short {_fmt_kg(a['shortfall'])}")
-        for b in sboxes:
-            pl.append(f"  {b['article']} box #{b['box_number']}: expected {_fmt_kg(b['expected'])}, actual {_fmt_kg(b['actual'])}")
+        pl.append("Short-weight:")
+        for a in short:
+            pl.append(f"  {a['article']}: {_fmt_kg(a['full'])} full, {_fmt_kg(a['short'])} short -- received {_fmt_kg(a['received'])} kg vs expected {_fmt_kg(a['expected'])} kg (short {_fmt_kg(a['shortfall'])})")
     return html, "\n".join(pl)
 
 

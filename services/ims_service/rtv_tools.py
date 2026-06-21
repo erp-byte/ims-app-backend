@@ -110,10 +110,16 @@ def sync_cold_stocks_from_rtv(company: Company, rtv_id_int: int, db: Session) ->
                 :rtv_date, :unit, :rtv_str,
                 COALESCE(b.item_mark, l.item_mark), COALESCE(b.vakkal, l.vakkal),
                 COALESCE(b.lot_number, l.lot_number),
-                1, b.net_weight, b.net_weight, l.item_category,
+                -- no_of_cartons = count (units the row represents; default 1).
+                -- total_inventory_kgs = count x net_weight; weight_kg stays per-carton.
+                -- count<=0/NULL -> 1, so ordinary count=1 rows are byte-identical to before.
+                GREATEST(COALESCE(b.count, 1), 1),
+                b.net_weight,
+                b.net_weight * GREATEST(COALESCE(b.count, 1), 1),
+                l.item_category,
                 l.item_description, :wh, :exporter, l.rate,
                 b.box_id, :rtv_str, l.sub_category, COALESCE(b.item_mark, l.item_mark),
-                ROUND(COALESCE(b.net_weight, 0) * COALESCE(l.rate, 0), 2),
+                ROUND(COALESCE(b.net_weight, 0) * GREATEST(COALESCE(b.count, 1), 1) * COALESCE(l.rate, 0), 2),
                 :rtv_str, true, COALESCE(b.spl_remarks, l.spl_remarks),
                 :wh, l.item_category, l.sub_category
             FROM {tables['boxes']} b
@@ -931,16 +937,20 @@ def _norm(v) -> str:
     return f"{f:g}" if f is not None else str(v).strip()
 
 
-def rtv_box_summary_and_short(detail: dict) -> tuple[dict, dict]:
-    """Per-article box summary + short/short-weight flags for a CR detail.
+def rtv_box_summary_and_short(detail: dict) -> tuple[dict, list]:
+    """Per-article box summary (what was received) + short-weight breakdown.
 
-    A box row carries ``count`` (number of units it represents; defaults to 1)
-    and a per-unit ``net_weight``, mirroring the approve-screen rule
-    ``conversion = count x uom``. Totals therefore aggregate BY COUNT, not by row:
-        boxes  = Sum(count)
-        weight = Sum(count x net_weight)
-    For ordinary count=1 rows this is identical to (#rows, Sum(net_weight)).
-    Expected weight uses the line's per-unit ``uom``: Sum(count x uom)."""
+    A box row's ``count`` is the number of boxes it represents (default 1) with a
+    per-box net/gross weight. Per article we total:
+        boxes        = Sum(count)
+        total_net    = Sum(count x net_weight)
+        total_gross  = Sum(count x gross_weight)
+        full         = Sum(count) for rows at/above the expected per-box weight (uom)
+        short        = Sum(count) for rows below it
+        expected     = Sum(count x uom)
+    For ordinary count=1 rows the totals equal (#rows, Sum(net), Sum(gross)).
+    The returned short list (one entry per article that has any short box) drives
+    the "<full> full, <short> short -- received vs expected" line in the mail."""
     lines = detail.get("lines", []) or []
     boxes = detail.get("boxes", []) or []
     line_by_art: dict = {}
@@ -951,47 +961,40 @@ def rtv_box_summary_and_short(detail: dict) -> tuple[dict, dict]:
         c = _to_float(b.get("count"))
         return c if (c is not None and c > 0) else 1.0
 
-    box_summary: dict = {}          # art -> {boxes, total_net}
-    expected_by_art: dict = {}      # art -> Sum(count x uom)
+    box_summary: dict = {}
     for b in boxes:
         art = b.get("article_description", "") or ""
         cnt = _box_count(b)
         nw = _to_float(b.get("net_weight")) or 0.0
+        gw = _to_float(b.get("gross_weight")) or 0.0
         uom = _to_float((line_by_art.get(art) or {}).get("uom"))
-        s = box_summary.setdefault(art, {"boxes": 0.0, "total_net": 0.0})
+        s = box_summary.setdefault(art, {
+            "boxes": 0.0, "total_net": 0.0, "total_gross": 0.0,
+            "full": 0.0, "short": 0.0, "expected": 0.0,
+        })
         s["boxes"] += cnt
         s["total_net"] += cnt * nw
-        if uom is not None:
-            expected_by_art[art] = expected_by_art.get(art, 0.0) + cnt * uom
+        s["total_gross"] += cnt * gw
+        if uom is not None and uom > 0:
+            s["expected"] += cnt * uom
+            if nw + 1e-6 < uom:        # per-box net below the expected per-box weight
+                s["short"] += cnt
+            else:
+                s["full"] += cnt
+        else:
+            s["full"] += cnt            # no expected weight to judge against
 
-    article_short = []
+    short = []
     for art, s in box_summary.items():
-        expected = expected_by_art.get(art, 0.0)
-        if expected > 0 and s["total_net"] + 1e-6 < expected:
-            article_short.append({
-                "article": art, "expected": expected,
-                "actual": s["total_net"], "shortfall": expected - s["total_net"],
+        if s["short"] > 0:
+            short.append({
+                "article": art,
+                "full": s["full"], "short": s["short"],
+                "received": s["total_net"], "expected": s["expected"],
+                "shortfall": max(s["expected"] - s["total_net"], 0.0),
             })
 
-    short_boxes = []
-    for b in boxes:
-        art = b.get("article_description", "") or ""
-        l = line_by_art.get(art)
-        if not l:
-            continue
-        uom = _to_float(l.get("uom"))
-        nw = _to_float(b.get("net_weight"))
-        if uom is None or nw is None:
-            continue
-        cnt = _box_count(b)
-        # per-unit net below the expected per-unit weight (uom) => underweight row
-        if nw + 1e-6 < uom:
-            short_boxes.append({
-                "article": art, "box_number": b.get("box_number"),
-                "expected": uom * cnt, "actual": nw * cnt,
-            })
-
-    return box_summary, {"articles": article_short, "boxes": short_boxes}
+    return box_summary, short
 
 
 _HEADER_DIFF_LABELS = {

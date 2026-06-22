@@ -27,7 +27,7 @@ logger = get_logger("ims.interunit")
 # Cold destinations that must route through /interunit/cold-transfer-in/* instead
 # of the legacy /transfer-in endpoints (2026-06-06). Umbrella label "Cold Storage"
 # excluded — IN-side receiving_warehouse is always a concrete sub-warehouse.
-_COLD_DEST_LOWER = {"savla d-39", "savla d-514", "rishi", "supreme"}
+_COLD_DEST_LOWER = {"savla d-39", "savla d-514", "rishi", "supreme", "eskimo"}
 
 
 def _is_cold_destination_name(name: Optional[str]) -> bool:
@@ -50,6 +50,7 @@ _COLD_UNIT_ALIASES: dict[str, set[str]] = {
     "Savla D-514": {"d-514", "d514", "savla d-514", "savla d514", "savla-d-514"},
     "Rishi":       {"rishi", "rishi cold"},
     "Supreme Cold":{"supreme", "supreme cold"},
+    "Eskimo":      {"eskimo", "eskimo cold"},
 }
 
 # Reverse lookup: alias-key (lowercased, stripped) → canonical

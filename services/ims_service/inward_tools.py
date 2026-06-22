@@ -619,6 +619,7 @@ _WAREHOUSE_ALIASES: dict[str, list[str]] = {
     ],
     "Rishi": ["rishi", "rishi cold", "rishi cold storage", "rishi cold storage pvt ltd"],
     "Supreme": ["supreme", "supreme cold", "supreme cold storage"],
+    "Eskimo": ["eskimo", "eskimo cold", "eskimo cold storage"],
 }
 
 def _warehouse_aliases(canonical: str) -> list[str]:
@@ -1988,9 +1989,9 @@ def create_inward_bulk_sticker(payload, db: Session) -> dict:
     #    This mirrors what bulk_entry_service.create_bulk_entry does.
     _wh = (getattr(t, "warehouse", None) or "").strip()
     _wl = _wh.lower()
-    if _wl.startswith("savla") or _wl.startswith("rishi") or _wl.startswith("supreme"):
+    if _wl.startswith("savla") or _wl.startswith("rishi") or _wl.startswith("supreme") or _wl.startswith("eskimo"):
         _cold_table = f"{'cfpl' if payload.company == 'CFPL' else 'cdpl'}_cold_stocks"
-        _unit_map = {"Savla D-39": "D-39", "Savla D-514": "D-514", "Rishi": "Rishi", "Supreme": "Supreme"}
+        _unit_map = {"Savla D-39": "D-39", "Savla D-514": "D-514", "Rishi": "Rishi", "Supreme": "Supreme", "Eskimo": "Eskimo"}
         _unit = _unit_map.get(_wh, _wh)
         cold_rows = []
         for article, art_group in zip(payload.articles, all_box_groups):
@@ -2821,13 +2822,14 @@ _COLD_UNIT_MAP = {
     "Savla D-514": "D-514",
     "Rishi": "Rishi",
     "Supreme": "Supreme",
+    "Eskimo": "Eskimo",
 }
 
 
 def _is_cold_warehouse(warehouse) -> bool:
     """True for cold storage destinations (Savla*/Rishi/Supreme) that mirror to *_cold_stocks."""
     w = (warehouse or "").strip().lower()
-    return w.startswith("savla") or w.startswith("rishi") or w.startswith("supreme")
+    return w.startswith("savla") or w.startswith("rishi") or w.startswith("supreme") or w.startswith("eskimo")
 
 
 def sync_cold_stocks_from_inward(

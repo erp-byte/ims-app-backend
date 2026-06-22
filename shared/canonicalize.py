@@ -27,6 +27,7 @@ CANONICAL_WAREHOUSES = {
     "Savla D-514",
     "Rishi",
     "Supreme",
+    "Eskimo",
     "W202",
     "A101",
     "A185",
@@ -61,6 +62,10 @@ WAREHOUSE_ALIASES: dict[str, str] = {
     "supreme": "Supreme",
     "supreme cold": "Supreme",
     "supreme cold storage": "Supreme",
+    # Eskimo
+    "eskimo": "Eskimo",
+    "eskimo cold": "Eskimo",
+    "eskimo cold storage": "Eskimo",
     # Regular warehouses (case variants)
     "w202": "W202",
     "warehouse w202": "W202",

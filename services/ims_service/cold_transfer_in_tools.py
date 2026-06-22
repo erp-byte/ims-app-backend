@@ -23,9 +23,9 @@ from sqlalchemy.orm import Session
 
 
 # ── Cold-destination routing ────────────────────────────────────────────
-COLD_DESTINATIONS = {"savla d-39", "savla d-514", "rishi", "supreme"}
+COLD_DESTINATIONS = {"savla d-39", "savla d-514", "rishi", "supreme", "eskimo"}
 CFPL_COLD_DESTS = {"savla d-39", "savla d-514"}
-CDPL_COLD_DESTS = {"rishi", "supreme"}
+CDPL_COLD_DESTS = {"rishi", "supreme", "eskimo"}
 
 
 def _is_cold_destination(name: Optional[str]) -> bool:

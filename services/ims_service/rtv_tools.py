@@ -61,6 +61,7 @@ _RTV_COLD_UNIT_MAP = {
     "Savla D-514": "D-514",
     "Rishi": "Rishi",
     "Supreme": "Supreme",
+    "Eskimo": "Eskimo",
 }
 
 

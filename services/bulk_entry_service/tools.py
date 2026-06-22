@@ -347,11 +347,38 @@ def list_bulk_entries(
     params["limit"] = per_page
     params["offset"] = offset
 
+    # Enrich each row with article/box aggregates (net/gross/boxes + item lists) so the
+    # cold-storage list can show the same hover card as the inward list. LATERAL joins keep
+    # DISTINCT counts correct and mirror list_inward_records.
+    item_case = (
+        "CASE "
+        "WHEN a.net_weight IS NOT NULL AND a.net_weight > 0 THEN ' (' || ROUND(a.net_weight::numeric, 2)::text || ' kg)' "
+        "WHEN a.quantity_units IS NOT NULL AND a.uom IS NOT NULL THEN ' (' || a.quantity_units::text || ' ' || a.uom || ')' "
+        "WHEN a.quantity_units IS NOT NULL THEN ' (' || a.quantity_units::text || ')' "
+        "ELSE '' END"
+    )
     rows = db.execute(
         text(
-            f"SELECT * FROM {tables['tx']} "
+            f"SELECT t.*, "
+            f"  agg.net_weight AS agg_net_weight, "
+            f"  agg.total_weight AS agg_total_weight, "
+            f"  agg.item_descriptions_text AS agg_item_desc, "
+            f"  agg.article_items_with_qty_text AS agg_items_qty, "
+            f"  bx.box_count AS agg_box_count "
+            f"FROM {tables['tx']} t "
+            f"LEFT JOIN LATERAL ( "
+            f"  SELECT SUM(a.net_weight) AS net_weight, SUM(a.total_weight) AS total_weight, "
+            f"    STRING_AGG(DISTINCT a.item_description, chr(10) ORDER BY a.item_description) AS item_descriptions_text, "
+            f"    STRING_AGG(DISTINCT a.item_description || {item_case}, chr(10) ORDER BY a.item_description || {item_case}) "
+            f"      FILTER (WHERE a.item_description IS NOT NULL) AS article_items_with_qty_text "
+            f"  FROM {tables['art']} a WHERE a.transaction_no = t.transaction_no "
+            f") agg ON TRUE "
+            f"LEFT JOIN LATERAL ( "
+            f"  SELECT COUNT(DISTINCT b.box_number) AS box_count "
+            f"  FROM {tables['box']} b WHERE b.transaction_no = t.transaction_no "
+            f") bx ON TRUE "
             f"WHERE {where} "
-            f"ORDER BY {sort_by} {sort_order} "
+            f"ORDER BY t.{sort_by} {sort_order} "
             f"LIMIT :limit OFFSET :offset"
         ),
         params,
@@ -359,8 +386,21 @@ def list_bulk_entries(
 
     total_pages = (total + per_page - 1) // per_page if per_page > 0 else 0
 
+    def _split_lines(s):
+        return [x.strip() for x in s.split("\n") if x.strip()] if s else []
+
+    records = []
+    for r in rows:
+        d = _map_tx_row(r)
+        d["net_weight"] = _safe_float(r.agg_net_weight)
+        d["total_weight"] = _safe_float(r.agg_total_weight)
+        d["box_count"] = int(r.agg_box_count) if r.agg_box_count is not None else None
+        d["item_descriptions"] = _split_lines(r.agg_item_desc)
+        d["article_items_with_qty"] = _split_lines(r.agg_items_qty)
+        records.append(d)
+
     return {
-        "records": [_map_tx_row(r) for r in rows],
+        "records": records,
         "total": total,
         "page": page,
         "per_page": per_page,

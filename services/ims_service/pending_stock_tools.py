@@ -43,6 +43,8 @@ COLD_STORAGE_SITE_NAMES = {
     "savla d-514",
     "savla d-514 cold",
     "supreme",
+    "eskimo",
+    "eskimo cold",
 }
 
 

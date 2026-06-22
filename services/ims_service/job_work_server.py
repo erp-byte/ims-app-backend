@@ -364,7 +364,7 @@ def _resolve_cold_table(cold_unit: str):
     # Map display names to table
     if "savla" in cu or "d-39" in cu or "d39" in cu:
         return "cfpl_cold_stocks"
-    if "rishi" in cu:
+    if "rishi" in cu or "eskimo" in cu:
         return "cdpl_cold_stocks"
     return None
 
@@ -2531,19 +2531,23 @@ def job_work_dashboard(
 
     where_h = "WHERE 1=1" + ("".join(f" AND {c}" for c in date_conditions))
 
-    # Combined line-filter join (item description AND/OR inventory group) used by
-    # header-level aggregations; keeps DISTINCT h.id counts correct.
-    filter_conds = []
+    # Header qualification for item/group filters is applied via EXISTS (not a JOIN) so a
+    # header with multiple matching lines is not multiplied — which would inflate the
+    # SUM(net_weight) KPIs and the status COUNT(*). Line-level breakdowns that GROUP BY a
+    # line column (by_item, by_group, vendor_item_matrix) additionally use `li_where`.
+    exist_conds = []
     if item:
-        filter_conds.append("LOWER(l_filter.item_description) LIKE LOWER(:item_filter)")
+        exist_conds.append("LOWER(lf.item_description) LIKE LOWER(:item_filter)")
         params["item_filter"] = f"%{item}%"
     if group:
         if group.strip().upper() == "UNGROUPED":
-            filter_conds.append("(l_filter.item_category IS NULL OR l_filter.item_category = '')")
+            exist_conds.append("(lf.item_category IS NULL OR lf.item_category = '')")
         else:
-            filter_conds.append("UPPER(l_filter.item_category) = UPPER(:group_filter)")
+            exist_conds.append("UPPER(lf.item_category) = UPPER(:group_filter)")
             params["group_filter"] = group.strip()
-    item_join = (" JOIN jb_materialout_lines l_filter ON l_filter.header_id = h.id AND " + " AND ".join(filter_conds)) if filter_conds else ""
+    if exist_conds:
+        where_h += " AND EXISTS (SELECT 1 FROM jb_materialout_lines lf WHERE lf.header_id = h.id AND " + " AND ".join(exist_conds) + ")"
+    item_join = ""  # filter now lives in where_h via EXISTS; no join needed (avoids fan-out)
     # Inline predicate for queries that already JOIN jb_materialout_lines AS l directly.
     li_where = ""
     if item:

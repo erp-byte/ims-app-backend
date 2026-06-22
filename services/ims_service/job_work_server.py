@@ -630,7 +630,10 @@ def submit_material_out(
                  batch_number, lot_number, manufacturing_date, expiry_date, line_remarks,
                  box_id, transaction_no, cold_unit, item_mark)
             VALUES
-                (:header_id, :sl_no, :item_description, :material_type, :item_category, :sub_category,
+                (:header_id, :sl_no, :item_description, :material_type,
+                 COALESCE(NULLIF(:item_category, ''), (SELECT UPPER(item_group) FROM all_sku
+                     WHERE UPPER(TRIM(particulars)) = UPPER(TRIM(:item_description))
+                       AND item_group IS NOT NULL AND item_group <> '' LIMIT 1)), :sub_category,
                  :quantity_kgs, :quantity_boxes, :rate_per_kg, :amount,
                  :uom, :case_pack, :net_weight, :total_weight,
                  :batch_number, :lot_number, :manufacturing_date, :expiry_date, :line_remarks,
@@ -758,7 +761,10 @@ def update_material_out(
                  batch_number, lot_number, manufacturing_date, expiry_date, line_remarks,
                  box_id, transaction_no, cold_unit, item_mark)
             VALUES
-                (:header_id, :sl_no, :item_description, :material_type, :item_category, :sub_category,
+                (:header_id, :sl_no, :item_description, :material_type,
+                 COALESCE(NULLIF(:item_category, ''), (SELECT UPPER(item_group) FROM all_sku
+                     WHERE UPPER(TRIM(particulars)) = UPPER(TRIM(:item_description))
+                       AND item_group IS NOT NULL AND item_group <> '' LIMIT 1)), :sub_category,
                  :quantity_kgs, :quantity_boxes, :rate_per_kg, :amount,
                  :uom, :case_pack, :net_weight, :total_weight,
                  :batch_number, :lot_number, :manufacturing_date, :expiry_date, :line_remarks,
@@ -866,9 +872,16 @@ def list_job_work_records(
                (SELECT COUNT(*)
                 FROM jb_work_inward_receipt ir
                 WHERE ir.header_id = h.id) as receipt_count,
-               (SELECT string_agg(DISTINCT UPPER(l7.item_category), ', ')
+               (SELECT string_agg(DISTINCT UPPER(COALESCE(NULLIF(l7.item_category, ''), s7.item_group)), ', ')
                 FROM jb_materialout_lines l7
-                WHERE l7.header_id = h.id AND l7.item_category IS NOT NULL AND l7.item_category <> '') as item_groups
+                LEFT JOIN LATERAL (
+                    SELECT item_group FROM all_sku
+                    WHERE UPPER(TRIM(particulars)) = UPPER(TRIM(l7.item_description))
+                      AND item_group IS NOT NULL AND item_group <> '' LIMIT 1
+                ) s7 ON true
+                WHERE l7.header_id = h.id
+                  AND COALESCE(NULLIF(l7.item_category, ''), s7.item_group) IS NOT NULL
+                  AND COALESCE(NULLIF(l7.item_category, ''), s7.item_group) <> '') as item_groups
         FROM jb_materialout_header h
         {where_sql}
         ORDER BY h.created_at DESC
@@ -2539,11 +2552,17 @@ def job_work_dashboard(
     if item:
         exist_conds.append("LOWER(lf.item_description) LIKE LOWER(:item_filter)")
         params["item_filter"] = f"%{item}%"
+    # Resolved inventory group = stored item_category, else the all_sku group for the item.
+    def _resolved_grp(alias: str) -> str:
+        return (f"COALESCE(NULLIF(UPPER({alias}.item_category), ''), "
+                f"(SELECT UPPER(asx.item_group) FROM all_sku asx "
+                f"WHERE UPPER(TRIM(asx.particulars)) = UPPER(TRIM({alias}.item_description)) "
+                f"AND asx.item_group IS NOT NULL AND asx.item_group <> '' LIMIT 1))")
     if group:
         if group.strip().upper() == "UNGROUPED":
-            exist_conds.append("(lf.item_category IS NULL OR lf.item_category = '')")
+            exist_conds.append(f"{_resolved_grp('lf')} IS NULL")
         else:
-            exist_conds.append("UPPER(lf.item_category) = UPPER(:group_filter)")
+            exist_conds.append(f"{_resolved_grp('lf')} = UPPER(:group_filter)")
             params["group_filter"] = group.strip()
     if exist_conds:
         where_h += " AND EXISTS (SELECT 1 FROM jb_materialout_lines lf WHERE lf.header_id = h.id AND " + " AND ".join(exist_conds) + ")"
@@ -2554,9 +2573,9 @@ def job_work_dashboard(
         li_where += " AND LOWER(l.item_description) LIKE LOWER(:item_filter)"
     if group:
         if group.strip().upper() == "UNGROUPED":
-            li_where += " AND (l.item_category IS NULL OR l.item_category = '')"
+            li_where += f" AND {_resolved_grp('l')} IS NULL"
         else:
-            li_where += " AND UPPER(l.item_category) = UPPER(:group_filter)"
+            li_where += f" AND {_resolved_grp('l')} = UPPER(:group_filter)"
 
     # ── 1. Summary KPIs ──
     summary = db.execute(text(f"""
@@ -2681,16 +2700,21 @@ def job_work_dashboard(
     # ── 6b. By Inventory Group (item_category) ──
     group_rows = db.execute(text(f"""
         SELECT
-            COALESCE(NULLIF(UPPER(l.item_category), ''), 'UNGROUPED') as grp,
+            COALESCE(NULLIF(UPPER(l.item_category), ''), UPPER(s.item_group), 'UNGROUPED') as grp,
             COUNT(DISTINCT h.id) as jwo_count,
             COALESCE(SUM(CAST(l.net_weight AS NUMERIC)), 0) as dispatched_kgs,
             SUM(l.quantity_boxes) as total_boxes,
             COUNT(DISTINCT l.item_description) as item_count
         FROM jb_materialout_header h
         JOIN jb_materialout_lines l ON l.header_id = h.id
+        LEFT JOIN LATERAL (
+            SELECT item_group FROM all_sku
+            WHERE UPPER(TRIM(particulars)) = UPPER(TRIM(l.item_description))
+              AND item_group IS NOT NULL AND item_group <> '' LIMIT 1
+        ) s ON true
         {where_h}
         {li_where}
-        GROUP BY COALESCE(NULLIF(UPPER(l.item_category), ''), 'UNGROUPED')
+        GROUP BY COALESCE(NULLIF(UPPER(l.item_category), ''), UPPER(s.item_group), 'UNGROUPED')
         ORDER BY dispatched_kgs DESC
     """), params).fetchall()
 
@@ -2745,7 +2769,16 @@ def job_work_dashboard(
     sub_cats = db.execute(text("SELECT DISTINCT sub_category FROM jb_materialout_header WHERE sub_category IS NOT NULL AND sub_category != '' ORDER BY sub_category")).fetchall()
     vendors_list = db.execute(text("SELECT DISTINCT to_party FROM jb_materialout_header WHERE to_party IS NOT NULL AND to_party != '' ORDER BY to_party")).fetchall()
     items_list = db.execute(text("SELECT DISTINCT item_description FROM jb_materialout_lines WHERE item_description IS NOT NULL AND item_description != '' ORDER BY item_description")).fetchall()
-    groups_list = db.execute(text("SELECT DISTINCT COALESCE(NULLIF(UPPER(item_category), ''), 'UNGROUPED') AS grp FROM jb_materialout_lines ORDER BY grp")).fetchall()
+    groups_list = db.execute(text("""
+        SELECT DISTINCT COALESCE(NULLIF(UPPER(l.item_category), ''), UPPER(s.item_group), 'UNGROUPED') AS grp
+        FROM jb_materialout_lines l
+        LEFT JOIN LATERAL (
+            SELECT item_group FROM all_sku
+            WHERE UPPER(TRIM(particulars)) = UPPER(TRIM(l.item_description))
+              AND item_group IS NOT NULL AND item_group <> '' LIMIT 1
+        ) s ON true
+        ORDER BY grp
+    """)).fetchall()
 
     return {
         "summary": {

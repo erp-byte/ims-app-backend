@@ -111,16 +111,13 @@ def sync_cold_stocks_from_rtv(company: Company, rtv_id_int: int, db: Session) ->
                 :rtv_date, :unit, :rtv_str,
                 COALESCE(b.item_mark, l.item_mark), COALESCE(b.vakkal, l.vakkal),
                 COALESCE(b.lot_number, l.lot_number),
-                -- no_of_cartons = count (units the row represents; default 1).
-                -- total_inventory_kgs = count x net_weight; weight_kg stays per-carton.
-                -- count<=0/NULL -> 1, so ordinary count=1 rows are byte-identical to before.
-                GREATEST(COALESCE(b.count, 1), 1),
-                b.net_weight,
-                b.net_weight * GREATEST(COALESCE(b.count, 1), 1),
-                l.item_category,
+                -- ONE box row = ONE carton; net_weight is that box's net. The box
+                -- `count` field is a per-box piece count for the label, NOT a
+                -- box/weight multiplier (matches the approve screen).
+                1, b.net_weight, b.net_weight, l.item_category,
                 l.item_description, :wh, :exporter, l.rate,
                 b.box_id, :rtv_str, l.sub_category, COALESCE(b.item_mark, l.item_mark),
-                ROUND(COALESCE(b.net_weight, 0) * GREATEST(COALESCE(b.count, 1), 1) * COALESCE(l.rate, 0), 2),
+                ROUND(COALESCE(b.net_weight, 0) * COALESCE(l.rate, 0), 2),
                 :rtv_str, true, COALESCE(b.spl_remarks, l.spl_remarks),
                 :wh, l.item_category, l.sub_category
             FROM {tables['boxes']} b
@@ -941,15 +938,15 @@ def _norm(v) -> str:
 def rtv_box_summary_and_short(detail: dict) -> tuple[dict, list]:
     """Per-article box summary (what was received) + short-weight breakdown.
 
-    A box row's ``count`` is the number of boxes it represents (default 1) with a
-    per-box net/gross weight. Per article we total:
-        boxes        = Sum(count)
-        total_net    = Sum(count x net_weight)
-        total_gross  = Sum(count x gross_weight)
-        full         = Sum(count) for rows at/above the expected per-box weight (uom)
-        short        = Sum(count) for rows below it
-        expected     = Sum(count x uom)
-    For ordinary count=1 rows the totals equal (#rows, Sum(net), Sum(gross)).
+    ONE box row = ONE box; ``net_weight``/``gross_weight`` are that box's weights.
+    The per-box ``count`` field is a piece count for the label, NOT a box/weight
+    multiplier (this matches the approve screen, which counts rows and sums net).
+    Per article:
+        boxes        = number of box rows
+        total_net    = Sum(net_weight)
+        total_gross  = Sum(gross_weight)
+        full / short = rows at/above vs below the expected per-box weight (uom)
+        expected     = Sum(uom) over the rows
     The returned short list (one entry per article that has any short box) drives
     the "<full> full, <short> short -- received vs expected" line in the mail."""
     lines = detail.get("lines", []) or []
@@ -958,32 +955,27 @@ def rtv_box_summary_and_short(detail: dict) -> tuple[dict, list]:
     for l in lines:
         line_by_art.setdefault(l.get("item_description"), l)
 
-    def _box_count(b) -> float:
-        c = _to_float(b.get("count"))
-        return c if (c is not None and c > 0) else 1.0
-
     box_summary: dict = {}
     for b in boxes:
         art = b.get("article_description", "") or ""
-        cnt = _box_count(b)
         nw = _to_float(b.get("net_weight")) or 0.0
         gw = _to_float(b.get("gross_weight")) or 0.0
         uom = _to_float((line_by_art.get(art) or {}).get("uom"))
         s = box_summary.setdefault(art, {
-            "boxes": 0.0, "total_net": 0.0, "total_gross": 0.0,
-            "full": 0.0, "short": 0.0, "expected": 0.0,
+            "boxes": 0, "total_net": 0.0, "total_gross": 0.0,
+            "full": 0, "short": 0, "expected": 0.0,
         })
-        s["boxes"] += cnt
-        s["total_net"] += cnt * nw
-        s["total_gross"] += cnt * gw
+        s["boxes"] += 1                  # one row = one box
+        s["total_net"] += nw
+        s["total_gross"] += gw
         if uom is not None and uom > 0:
-            s["expected"] += cnt * uom
-            if nw + 1e-6 < uom:        # per-box net below the expected per-box weight
-                s["short"] += cnt
+            s["expected"] += uom
+            if nw + 1e-6 < uom:          # this box is under the expected per-box weight
+                s["short"] += 1
             else:
-                s["full"] += cnt
+                s["full"] += 1
         else:
-            s["full"] += cnt            # no expected weight to judge against
+            s["full"] += 1                # no expected weight to judge against
 
     short = []
     for art, s in box_summary.items():

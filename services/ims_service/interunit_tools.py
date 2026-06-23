@@ -565,6 +565,10 @@ def _map_box_row(row) -> dict:
         "updated_at": row.updated_at,
         "source_storage": getattr(row, "source_storage", None) or None,
         "source_unit": getattr(row, "source_unit", None) or None,
+        # From the parent line so the hover/DC can show piece Count for PM/packaging box transfers.
+        "unit_pack_size": str(row.unit_pack_size) if getattr(row, "unit_pack_size", None) is not None else None,
+        "rm_pm_fg_type": getattr(row, "rm_pm_fg_type", None),
+        "item_category": getattr(row, "item_category", None),
     }
 
 
@@ -596,6 +600,9 @@ def _fetch_boxes(db: Session, header_id: int) -> list:
                    itb.box_id, itb.article, itb.lot_number, itb.batch_number,
                    itb.transaction_no, itb.net_weight, itb.gross_weight,
                    itb.created_at, itb.updated_at,
+                   l.unit_pack_size AS unit_pack_size,
+                   l.rm_pm_fg_type AS rm_pm_fg_type,
+                   l.item_category AS item_category,
                    pts.cold_storage_data->>'storage_location' AS source_storage,
                    CASE
                      WHEN LOWER(pts.cold_storage_data->>'unit') IN ('d-39','d39','savla d-39','savla d39','savla-d-39') THEN 'Savla D-39'
@@ -605,6 +612,8 @@ def _fetch_boxes(db: Session, header_id: int) -> list:
                      ELSE pts.cold_storage_data->>'unit'
                    END AS source_unit
             FROM interunit_transfer_boxes itb
+            LEFT JOIN interunit_transfers_lines l
+                ON l.id = itb.transfer_line_id
             LEFT JOIN pending_transfer_stock pts
                 ON pts.box_id = itb.box_id AND pts.status = 'In Transit'
             WHERE itb.header_id = :hid
@@ -970,6 +979,50 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
             ).fetchone()
             boxes.append(box_row)
 
+    # ── Boxes are authoritative for WAREHOUSE-source scans ──
+    # The frontend can send a typed qty and/or several duplicate article lines that don't
+    # match the physically-scanned boxes (root cause of TRANS202606231040: 3 lines x qty 34
+    # + 3 boxes -> DC qty 102 and 102 phantom pending units). For non-cold sources, rebuild
+    # each scanned article's line from its actual boxes: qty = box count, net/total = summed
+    # box weights, keep the real (max) unit_pack_size, reattach the article's boxes to one
+    # line, and drop duplicate lines. Cold sources are untouched (boxes are artifacts there).
+    if data.boxes and not _is_cold_site(data.header.from_warehouse):
+        agg: dict = {}
+        for b in data.boxes:
+            k = (b.article or "").strip().upper()
+            a = agg.setdefault(k, {"n": 0, "net": 0.0, "gross": 0.0})
+            a["n"] += 1
+            a["net"] += float(b.net_weight or 0)
+            a["gross"] += float(b.gross_weight or 0)
+        for k, a in agg.items():
+            art_lines = [l for l in lines if (l.item_desc_raw or "").strip().upper() == k]
+            if not art_lines:
+                continue
+            keep = art_lines[0]
+            ups = max([float(l.unit_pack_size or 0) for l in art_lines] + [0.0])
+            db.execute(
+                text("UPDATE interunit_transfer_boxes SET transfer_line_id = :lid "
+                     "WHERE header_id = :h AND UPPER(TRIM(article)) = :k"),
+                {"lid": keep.id, "h": header_id, "k": k},
+            )
+            db.execute(
+                text("UPDATE interunit_transfers_lines SET qty = :q, net_weight = :net, "
+                     "total_weight = :gross, unit_pack_size = :ups WHERE id = :id"),
+                {"q": a["n"], "net": round(a["net"], 3), "gross": round(a["gross"], 3),
+                 "ups": ups, "id": keep.id},
+            )
+            dup_ids = [l.id for l in art_lines[1:]]
+            if dup_ids:
+                db.execute(text("DELETE FROM interunit_transfers_lines WHERE id = ANY(:ids)"),
+                           {"ids": dup_ids})
+        lines = db.execute(
+            text("SELECT id, header_id, rm_pm_fg_type, item_category, sub_category, "
+                 "item_desc_raw, pack_size, qty, uom, unit_pack_size, net_weight, "
+                 "total_weight, batch_number, lot_number, vakkal, created_at, updated_at "
+                 "FROM interunit_transfers_lines WHERE header_id = :h ORDER BY id"),
+            {"h": header_id},
+        ).fetchall()
+
     # Line weights are already set correctly from frontend per-box values.
     # Each line represents one box entry   no need to sum box weights back into lines.
 
@@ -1015,18 +1068,17 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
     # MIXED scan + manual: park ALSO the lines that have no scanned/derived box, so
     # manually-filled entries are NEVER dropped. The old `elif lines` skipped line parking
     # whenever ANY box was scanned → manual stock vanished + transfer went Partial.
-    # Coverage is counted per (article, lot); each article entry == 1 box in this form.
-    _covered: dict = {}
-    for _b in (data.boxes or []):
-        _k = ((_b.article or "").strip().upper(), (_b.lot_number or "").strip())
-        _covered[_k] = _covered.get(_k, 0) + 1
-    uncovered_lines = []
-    for _l in lines:
-        _k = ((_l.item_desc_raw or "").strip().upper(), (_l.lot_number or "").strip())
-        if _covered.get(_k, 0) > 0:
-            _covered[_k] -= 1            # this line's box was scanned / auto-derived
-        else:
-            uncovered_lines.append(_l)   # manual / unscanned → park box-less so it isn't lost
+    # A line is "covered" (its stock is parked via boxes) iff it has boxes attached. This is
+    # robust regardless of lot text — an "N/A" box lot vs an empty line lot previously left a
+    # box-covered line "uncovered" and double-parked it as phantom units (the 102-row bug).
+    covered_line_ids = set(
+        r[0] for r in db.execute(
+            text("SELECT DISTINCT transfer_line_id FROM interunit_transfer_boxes "
+                 "WHERE header_id = :h AND transfer_line_id IS NOT NULL"),
+            {"h": header_id},
+        )
+    )
+    uncovered_lines = [l for l in lines if l.id not in covered_line_ids]
     if uncovered_lines:
         park_lines_in_pending(
             transfer_out_id=header_id,

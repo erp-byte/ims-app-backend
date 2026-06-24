@@ -1007,7 +1007,8 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
             )
             db.execute(
                 text("UPDATE interunit_transfers_lines SET qty = :q, net_weight = :net, "
-                     "total_weight = :gross, unit_pack_size = :ups WHERE id = :id"),
+                     "total_weight = :gross, unit_pack_size = :ups, "
+                     "uom = COALESCE(NULLIF(TRIM(uom), ''), 'BOX') WHERE id = :id"),
                 {"q": a["n"], "net": round(a["net"], 3), "gross": round(a["gross"], 3),
                  "ups": ups, "id": keep.id},
             )

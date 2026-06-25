@@ -1574,6 +1574,7 @@ def submit_material_in(
     # Query cumulative data for the enriched Material In email
     challan_summary = []
     all_ir_lines = []
+    ir_article_breakdown = []
     if header_id:
         try:
             summary_rows = db.execute(text("""
@@ -1620,6 +1621,28 @@ def submit_material_in(
                 }
                 for r in ir_rows
             ]
+
+            # FG kgs grouped by the inward article the QR/FG box was generated in.
+            # Drives the per-article FG bifurcation in the Challan IR History card.
+            article_rows = db.execute(text("""
+                SELECT r.ir_number, b.item_description AS article,
+                       SUM(b.net_weight) AS fg_kgs, COUNT(*) AS box_count
+                FROM jb_inward_boxes b
+                JOIN jb_work_inward_receipt r ON r.id = b.inward_receipt_id
+                WHERE r.header_id = :hid
+                  AND UPPER(COALESCE(b.box_type, 'FG')) = 'FG'
+                GROUP BY r.ir_number, b.item_description
+                ORDER BY r.ir_number, b.item_description
+            """), {"hid": header_id}).fetchall()
+            ir_article_breakdown = [
+                {
+                    "ir_number": r[0],
+                    "item_description": r[1] or "-",
+                    "fg_kgs": float(r[2] or 0),
+                    "box_count": int(r[3] or 0),
+                }
+                for r in article_rows
+            ]
         except Exception as e:
             _jw_logger.error(f"Failed to fetch cumulative IR data for email: {e}")
 
@@ -1629,6 +1652,7 @@ def submit_material_in(
             payload, ir_number, inward_receipt_id, created_by,
             challan_summary=challan_summary,
             all_ir_lines=all_ir_lines,
+            ir_article_breakdown=ir_article_breakdown,
         )
     except Exception as e:
         _jw_logger.error(f"Failed to queue material-in notification: {e}")

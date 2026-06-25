@@ -1291,6 +1291,7 @@ def notify_job_work_material_in_created(
     created_by: str,
     challan_summary: list | None = None,
     all_ir_lines: list | None = None,
+    ir_article_breakdown: list | None = None,
 ) -> None:
     """Send notification email when a Job Work Material In (Inward Receipt) is created.
 
@@ -1298,6 +1299,9 @@ def notify_job_work_material_in_created(
     all_ir_lines: list of dicts {ir_number, receipt_date, receipt_type, item_description,
                   finished_goods_kgs, waste_kgs, rejection_kgs, min_loss_pct, max_loss_pct}
                   for all IRs of this challan including the current one
+    ir_article_breakdown: list of dicts {ir_number, item_description, fg_kgs, box_count}
+                  — FG kgs grouped by the inward article the QR/FG box was generated in
+                  (from jb_inward_boxes, box_type=FG) for each IR of this challan.
     """
     items = payload.get("items", []) or []
     receipt_type = payload.get("receipt_type", "partial")
@@ -1363,6 +1367,9 @@ def notify_job_work_material_in_created(
     )
 
     # ── Section C: Challan IR History ────────────────────────────────────
+    # Per-IR line-level rollup. Waste / Rejection / Accounted are NOT split by
+    # article (they cannot be tied to a single FG article) — only FG kgs is
+    # bifurcated per inward article in the sub-rows below.
     ir_history: dict[str, dict] = {}
     for ln in (all_ir_lines or []):
         key = ln.get("ir_number", "?")
@@ -1377,43 +1384,78 @@ def notify_job_work_material_in_created(
         ir_history[key]["waste"] += float(ln.get("waste_kgs") or 0)
         ir_history[key]["rejection"] += float(ln.get("rejection_kgs") or 0)
 
+    # FG-by-inward-article map: ir_number -> [{"article", "fg_kgs"}], sourced from
+    # the QR/FG boxes generated at material-in (jb_inward_boxes, box_type=FG).
+    fg_articles_by_ir: dict[str, list] = {}
+    for row in (ir_article_breakdown or []):
+        irn = row.get("ir_number", "?")
+        fg_articles_by_ir.setdefault(irn, []).append({
+            "article": row.get("item_description") or "-",
+            "fg_kgs": float(row.get("fg_kgs") or 0),
+        })
+
+    cell = "padding:6px 10px;border:1px solid #e0e0e0;"
     history_rows = ""
-    total_fg = total_waste = total_rej = 0.0
-    for ir_key, ir in ir_history.items():
+    total_fg_display = 0.0                          # FG column total (per-article QR kgs)
+    total_fg_line = total_waste = total_rej = 0.0   # line-level totals (for Accounted)
+    for ir_idx, (ir_key, ir) in enumerate(ir_history.items()):
         accounted = ir["fg"] + ir["waste"] + ir["rejection"]
-        total_fg += ir["fg"]
+        total_fg_line += ir["fg"]
         total_waste += ir["waste"]
         total_rej += ir["rejection"]
+
+        # FG split per inward article; fall back to a single "—" row carrying the
+        # line-level FG when this IR has no QR/FG boxes (e.g. legacy receipts).
+        articles = fg_articles_by_ir.get(ir_key) or []
+        if not articles:
+            articles = [{"article": "&mdash;", "fg_kgs": ir["fg"]}]
+        total_fg_display += sum(a["fg_kgs"] for a in articles)
+        nrows = len(articles)
+
         is_current = ir_key == ir_number
-        row_style = "background:#dbeafe;font-weight:bold;" if is_current else "background:#fff;"
-        history_rows += (
-            f'<tr style="{row_style}">'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">'
-            f'{ir_key}{"&nbsp;&#9664; current" if is_current else ""}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{ir["receipt_date"]}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;">{ir["receipt_type"].title()}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{ir["fg"]:g}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{ir["waste"]:g}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{ir["rejection"]:g}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;font-weight:bold;">{accounted:g}</td>'
-            f'</tr>'
-        )
-    total_accounted_history = total_fg + total_waste + total_rej
+        if is_current:
+            bg, weight = "#dbeafe", "font-weight:bold;"
+        else:
+            bg, weight = ("#fff" if ir_idx % 2 == 0 else "#f8f9fa"), ""
+        ir_label = f'{ir_key}{"&nbsp;&#9664; current" if is_current else ""}'
+
+        for a_idx, art in enumerate(articles):
+            history_rows += f'<tr style="background:{bg};{weight}">'
+            if a_idx == 0:
+                history_rows += (
+                    f'<td rowspan="{nrows}" style="{cell}vertical-align:top;">{ir_label}</td>'
+                    f'<td rowspan="{nrows}" style="{cell}vertical-align:top;">{ir["receipt_date"]}</td>'
+                    f'<td rowspan="{nrows}" style="{cell}vertical-align:top;">{ir["receipt_type"].title()}</td>'
+                )
+            history_rows += (
+                f'<td style="{cell}">{art["article"]}</td>'
+                f'<td style="{cell}text-align:right;">{art["fg_kgs"]:g}</td>'
+            )
+            if a_idx == 0:
+                history_rows += (
+                    f'<td rowspan="{nrows}" style="{cell}text-align:right;vertical-align:top;">{ir["waste"]:g}</td>'
+                    f'<td rowspan="{nrows}" style="{cell}text-align:right;vertical-align:top;">{ir["rejection"]:g}</td>'
+                    f'<td rowspan="{nrows}" style="{cell}text-align:right;vertical-align:top;font-weight:bold;">{accounted:g}</td>'
+                )
+            history_rows += '</tr>'
+
+    total_accounted_history = total_fg_line + total_waste + total_rej
     if history_rows:
         history_rows += (
             f'<tr style="background:#e8edf5;font-weight:bold;">'
-            f'<td colspan="3" style="padding:6px 10px;border:1px solid #e0e0e0;">Total</td>'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{total_fg:g}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{total_waste:g}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{total_rej:g}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #e0e0e0;text-align:right;">{total_accounted_history:g}</td>'
+            f'<td colspan="4" style="{cell}">Total</td>'
+            f'<td style="{cell}text-align:right;">{total_fg_display:g}</td>'
+            f'<td style="{cell}text-align:right;">{total_waste:g}</td>'
+            f'<td style="{cell}text-align:right;">{total_rej:g}</td>'
+            f'<td style="{cell}text-align:right;">{total_accounted_history:g}</td>'
             f'</tr>'
         )
     else:
-        history_rows = '<tr><td colspan="7" style="text-align:center;padding:8px;">No history available</td></tr>'
+        history_rows = '<tr><td colspan="8" style="text-align:center;padding:8px;">No history available</td></tr>'
     history_headers = "".join(
         f'<th style="padding:8px 10px;text-align:left;">{h}</th>'
-        for h in ["IR Number", "Date", "Type", "FG Kgs", "Waste Kgs", "Rejection Kgs", "Accounted Kgs"]
+        for h in ["IR Number", "Date", "Type", "Inward Article",
+                  "FG Kgs", "Waste Kgs", "Rejection Kgs", "Accounted Kgs"]
     )
 
     # ── Section D: Pendency per item ─────────────────────────────────────
@@ -1534,6 +1576,13 @@ def notify_job_work_material_in_created(
             f"Waste: {waste:g} | Rejection: {rej:g} | Loss: {loss_pct:.1f}%"
             + (" [PARTIAL]" if is_partial else "")
         )
+    if ir_article_breakdown:
+        plain_lines += ["", "FG by Inward Article (QR generated):"]
+        for row in ir_article_breakdown:
+            plain_lines.append(
+                f"  {row.get('ir_number', '')} | {row.get('item_description', '-')} | "
+                f"FG: {float(row.get('fg_kgs') or 0):g} kg"
+            )
     if total_pending_all > 0:
         plain_lines += ["", f"Pending: {total_pending_all:g} Kgs still outstanding."]
 

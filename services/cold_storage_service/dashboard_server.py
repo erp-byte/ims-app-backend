@@ -66,18 +66,19 @@ def _union_source(tables: List[str]) -> str:
 
 # Canonical storage_location SQL expression.
 # Prefers the materialized `canonical_warehouse` column (populated by the
-# 20260525 migration + trigger). Falls back to legacy unit/storage_location
-# disambiguation only when the column is unpopulated.
+# 20260525 / 20260621 migrations + trigger). When that column is still NULL
+# (e.g. rows written while a warehouse's canonical fn was stale — the exact
+# cause of Eskimo lots showing as "Other"), fall back to the LIVE
+# canonical_warehouse_fn() so this expression can never drift from the
+# trigger/migration definition again. Final catch-all is 'Other'.
+# canonical_warehouse_fn is guaranteed to exist here: every endpoint calls
+# _resolve_tables() -> _ensure_canonical_columns(), which creates the function
+# in the same committed transaction as the `canonical_warehouse` column that
+# this expression already references.
 _CANONICAL_LOC = """
     COALESCE(
         canonical_warehouse,
-        CASE
-            WHEN UPPER(TRIM(COALESCE(storage_location,''))) IN ('SAVLA','OLD SAVLA','SAVLA BOND','SAVLA D-39','SAVLA D39','SAVLA D-39 COLD','SAVLA D-514','SAVLA D514','SAVLA D-514 COLD','NEW SAVLA')
-                 AND UPPER(TRIM(COALESCE(unit,''))) = 'D-514' THEN 'Savla D-514'
-            WHEN UPPER(TRIM(COALESCE(storage_location,''))) IN ('SAVLA','OLD SAVLA','SAVLA BOND','SAVLA D-39','SAVLA D39','SAVLA D-39 COLD','SAVLA D-514','SAVLA D514','SAVLA D-514 COLD','NEW SAVLA')
-                 AND UPPER(TRIM(COALESCE(unit,''))) = 'D-39' THEN 'Savla D-39'
-            ELSE NULL
-        END,
+        canonical_warehouse_fn(unit, storage_location),
         'Other'
     )
 """
@@ -123,6 +124,7 @@ def _ensure_canonical_columns(db: Session) -> None:
                 ELSIF k IN ('savla d-514','savla d514','d-514','d514','new savla','savla d-514 cold') THEN RETURN 'Savla D-514';
                 ELSIF k IN ('rishi','rishi cold','rishi cold storage') THEN RETURN 'Rishi';
                 ELSIF k IN ('supreme','supreme cold','supreme cold storage') THEN RETURN 'Supreme';
+                ELSIF k IN ('eskimo','eskimo cold','eskimo cold storage') THEN RETURN 'Eskimo';
                 ELSIF k IN ('w202','warehouse w202') THEN RETURN 'W202';
                 ELSIF k IN ('a101','warehouse a101') THEN RETURN 'A101';
                 ELSIF k IN ('a185','warehouse a185') THEN RETURN 'A185';
@@ -137,6 +139,7 @@ def _ensure_canonical_columns(db: Session) -> None:
                 ELSIF k IN ('savla d-514','savla d514','d-514','d514','new savla','savla d-514 cold') THEN RETURN 'Savla D-514';
                 ELSIF k IN ('rishi','rishi cold','rishi cold storage') THEN RETURN 'Rishi';
                 ELSIF k IN ('supreme','supreme cold','supreme cold storage') THEN RETURN 'Supreme';
+                ELSIF k IN ('eskimo','eskimo cold','eskimo cold storage') THEN RETURN 'Eskimo';
                 ELSIF k IN ('w202','warehouse w202') THEN RETURN 'W202';
                 ELSIF k IN ('a101','warehouse a101') THEN RETURN 'A101';
                 ELSIF k IN ('a185','warehouse a185') THEN RETURN 'A185';

@@ -11,8 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from shared.database import get_db
-from shared.models import Promoter
-from services.auth_service.dependencies import get_current_promoter
+from services.ims_service.dependencies import verify_token
 from services.packing_service import crypto, tools
 from services.packing_service.crypto import InvalidBatchToken
 
@@ -20,12 +19,8 @@ from services.packing_service.crypto import InvalidBatchToken
 router = APIRouter(prefix="/api/v1/packing-details", tags=["packing-details"])
 
 
-def _created_by(promoter: Promoter) -> str:
-    return (
-        getattr(promoter, "email", None)
-        or getattr(promoter, "name", None)
-        or str(getattr(promoter, "id", ""))
-    )
+def _created_by(user: dict) -> str:
+    return user.get("email") or user.get("user_id") or ""
 
 
 # ── request bodies ─────────────────────────────────────────────────────────
@@ -71,11 +66,11 @@ def _not_found(packing_id: int) -> HTTPException:
 def create_packing_detail(
     body: PackingDetailCreate,
     db: Session = Depends(get_db),
-    promoter: Promoter = Depends(get_current_promoter),
+    user: dict = Depends(verify_token),
 ):
     return tools.create_packing_detail(
         db, batch_code=body.batch_code, article_name=body.article_name,
-        details=body.details, created_by=_created_by(promoter),
+        details=body.details, created_by=_created_by(user),
     )
 
 
@@ -83,7 +78,7 @@ def create_packing_detail(
 @router.post("/batch-token")
 def mint_batch_token(
     body: BatchTokenMintRequest,
-    promoter: Promoter = Depends(get_current_promoter),
+    user: dict = Depends(verify_token),
 ):
     """Encrypt a plaintext batch_code into a token the QR/frontend can store."""
     return {"batch_token": crypto.encrypt_batch_code(body.batch_code)}
@@ -93,7 +88,7 @@ def mint_batch_token(
 def fetch_by_encrypted_batch(
     body: EncryptedBatchRequest,
     db: Session = Depends(get_db),
-    promoter: Promoter = Depends(get_current_promoter),
+    user: dict = Depends(verify_token),
 ):
     try:
         batch_code = crypto.decrypt_batch_code(body.batch_token)
@@ -134,7 +129,7 @@ def list_packing_details(
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    promoter: Promoter = Depends(get_current_promoter),
+    user: dict = Depends(verify_token),
 ):
     return tools.list_packing_details(
         db, batch_code=batch_code, article_name=article_name, limit=limit, offset=offset,
@@ -145,7 +140,7 @@ def list_packing_details(
 def get_packing_detail(
     packing_id: int,
     db: Session = Depends(get_db),
-    promoter: Promoter = Depends(get_current_promoter),
+    user: dict = Depends(verify_token),
 ):
     row = tools.get_packing_detail(db, packing_id)
     if row is None:
@@ -159,7 +154,7 @@ def update_packing_detail(
     packing_id: int,
     body: PackingDetailUpdate,
     db: Session = Depends(get_db),
-    promoter: Promoter = Depends(get_current_promoter),
+    user: dict = Depends(verify_token),
 ):
     provided = body.model_dump(exclude_unset=True)
     if not provided:
@@ -179,7 +174,7 @@ def update_packing_detail(
 def delete_packing_detail(
     packing_id: int,
     db: Session = Depends(get_db),
-    promoter: Promoter = Depends(get_current_promoter),
+    user: dict = Depends(verify_token),
 ):
     if not tools.delete_packing_detail(db, packing_id):
         raise _not_found(packing_id)

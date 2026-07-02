@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 720  # 12h — long session so users aren't logged out mid-work (no token-refresh flow yet)
     REFRESH_TOKEN_EXPIRE_HOURS: int = 10
     AES_SECRET_KEY: str  # 64-char hex string (32 bytes)
+    # Optional dedicated key for packing QR batch tokens (64-char hex OR
+    # urlsafe-base64 of 32 bytes). Falls back to AES_SECRET_KEY when blank.
+    PACKING_TOKEN_KEY: str = ""
     LOCATIONIQ_API_KEY: str
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587

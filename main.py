@@ -34,6 +34,7 @@ from services.ims_service.transfer_dashboard_server import router as transfer_da
 from services.ims_service.jobwork_dashboard_server import router as jobwork_dashboard_router
 from services.ims_service.job_work_server import router as job_work_router
 from services.lot_search_service.server import router as lot_search_router
+from services.packing_service.server import router as packing_router
 
 
 logger = get_logger("main")
@@ -185,6 +186,26 @@ def _run_startup_migrations():
             except Exception:
                 db.rollback()
 
+        # Packing Details (QR / encrypted batch tokens). Mirrors
+        # migrations/2026-07-02_packing_details.sql so the schema self-heals at boot.
+        try:
+            db.execute(text("""
+                CREATE TABLE IF NOT EXISTS packing_details (
+                    id           SERIAL PRIMARY KEY,
+                    batch_code   VARCHAR(255) NOT NULL,
+                    article_name VARCHAR(255) NOT NULL,
+                    details      JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_by   VARCHAR(255),
+                    created_at   TIMESTAMP DEFAULT NOW(),
+                    updated_at   TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            db.execute(text("CREATE INDEX IF NOT EXISTS idx_packing_details_batch ON packing_details(batch_code)"))
+            db.execute(text("CREATE INDEX IF NOT EXISTS idx_packing_details_article ON packing_details(article_name)"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
         logger.info("Startup migrations completed")
     except Exception as exc:
         db.rollback()
@@ -253,6 +274,9 @@ app.add_middleware(
         "http://127.0.0.1:4000",
         "https://candorims.netlify.app",
         "https://8vp3hks5-8000.inc1.devtunnels.ms",
+        # candorfoods.in (Wix) — for the public packing QR scan page.
+        "https://www.candorfoods.in",
+        "https://candorfoods.in",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -276,6 +300,7 @@ app.include_router(transfer_dashboard_router)
 app.include_router(jobwork_dashboard_router)
 app.include_router(job_work_router)
 app.include_router(lot_search_router)
+app.include_router(packing_router)
 
 
 if __name__ == "__main__":

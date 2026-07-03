@@ -21,6 +21,7 @@ from services.cold_storage_service.models import (
     ColdStorageApprovalResponse,
     DirectOutCreate,
     DirectOutRecord,
+    DirectOutCreateResponse,
     DirectOutListResponse,
     DirectOutUpdate,
 )
@@ -120,11 +121,12 @@ def bulk_delete_endpoint(
 # ── Direct Out endpoints (before /{record_id} to avoid path conflict) ──
 
 
-@router.post("/direct-out", response_model=DirectOutRecord, status_code=201)
+@router.post("/direct-out", response_model=DirectOutCreateResponse, status_code=201)
 def create_direct_out_endpoint(
     data: DirectOutCreate,
     db: Session = Depends(get_db),
 ):
+    # Returns {"records": [...]} — 1 record, or 2 when the pallet mixes companies.
     return create_direct_out(data, db)
 
 

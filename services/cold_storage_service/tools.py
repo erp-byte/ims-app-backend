@@ -572,6 +572,33 @@ def _direct_out_table(company: str) -> str:
     return f"{company.lower()}_cold_storage_direct_out"
 
 
+_DIRECT_OUT_TABLES = ("cfpl_cold_storage_direct_out", "cdpl_cold_storage_direct_out")
+
+
+def _existing_direct_out_tables(db: Session) -> list[str]:
+    """The Direct-Out tables that actually exist (guards the UNION against a
+    missing per-company table on a fresh DB)."""
+    out = []
+    for tbl in _DIRECT_OUT_TABLES:
+        if db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{tbl}"}).scalar():
+            out.append(tbl)
+    return out
+
+
+def _resolve_direct_out_table(transaction_no: str, db: Session) -> Optional[str]:
+    """Cold Storage Direct Out is company-agnostic: find which company's table
+    holds this transaction_no (cfpl or cdpl). Mirrors inner-transfer's
+    _resolve_record_table so get/update/delete work regardless of the URL company."""
+    for tbl in _existing_direct_out_tables(db):
+        found = db.execute(
+            text(f"SELECT 1 FROM {tbl} WHERE transaction_no = :tn LIMIT 1"),
+            {"tn": transaction_no},
+        ).fetchone()
+        if found:
+            return tbl
+    return None
+
+
 def _map_direct_out_row(row) -> dict:
     lines_val = row.lines
     if isinstance(lines_val, str):
@@ -610,19 +637,56 @@ def _map_direct_out_row(row) -> dict:
 
 
 def create_direct_out(payload, db: Session) -> dict:
-    company = payload.company
+    """Company-agnostic Direct Out. Cold storage holds boxes from both companies,
+    so a single submit may mix CFPL + CDPL boxes. Group the lines by each box's
+    source company and write ONE Direct-Out record per company (auto-split), all
+    within a single DB transaction. Returns {"records": [...]} (1 or 2 records)."""
+    default_co = (getattr(payload, "company", None) or "CFPL").upper()
+    groups: dict[str, list] = {}
+    for l in payload.lines:
+        co = (getattr(l, "company", None) or default_co).upper()
+        if co not in ("CFPL", "CDPL"):
+            co = default_co
+        groups.setdefault(co, []).append(l)
+
+    # Ensure the disposition/reconciliation schema once up front (it commits
+    # internally). Keeping it out of the per-group loop means the stock
+    # deletes + header inserts for every company group stay in one transaction.
+    try:
+        from services.ims_service.pending_stock_tools import _ensure_reconciliation_schema
+        _ensure_reconciliation_schema(db)
+    except Exception as e:
+        logger.warning("Direct Out reconciliation schema ensure skipped: %s", e)
+
+    base_ts = now_ist().strftime("%Y%m%d%H%M%S")
+    multi = len(groups) > 1
+    records = []
+    for co in sorted(groups):  # deterministic order (CDPL, CFPL)
+        txn = f"DO-{base_ts}-{co}" if multi else f"DO-{base_ts}"
+        records.append(_dispatch_direct_out_group(co, groups[co], payload, txn, db))
+
+    db.commit()
+    logger.info("Created direct out(s): %s", [r["transaction_no"] for r in records])
+    return {"records": records}
+
+
+def _dispatch_direct_out_group(
+    company: str, lines: list, payload, transaction_no: str, db: Session
+) -> dict:
+    """Pick + delete boxes for ONE company and insert its Direct-Out header.
+    Does NOT commit — the caller commits once for the whole (possibly split) submit."""
+    company = company.upper()
     table = _direct_out_table(company)
     stocks_table = f"{company.lower()}_cold_stocks"
 
-    transaction_no = f"DO-{now_ist().strftime('%Y%m%d%H%M%S')}"
-    lines_list = [l.model_dump() for l in payload.lines]
-    total_issue_qty = sum(float(l.issue_qty or 0) for l in payload.lines)
+    lines_list = [l.model_dump() for l in lines]
+    total_issue_qty = sum(float(l.issue_qty or 0) for l in lines)
 
     # Persist the lot number(s) on the header's lot_no column. A Direct Out can span
     # multiple lots/lines, so store the distinct lot values joined by ", " (single lot
     # → just that lot; none → NULL).
     lot_values = sorted({
-        str(l.lot_no).strip() for l in payload.lines
+        str(l.lot_no).strip() for l in lines
         if getattr(l, "lot_no", None) and str(l.lot_no).strip()
     })
     lot_no_combined = ", ".join(lot_values) if lot_values else None
@@ -634,7 +698,7 @@ def create_direct_out(payload, db: Session) -> dict:
     snapshot: list[dict] = []
     all_ids_to_delete: list[int] = []
 
-    for line in payload.lines:
+    for line in lines:
         if line.stock_id is None:
             continue
         qty = max(1, int(line.issue_qty or 1))
@@ -695,11 +759,7 @@ def create_direct_out(payload, db: Session) -> dict:
         # future Transfer-In / Job-Work scans can answer "where did box X go?"
         # and can reconcile fungibly (same txn, same lot = arbitrary labels).
         try:
-            from services.ims_service.pending_stock_tools import (
-                _ensure_reconciliation_schema,
-                _write_disposition,
-            )
-            _ensure_reconciliation_schema(db)
+            from services.ims_service.pending_stock_tools import _write_disposition
             for row_data in snapshot:
                 if not isinstance(row_data, dict):
                     continue
@@ -760,9 +820,8 @@ def create_direct_out(payload, db: Session) -> dict:
         params,
     ).fetchone()
 
-    db.commit()
     logger.info(
-        "Created direct out %s for %s — removed %d stock rows",
+        "Direct out %s for %s — removed %d stock rows",
         transaction_no, company, len(all_ids_to_delete),
     )
     return _map_direct_out_row(row)
@@ -778,7 +837,14 @@ def list_direct_out(
     warehouse: Optional[str],
     db: Session,
 ) -> dict:
-    table = _direct_out_table(company)
+    # Cold Storage Direct Out is company-agnostic — the `company` arg is ignored;
+    # merge both companies' per-company tables into one list (UNION ALL). Each row
+    # keeps its own `company` column so the UI can still show which company it is.
+    tables = _existing_direct_out_tables(db)
+    if not tables:
+        return {"records": [], "total": 0, "page": page, "per_page": per_page}
+    union = " UNION ALL ".join(f"SELECT {DIRECT_OUT_COLS} FROM {t}" for t in tables)
+
     conditions = []
     params: dict = {}
 
@@ -800,7 +866,7 @@ def list_direct_out(
     where = " AND ".join(conditions) if conditions else "1=1"
 
     total = db.execute(
-        text(f"SELECT COUNT(*) AS cnt FROM {table} WHERE {where}"),
+        text(f"SELECT COUNT(*) AS cnt FROM ({union}) AS combined WHERE {where}"),
         params,
     ).scalar() or 0
 
@@ -810,7 +876,7 @@ def list_direct_out(
 
     rows = db.execute(
         text(
-            f"SELECT {DIRECT_OUT_COLS} FROM {table} WHERE {where} "
+            f"SELECT * FROM ({union}) AS combined WHERE {where} "
             f"ORDER BY entry_date DESC, id DESC "
             f"LIMIT :limit OFFSET :offset"
         ),
@@ -826,7 +892,10 @@ def list_direct_out(
 
 
 def get_direct_out(company: str, transaction_no: str, db: Session) -> dict:
-    table = _direct_out_table(company)
+    # company-agnostic: resolve whichever company's table holds this txn
+    table = _resolve_direct_out_table(transaction_no, db)
+    if not table:
+        raise HTTPException(status_code=404, detail="Direct Out record not found")
     row = db.execute(
         text(f"SELECT {DIRECT_OUT_COLS} FROM {table} WHERE transaction_no = :tn"),
         {"tn": transaction_no},
@@ -846,7 +915,9 @@ DIRECT_OUT_EDITABLE = (
 
 
 def update_direct_out(company: str, transaction_no: str, patch: dict, db: Session) -> dict:
-    table = _direct_out_table(company)
+    table = _resolve_direct_out_table(transaction_no, db)
+    if not table:
+        raise HTTPException(status_code=404, detail="Direct Out record not found")
 
     cols = [c for c in DIRECT_OUT_EDITABLE if c in patch]
     if not cols:
@@ -884,8 +955,13 @@ def delete_direct_out(
     if not requested_by_email or requested_by_email.lower() not in DIRECT_OUT_DELETE_ALLOWED_EMAILS:
         raise HTTPException(status_code=403, detail="Not authorized to delete Direct Out records")
 
-    table = _direct_out_table(company)
-    stocks_table = f"{company.lower()}_cold_stocks"
+    # company-agnostic: resolve the table holding this txn, then derive the
+    # matching cold_stocks table from its prefix so restore hits the right company.
+    table = _resolve_direct_out_table(transaction_no, db)
+    if not table:
+        raise HTTPException(status_code=404, detail="Direct Out record not found")
+    prefix = table.split("_")[0]  # "cfpl" | "cdpl"
+    stocks_table = f"{prefix}_cold_stocks"
 
     # Fetch the snapshot before deleting the direct-out record
     snap_row = db.execute(

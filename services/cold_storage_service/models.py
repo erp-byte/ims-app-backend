@@ -163,6 +163,7 @@ class ColdStorageApprovalResponse(BaseModel):
 
 class DirectOutLine(BaseModel):
     stock_id: int
+    company: Optional[str] = None  # source company of THIS box (CFPL/CDPL); cold storage is company-agnostic so a single Direct Out may mix both
     item_description: Optional[str] = None
     lot_no: Optional[str] = None
     inward_no: Optional[str] = None
@@ -210,6 +211,12 @@ class DirectOutRecord(BaseModel):
     created_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+class DirectOutCreateResponse(BaseModel):
+    """A Direct Out submit may auto-split into one record per company (CFPL/CDPL)
+    when a single pallet mixes both, so create always returns a list."""
+    records: List[DirectOutRecord] = []
 
 
 class DirectOutUpdate(BaseModel):

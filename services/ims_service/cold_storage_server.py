@@ -459,14 +459,13 @@ def search_cold_storage_stocks(
         LIMIT :limit
     """
 
-    # Always search cfpl_cold_stocks first; fall back to cdpl_cold_stocks if empty.
-    # Track which table the rows actually came from so each result carries its
-    # REAL source company (cfpl/cdpl). The UI no longer guesses company from a
-    # dropdown/navbar — it uses this value so pick-boxes + deduction hit the
-    # correct cold table.
-    rows = []
-    source_company = None
-    for tbl in ["cfpl_cold_stocks", "cdpl_cold_stocks"]:
+    # Cold storage is company-agnostic: search BOTH cfpl_cold_stocks AND
+    # cdpl_cold_stocks and return the combined matches (previously it stopped at
+    # the first table with any hit, hiding the other company). Each row carries
+    # its REAL source company so pick-boxes + Direct Out deduction hit the
+    # correct cold table — the UI never guesses company from a dropdown/navbar.
+    results = []
+    for tbl, source_company in (("cfpl_cold_stocks", "cfpl"), ("cdpl_cold_stocks", "cdpl")):
         tbl_exists = db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{tbl}"}).scalar()
         if not tbl_exists:
             continue
@@ -474,35 +473,31 @@ def search_cold_storage_stocks(
             text(_SEARCH_SQL.format(table=tbl, where_sql=where_sql)),
             params,
         ).fetchall()
-        if rows:
-            source_company = "cfpl" if tbl == "cfpl_cold_stocks" else "cdpl"
-            break
-
-    results = [
-        {
-            "id": r.id,
-            "inward_dt": str(r.inward_dt) if r.inward_dt else None,
-            "unit": r.unit,
-            "inward_no": r.inward_no,
-            "item_description": r.item_description,
-            "item_mark": r.item_mark,
-            "vakkal": r.vakkal,
-            "lot_no": r.lot_no,
-            "net_qty_on_cartons": float(r.no_of_cartons) if r.no_of_cartons else None,
-            "weight_kg": float(r.weight_kg) if r.weight_kg else None,
-            "total_inventory_kgs": float(r.total_inventory_kgs) if r.total_inventory_kgs else None,
-            "group_name": r.group_name,
-            "storage_location": r.storage_location,
-            "stock": None,
-            "exporter": r.exporter,
-            "last_purchase_rate": float(r.last_purchase_rate) if r.last_purchase_rate else None,
-            "value": float(r.value) if r.value else None,
-            "box_id": r.box_id,
-            "transaction_no": r.transaction_no,
-            "company": source_company,
-        }
-        for r in rows
-    ]
+        results.extend(
+            {
+                "id": r.id,
+                "inward_dt": str(r.inward_dt) if r.inward_dt else None,
+                "unit": r.unit,
+                "inward_no": r.inward_no,
+                "item_description": r.item_description,
+                "item_mark": r.item_mark,
+                "vakkal": r.vakkal,
+                "lot_no": r.lot_no,
+                "net_qty_on_cartons": float(r.no_of_cartons) if r.no_of_cartons else None,
+                "weight_kg": float(r.weight_kg) if r.weight_kg else None,
+                "total_inventory_kgs": float(r.total_inventory_kgs) if r.total_inventory_kgs else None,
+                "group_name": r.group_name,
+                "storage_location": r.storage_location,
+                "stock": None,
+                "exporter": r.exporter,
+                "last_purchase_rate": float(r.last_purchase_rate) if r.last_purchase_rate else None,
+                "value": float(r.value) if r.value else None,
+                "box_id": r.box_id,
+                "transaction_no": r.transaction_no,
+                "company": source_company,
+            }
+            for r in rows
+        )
 
     return {"results": results, "total": len(results)}
 

@@ -63,7 +63,7 @@ ENTRY_FILTER = """(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/all-data")
-async def get_all_data(
+def get_all_data(
     company: str = Query(...),
     only_entries: bool = Query(
         False,
@@ -159,7 +159,7 @@ async def get_all_data(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/filter-options")
-async def get_filter_options(
+def get_filter_options(
     company: str = Query(...),
     only_entries: bool = Query(False),
     db: Session = Depends(get_db),
@@ -229,7 +229,7 @@ async def get_filter_options(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/item-history")
-async def get_item_history(
+def get_item_history(
     company: str = Query(...),
     item_description: str = Query(...),
     db: Session = Depends(get_db),
@@ -297,7 +297,7 @@ async def get_item_history(
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/vendor-history")
-async def get_vendor_history(
+def get_vendor_history(
     company: str = Query(...),
     vendor_name: str = Query(...),
     db: Session = Depends(get_db),

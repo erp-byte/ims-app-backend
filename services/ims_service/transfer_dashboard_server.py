@@ -28,7 +28,7 @@ LINE_FILTER = "COALESCE(l.net_weight, 0) > 0 OR COALESCE(l.total_weight, 0) > 0 
 
 
 @router.get("/all-data")
-async def get_all_data(db: Session = Depends(get_db)):
+def get_all_data(db: Session = Depends(get_db)):
     """All transfer records joined with lines. Only transfers with actual items."""
     try:
         sql = text(f"""
@@ -157,7 +157,7 @@ async def get_all_data(db: Session = Depends(get_db)):
 
 
 @router.get("/filter-options")
-async def get_filter_options(db: Session = Depends(get_db)):
+def get_filter_options(db: Session = Depends(get_db)):
     """Distinct values for filter chips."""
     try:
         result: dict = {}

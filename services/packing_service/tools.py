@@ -1,8 +1,14 @@
 """Packing Details — DB access (SQLAlchemy Core via text()).
 
-Sync sessions (shared.database.SessionLocal / get_db). psycopg3 returns JSONB
+Sync sessions (shared.database.SessionLocal / get_db). psycopg3 returns JSON
 columns as Python dicts, so `details` needs no manual json.loads on read; on
-write we pass json.dumps + CAST(... AS JSONB).
+write we pass json.dumps + CAST(... AS JSON).
+
+`details` is a JSON column (not JSONB) on purpose: JSONB canonicalises object
+keys (reorders them by length, then bytewise), which would silently discard the
+user's block ordering on every round-trip. JSON stores the text verbatim, so the
+order the user builds their blocks in is preserved. Nothing queries `details`
+with jsonb operators or a GIN index, so no functionality is lost.
 """
 from __future__ import annotations
 
@@ -35,7 +41,7 @@ def create_packing_detail(
     mapping = db.execute(
         text(f"""
             INSERT INTO packing_details (batch_code, article_name, details, created_by)
-            VALUES (:bc, :an, CAST(:details AS JSONB), :cb)
+            VALUES (:bc, :an, CAST(:details AS JSON), :cb)
             RETURNING {_COLS}
         """),
         {"bc": batch_code, "an": article_name,
@@ -86,7 +92,7 @@ def update_packing_detail(
     if article_name is not None:
         sets.append("article_name = :an"); params["an"] = article_name
     if details_provided:
-        sets.append("details = CAST(:details AS JSONB)")
+        sets.append("details = CAST(:details AS JSON)")
         params["details"] = json.dumps(details or {})
     sets.append("updated_at = NOW()")
     mapping = db.execute(

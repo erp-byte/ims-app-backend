@@ -188,17 +188,37 @@ def _run_startup_migrations():
 
         # Packing Details (QR / encrypted batch tokens). Mirrors
         # migrations/2026-07-02_packing_details.sql so the schema self-heals at boot.
+        # `details` is JSON (not JSONB) so the user's block/key order is preserved
+        # on round-trip — JSONB canonicalises (reorders) object keys.
         try:
             db.execute(text("""
                 CREATE TABLE IF NOT EXISTS packing_details (
                     id           SERIAL PRIMARY KEY,
                     batch_code   VARCHAR(255) NOT NULL,
                     article_name VARCHAR(255) NOT NULL,
-                    details      JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    details      JSON NOT NULL DEFAULT '{}'::json,
                     created_by   VARCHAR(255),
                     created_at   TIMESTAMP DEFAULT NOW(),
                     updated_at   TIMESTAMP DEFAULT NOW()
                 )
+            """))
+            # Self-heal older deployments where `details` was created as JSONB:
+            # convert to JSON in place so key order is preserved from here on
+            # (idempotent — only rewrites while the column is still jsonb).
+            db.execute(text("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'packing_details'
+                          AND column_name = 'details'
+                          AND data_type  = 'jsonb'
+                    ) THEN
+                        ALTER TABLE packing_details ALTER COLUMN details DROP DEFAULT;
+                        ALTER TABLE packing_details ALTER COLUMN details TYPE JSON USING details::text::json;
+                        ALTER TABLE packing_details ALTER COLUMN details SET DEFAULT '{}'::json;
+                    END IF;
+                END $$;
             """))
             db.execute(text("CREATE INDEX IF NOT EXISTS idx_packing_details_batch ON packing_details(batch_code)"))
             db.execute(text("CREATE INDEX IF NOT EXISTS idx_packing_details_article ON packing_details(article_name)"))

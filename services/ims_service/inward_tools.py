@@ -675,7 +675,17 @@ def build_search_conditions(
 
 ) -> tuple[str, dict]:
 
-    """Build comprehensive WHERE clause for search across all fields."""
+    """Build comprehensive WHERE clause for search across all fields.
+
+    Article and box fields are matched with correlated EXISTS against `all_art` /
+    `all_box` rather than by having the caller LEFT JOIN them in: a join fans each
+    transaction out to (its articles x its boxes) rows — ~150k box rows here — and
+    then needs a DISTINCT, which spilled a 42MB sort to disk and took ~20s per pass.
+    EXISTS stops at the first matching child row and needs no DISTINCT.
+
+    Callers must therefore have `all_art` / `all_box` in scope (i.e. use
+    `union_source_ctes`, not `tx_source_cte`) whenever `search` is set.
+    """
 
     where_clauses = ["1=1"]
 
@@ -709,93 +719,67 @@ def build_search_conditions(
 
     if search and search.strip():
 
-        search_term = f"%{search.strip()}%"
+        term = search.strip()
 
+        params["search"] = f"%{term}%"
 
+        # Casting a numeric column to text can only ever match a term containing a
+        # digit, so for plain text searches those predicates are pure waste — and
+        # they are the only reason the box table needs its numeric columns read.
+        want_numeric = any(ch.isdigit() for ch in term)
 
-        search_fields = [
+        def _match(text_fields: list[str], numeric_fields: list[str]) -> str:
+            # Bare `col ILIKE` rather than `COALESCE(col, '') ILIKE`: the term is
+            # non-empty so a NULL column can never match either way, and wrapping the
+            # column in a function is what stops a trigram index being usable.
+            # (The numeric COALESCE does change results — NULL reads as "0" — so it stays.)
+            conds = [f"{f} ILIKE :search" for f in text_fields]
+            if want_numeric:
+                conds += [f"CAST(COALESCE({f}, 0) AS TEXT) ILIKE :search" for f in numeric_fields]
+            return " OR ".join(conds)
 
-            # Transaction fields
+        tx_match = _match(
+            [
+                "t.transaction_no", "t.vehicle_number", "t.transporter_name",
+                "t.lr_number", "t.vendor_supplier_name", "t.customer_party_name",
+                "t.source_location", "t.destination_location", "t.challan_number",
+                "t.invoice_number", "t.po_number", "t.grn_number", "t.purchased_by",
+                "t.service_invoice_number", "t.dn_number", "t.approval_authority",
+                "t.warehouse", "t.remark", "t.currency",
+            ],
+            [
+                "t.grn_quantity", "t.total_amount", "t.tax_amount",
+                "t.discount_amount", "t.po_quantity",
+            ],
+        )
 
-            "t.transaction_no", "t.vehicle_number", "t.transporter_name",
+        art_match = _match(
+            [
+                "a.item_description", "a.item_category", "a.sub_category",
+                "a.material_type", "a.quality_grade", "a.uom", "a.units",
+                "a.lot_number",
+            ],
+            [
+                "a.sku_id", "a.po_weight", "a.po_quantity", "a.quantity_units",
+                "a.net_weight", "a.total_weight", "a.unit_rate", "a.total_amount",
+                "a.carton_weight",
+            ],
+        )
 
-            "t.lr_number", "t.vendor_supplier_name", "t.customer_party_name",
+        box_match = _match(
+            ["b.article_description", "b.lot_number", "b.box_id"],
+            ["b.box_number", "b.net_weight", "b.gross_weight", "b.count"],
+        )
 
-            "t.source_location", "t.destination_location", "t.challan_number",
-
-            "t.invoice_number", "t.po_number", "t.grn_number", "t.purchased_by",
-
-            "t.service_invoice_number", "t.dn_number", "t.approval_authority",
-
-            "t.warehouse", "t.remark", "t.currency",
-
-            # Article fields
-
-            "a.item_description", "a.item_category", "a.sub_category",
-
-            "a.material_type", "a.quality_grade", "a.uom", "a.units",
-
-            "a.lot_number",
-
-            # Box fields
-
-            "b.article_description", "b.lot_number", "b.box_id",
-
-        ]
-
-
-
-        search_conditions = [f"COALESCE({f}, '') ILIKE :search" for f in search_fields]
-
-
-
-        numeric_search_conditions = [
-
-            "CAST(COALESCE(t.grn_quantity, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(t.total_amount, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(t.tax_amount, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(t.discount_amount, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(t.po_quantity, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(a.sku_id, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(a.po_weight, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(a.po_quantity, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(a.quantity_units, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(a.net_weight, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(a.total_weight, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(a.unit_rate, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(a.total_amount, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(a.carton_weight, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(b.box_number, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(b.net_weight, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(b.gross_weight, 0) AS TEXT) ILIKE :search",
-
-            "CAST(COALESCE(b.count, 0) AS TEXT) ILIKE :search",
-
-        ]
-
-
-
-        all_conditions = search_conditions + numeric_search_conditions
-
-        where_clauses.append(f"({' OR '.join(all_conditions)})")
-
-        params["search"] = search_term
+        where_clauses.append(
+            f"({tx_match}"
+            f" OR EXISTS (SELECT 1 FROM all_art a"
+            f" WHERE a.transaction_no = t.transaction_no AND a._source = t._source"
+            f" AND ({art_match}))"
+            f" OR EXISTS (SELECT 1 FROM all_box b"
+            f" WHERE b.transaction_no = t.transaction_no AND b._source = t._source"
+            f" AND ({box_match})))"
+        )
 
 
 
@@ -918,69 +902,57 @@ def list_inward_records(
 
     union_ctes = union_source_ctes(company)
 
-    # When there is no text search, the WHERE clause only touches transaction
-    # columns (t.*), so the article/box joins are unnecessary for filtering and
-    # counting. Skipping them avoids fanning out across ~100k box rows on every
-    # call. The joins are only needed when `search` matches article/box fields.
-    needs_join = bool(search and search.strip())
-
-    art_box_join = """
-                LEFT JOIN all_art a
-                    ON t.transaction_no = a.transaction_no AND t._source = a._source
-                LEFT JOIN all_box b
-                    ON t.transaction_no = b.transaction_no AND t._source = b._source"""
+    # The filter only ever scans transaction columns (t.*) plus EXISTS lookups into
+    # all_art / all_box, so it is a plain scan of ~1.2k transactions — no join, no
+    # fan-out, no DISTINCT. The article/box CTEs only need to exist when searching.
+    filter_ctes = union_ctes if (search and search.strip()) else tx_source_cte(company)
 
     # ---- Count of matching transactions ----
-    if needs_join:
-        total = db.execute(
-            text(f"""
-                WITH {union_ctes}
-                SELECT COUNT(*) FROM (
-                    SELECT DISTINCT t.transaction_no, t._source
-                    FROM all_tx t{art_box_join}
-                    WHERE {where_sql}
-                ) x
-            """),
-            params,
-        ).scalar_one()
-    else:
-        total = db.execute(
-            text(f"""
-                WITH {tx_source_cte(company)}
-                SELECT COUNT(*) FROM all_tx t
-                WHERE {where_sql}
-            """),
-            params,
-        ).scalar_one()
+    total = db.execute(
+        text(f"""
+            WITH {filter_ctes}
+            SELECT COUNT(*) FROM all_tx t
+            WHERE {where_sql}
+        """),
+        params,
+    ).scalar_one()
 
     # ---- Page the transaction ids BEFORE the heavy aggregation ----
     # Only this page's transactions (~per_page rows) are then aggregated, instead
     # of aggregating every transaction's articles/boxes and discarding all but one
     # page at the end.
-    if needs_join:
-        paged_select = f"""
-                SELECT transaction_no, _source FROM (
-                    SELECT DISTINCT
-                        t.transaction_no, t._source,
-                        t.entry_date, t.system_grn_date, t.invoice_number, t.po_number
-                    FROM all_tx t{art_box_join}
-                    WHERE {where_sql}
-                ) d
-                ORDER BY {order_clause}
-                LIMIT :limit OFFSET :offset"""
-    else:
-        paged_select = f"""
-                SELECT transaction_no, _source
-                FROM all_tx t
-                WHERE {where_sql}
-                ORDER BY {order_clause}
-                LIMIT :limit OFFSET :offset"""
+    page_ids = db.execute(
+        text(f"""
+            WITH {filter_ctes}
+            SELECT transaction_no, _source
+            FROM all_tx t
+            WHERE {where_sql}
+            ORDER BY {order_clause}
+            LIMIT :limit OFFSET :offset
+        """),
+        {**params, "limit": per_page, "offset": offset},
+    ).fetchall()
+
+    if not page_ids:
+        return InwardListResponse(records=[], total=total, page=page, per_page=per_page)
+
+    # Resolving the page ids in their own round trip keeps the search predicate out
+    # of the aggregation query below. That matters: the EXISTS lookups would be a
+    # second reference to `all_box`, which makes PostgreSQL materialise the CTE —
+    # and a materialised CTE has no index, so the per-transaction LATERAL below
+    # degrades from an index lookup into a full ~150k-row scan per paged row (~20s).
+    id_params = {
+        "page_tx_nos": [r[0] for r in page_ids],
+        "page_sources": [r[1] for r in page_ids],
+    }
 
     records = db.execute(
         text(f"""
             WITH {union_ctes},
             paged_transactions AS (
-                {paged_select}
+                SELECT * FROM unnest(
+                    CAST(:page_tx_nos AS text[]), CAST(:page_sources AS text[])
+                ) AS v(transaction_no, _source)
             ),
             transaction_data AS (
                 SELECT
@@ -1111,7 +1083,7 @@ def list_inward_records(
             FROM transaction_data td
             ORDER BY {order_clause}
         """),
-        {**params, "limit": per_page, "offset": offset},
+        id_params,
     ).fetchall()
 
     formatted = []
@@ -1264,7 +1236,22 @@ def export_inward_records(
 
     union_ctes = union_source_ctes(company)
 
+    # Resolve the matching transactions in their own round trip — see the comment in
+    # list_inward_records: keeping the search predicate out of the query below stops
+    # PostgreSQL materialising `all_box`, which would cost the fan-out joins their
+    # index access (~80s for a 60-transaction export).
+    filter_ctes = union_ctes if (search and search.strip()) else tx_source_cte(company)
 
+    matched = db.execute(
+        text(f"""
+            WITH {filter_ctes}
+            SELECT transaction_no, _source FROM all_tx t WHERE {where_sql}
+        """),
+        params,
+    ).fetchall()
+
+    if not matched:
+        return []
 
     records = db.execute(
 
@@ -1274,19 +1261,9 @@ def export_inward_records(
 
             filtered_transactions AS (
 
-                SELECT DISTINCT t.transaction_no, t._source
-
-                FROM all_tx t
-
-                LEFT JOIN all_art a
-
-                    ON t.transaction_no = a.transaction_no AND t._source = a._source
-
-                LEFT JOIN all_box b
-
-                    ON t.transaction_no = b.transaction_no AND t._source = b._source
-
-                WHERE {where_sql}
+                SELECT * FROM unnest(
+                    CAST(:match_tx_nos AS text[]), CAST(:match_sources AS text[])
+                ) AS v(transaction_no, _source)
 
             )
 
@@ -1426,7 +1403,10 @@ def export_inward_records(
 
         """),
 
-        params,
+        {
+            "match_tx_nos": [m[0] for m in matched],
+            "match_sources": [m[1] for m in matched],
+        },
 
     ).fetchall()
 

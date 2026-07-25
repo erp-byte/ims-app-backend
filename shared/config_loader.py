@@ -1,3 +1,4 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -38,7 +39,10 @@ class Settings(BaseSettings):
     BACKEND_URL: str = "https://mmvxmfvhmq.ap-south-1.awsapprunner.com"
 
     class Config:
-        env_file = ".env"
+        # Absolute path so the .env is found regardless of the process's
+        # working directory (e.g. uvicorn --reload subprocess, launching
+        # from a different folder). shared/ -> repo root.
+        env_file = Path(__file__).resolve().parent.parent / ".env"
         extra = "ignore"
 
 

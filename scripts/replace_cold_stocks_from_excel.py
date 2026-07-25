@@ -383,6 +383,47 @@ def dedupe_rows(rows: list[dict], table_label: str, errors: list) -> list[dict]:
     return list(by_key.values()) + null_box_rows
 
 
+def report_pile_box_collisions(rows: list[dict], table_label: str, errors: list) -> int:
+    """Warn about piles that will trip the Cold-transfer 'Duplicate Box IDs From Source'
+    guard. dedupe_rows only removes exact (transaction_no, box_id) repeats, so a box_id
+    reused across two transaction_nos in the SAME (item, lot, inward_no) pile survives —
+    and /cold-storage/stocks/pick-boxes ignores transaction_no, so it returns the collision.
+    Also flags piles with NULL box_ids. Reports only; does NOT mutate (relabeling would
+    desync the physical sticker). Returns the number of broken piles."""
+    from collections import defaultdict
+
+    pile_ids: dict[tuple, list] = defaultdict(list)   # pile -> [box_id, ...]
+    pile_nulls: dict[tuple, int] = defaultdict(int)
+    for r in rows:
+        pile = (r.get("item_description"), str(r.get("lot_no")), r.get("inward_no") or "")
+        if r["box_id"] is None or not str(r["box_id"]).strip():
+            pile_nulls[pile] += 1
+        else:
+            pile_ids[pile].append(r["box_id"])
+
+    broken = 0
+    for pile in set(list(pile_ids.keys()) + list(pile_nulls.keys())):
+        ids = pile_ids.get(pile, [])
+        nulls = pile_nulls.get(pile, 0)
+        dup = len(ids) != len(set(ids))
+        if dup or nulls > 0:
+            broken += 1
+            item, lot, inward = pile
+            reason = []
+            if dup:
+                repeated = sorted({b for b in ids if ids.count(b) > 1})
+                reason.append(f"{len(ids) - len(set(ids))} cross-txn box_id collision(s): {repeated[:5]}")
+            if nulls:
+                reason.append(f"{nulls} NULL box_id row(s)")
+            errors.append(
+                f"PILE-INTEGRITY [{table_label}]: item={item!r} lot={lot!r} inward={inward!r} "
+                f"-> WILL BLOCK cold-transfer ({'; '.join(reason)})"
+            )
+    if broken:
+        errors.append(f"PILE-INTEGRITY [{table_label}]: {broken} pile(s) will block cold-transfer — fix box IDs at source")
+    return broken
+
+
 def insert_rows(cur, table: str, rows: list[dict]):
     if not rows:
         return
@@ -430,6 +471,10 @@ def main():
     rows_cfpl = dedupe_rows(rows_cfpl, "CFPL", errors)
     rows_cdpl = dedupe_rows(rows_cdpl, "CDPL", errors)
 
+    # Loudly flag any pile that will block cold-transfer (dup box_id across txns / NULL box_id)
+    broken_cfpl = report_pile_box_collisions(rows_cfpl, "CFPL", errors)
+    broken_cdpl = report_pile_box_collisions(rows_cdpl, "CDPL", errors)
+
     print()
     print("=== PROJECTION ===")
     print(f"  CFPL rows to insert: {len(rows_cfpl)}")
@@ -439,6 +484,7 @@ def main():
     print(f"  Unmatched lots (cold_item_mark=NULL): {len(unmatched)}")
     print(f"  #N/A lookups: hit={na_stats['hit']}, miss={na_stats['miss']}, duplicate_skipped={na_stats['duplicate_skipped']}")
     print(f"  boxes_v2 priority lookups: {v2_hits} Excel rows resolved via boxes_v2")
+    print(f"  Piles that WILL BLOCK cold-transfer (dup/NULL box_id): CFPL={broken_cfpl}, CDPL={broken_cdpl}")
     print(f"  Parser/dedupe warnings: {len(errors)}")
     for e in errors[:50]:
         print(f"    - {e}")

@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -285,6 +286,24 @@ app = FastAPI(
 )
 
 app.add_middleware(RouteObfuscationMiddleware)
+
+
+# Starlette's ServerErrorMiddleware sits OUTSIDE CORSMiddleware, so an unhandled 500 is
+# answered with no Access-Control-Allow-Origin and the browser reports a backend crash as
+# "blocked by CORS policy / Failed to fetch" — the real error never reaches the operator.
+# Declared before the CORS add_middleware call so it nests *inside* it and its response
+# gets the CORS headers.
+@app.middleware("http")
+async def cors_safe_errors(request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        logger.exception("UNHANDLED %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"}
+        )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[

@@ -158,8 +158,19 @@ class TransferHeaderCreate(BaseModel):
     vehicle_no: str
     driver_name: Optional[str] = None
     approved_by: Optional[str] = None
-    remark: Optional[str] = None
-    reason_code: Optional[str] = None
+    # remark + reason_code are NOT NULL in interunit_transfers_header. A form that omits
+    # them (operator skipped the reason dropdown) used to reach the INSERT and die as an
+    # unhandled IntegrityError — a 500, which loses its CORS headers on the way out and
+    # reaches the browser as "blocked by CORS policy / Failed to fetch", so the operator
+    # never learns which field was missing. Default them the same way the cold dispatch
+    # path already does (cold_transfer_out_tools.create_cold_transfer_out).
+    remark: str = ""
+    reason_code: str = ""
+
+    @field_validator("remark", "reason_code", mode="before")
+    @classmethod
+    def _null_to_blank(cls, v):
+        return "" if v is None else v
 
     @model_validator(mode="after")
     def warehouses_must_differ(self):

@@ -785,6 +785,95 @@ def _auto_derive_warehouse_boxes(db: Session, from_site: str, lines: list) -> li
     return derived
 
 
+# ── Boxes are authoritative for WAREHOUSE-source scans ──
+#
+# The frontend sends ONE line per article-list row plus a separate `boxes` array for
+# the QR-scanned ones, so a scanned article routinely arrives as N duplicate lines —
+# and when the operator ALSO types the same article manually, as scanned + manual
+# lines that double-count the same physical stock:
+#   TRANS202606231040: 3 lines x qty 34 + 3 boxes  -> DC qty 102, 102 phantom pending
+#   TRANS202607271640: 9 scans + 9 manual entries  -> DC qty 18, net 356.22 (real 178.11)
+# For non-cold sources rebuild each scanned article's line from its actual boxes.
+# Cold sources are untouched (their "boxes" are artifacts, lines are the order).
+#
+# Used by BOTH create_transfer and update_transfer — an edit that skipped this was
+# how the doubled DCs above got written back after creation had already fixed them.
+
+
+def _boxes_authoritative(
+    db: Session, header_id: int, from_site: str, payload_boxes: list, lines: list
+) -> list:
+    """Per scanned article: qty = box count, net/total = summed box weights, keep the
+    real (max) unit_pack_size, reattach that article's boxes to one line, drop the
+    duplicates. Returns the refreshed line rows (unchanged input if nothing applies)."""
+    if not payload_boxes or _is_cold_site(from_site):
+        return lines
+
+    agg: dict = {}
+    for b in payload_boxes:
+        k = (b.article or "").strip().upper()
+        a = agg.setdefault(k, {"n": 0, "net": 0.0, "gross": 0.0})
+        a["n"] += 1
+        net = float(b.net_weight or 0)
+        gross = float(b.gross_weight or 0)
+        # PM boxes carry their weight in gross only (net 0 in boxes_v2) — fall back
+        # so a real box never contributes 0.000 kg to the DC.
+        a["net"] += net or gross
+        a["gross"] += gross or net
+
+    for k, a in agg.items():
+        art_lines = [l for l in lines if (l.item_desc_raw or "").strip().upper() == k]
+        if not art_lines:
+            continue
+        keep = art_lines[0]
+        ups = max([float(l.unit_pack_size or 0) for l in art_lines] + [0.0])
+        db.execute(
+            text("UPDATE interunit_transfer_boxes SET transfer_line_id = :lid "
+                 "WHERE header_id = :h AND UPPER(TRIM(article)) = :k"),
+            {"lid": keep.id, "h": header_id, "k": k},
+        )
+        db.execute(
+            text("UPDATE interunit_transfers_lines SET qty = :q, net_weight = :net, "
+                 "total_weight = :gross, unit_pack_size = :ups, "
+                 "uom = COALESCE(NULLIF(TRIM(uom), ''), 'BOX') WHERE id = :id"),
+            {"q": a["n"], "net": round(a["net"], 3), "gross": round(a["gross"], 3),
+             "ups": ups, "id": keep.id},
+        )
+        dup_ids = [l.id for l in art_lines[1:]]
+        if dup_ids:
+            db.execute(text("DELETE FROM interunit_transfers_lines WHERE id = ANY(:ids)"),
+                       {"ids": dup_ids})
+        logger.info(
+            "BOXES_AUTHORITATIVE: header=%s article=%r -> line %s qty=%s net=%.3f "
+            "(dropped %d duplicate line(s))",
+            header_id, k, keep.id, a["n"], a["net"], len(dup_ids),
+        )
+
+    return db.execute(
+        text("SELECT id, header_id, rm_pm_fg_type, item_category, sub_category, "
+             "item_desc_raw, pack_size, qty, uom, unit_pack_size, net_weight, "
+             "total_weight, batch_number, lot_number, vakkal, created_at, updated_at "
+             "FROM interunit_transfers_lines WHERE header_id = :h ORDER BY id"),
+        {"h": header_id},
+    ).fetchall()
+
+
+def _uncovered_lines(db: Session, header_id: int, lines: list) -> list:
+    """Lines whose stock is NOT parked via a box row — they must be parked box-less so
+    manually-typed entries are never dropped. Coverage is read from the boxes table
+    (transfer_line_id), which is exact after _boxes_authoritative reattached them —
+    matching on lot text instead left box-covered lines "uncovered" and double-parked
+    them as phantom units (the 102-row bug)."""
+    covered = {
+        r[0] for r in db.execute(
+            text("SELECT DISTINCT transfer_line_id FROM interunit_transfer_boxes "
+                 "WHERE header_id = :h AND transfer_line_id IS NOT NULL"),
+            {"h": header_id},
+        )
+    }
+    return [l for l in lines if l.id not in covered]
+
+
 # -- Create transfer --
 
 
@@ -979,53 +1068,9 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
             ).fetchone()
             boxes.append(box_row)
 
-    # ── Boxes are authoritative for WAREHOUSE-source scans ──
-    # The frontend can send a typed qty and/or several duplicate article lines that don't
-    # match the physically-scanned boxes (root cause of TRANS202606231040: 3 lines x qty 34
-    # + 3 boxes -> DC qty 102 and 102 phantom pending units). For non-cold sources, rebuild
-    # each scanned article's line from its actual boxes: qty = box count, net/total = summed
-    # box weights, keep the real (max) unit_pack_size, reattach the article's boxes to one
-    # line, and drop duplicate lines. Cold sources are untouched (boxes are artifacts there).
-    if data.boxes and not _is_cold_site(data.header.from_warehouse):
-        agg: dict = {}
-        for b in data.boxes:
-            k = (b.article or "").strip().upper()
-            a = agg.setdefault(k, {"n": 0, "net": 0.0, "gross": 0.0})
-            a["n"] += 1
-            a["net"] += float(b.net_weight or 0)
-            a["gross"] += float(b.gross_weight or 0)
-        for k, a in agg.items():
-            art_lines = [l for l in lines if (l.item_desc_raw or "").strip().upper() == k]
-            if not art_lines:
-                continue
-            keep = art_lines[0]
-            ups = max([float(l.unit_pack_size or 0) for l in art_lines] + [0.0])
-            db.execute(
-                text("UPDATE interunit_transfer_boxes SET transfer_line_id = :lid "
-                     "WHERE header_id = :h AND UPPER(TRIM(article)) = :k"),
-                {"lid": keep.id, "h": header_id, "k": k},
-            )
-            db.execute(
-                text("UPDATE interunit_transfers_lines SET qty = :q, net_weight = :net, "
-                     "total_weight = :gross, unit_pack_size = :ups, "
-                     "uom = COALESCE(NULLIF(TRIM(uom), ''), 'BOX') WHERE id = :id"),
-                {"q": a["n"], "net": round(a["net"], 3), "gross": round(a["gross"], 3),
-                 "ups": ups, "id": keep.id},
-            )
-            dup_ids = [l.id for l in art_lines[1:]]
-            if dup_ids:
-                db.execute(text("DELETE FROM interunit_transfers_lines WHERE id = ANY(:ids)"),
-                           {"ids": dup_ids})
-        lines = db.execute(
-            text("SELECT id, header_id, rm_pm_fg_type, item_category, sub_category, "
-                 "item_desc_raw, pack_size, qty, uom, unit_pack_size, net_weight, "
-                 "total_weight, batch_number, lot_number, vakkal, created_at, updated_at "
-                 "FROM interunit_transfers_lines WHERE header_id = :h ORDER BY id"),
-            {"h": header_id},
-        ).fetchall()
-
-    # Line weights are already set correctly from frontend per-box values.
-    # Each line represents one box entry   no need to sum box weights back into lines.
+    lines = _boxes_authoritative(
+        db, header_id, data.header.from_warehouse, data.boxes or [], lines,
+    )
 
     # Park dispatched boxes into pending_transfer_stock (deducts source inventory)
     if boxes:
@@ -1069,17 +1114,7 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
     # MIXED scan + manual: park ALSO the lines that have no scanned/derived box, so
     # manually-filled entries are NEVER dropped. The old `elif lines` skipped line parking
     # whenever ANY box was scanned → manual stock vanished + transfer went Partial.
-    # A line is "covered" (its stock is parked via boxes) iff it has boxes attached. This is
-    # robust regardless of lot text — an "N/A" box lot vs an empty line lot previously left a
-    # box-covered line "uncovered" and double-parked it as phantom units (the 102-row bug).
-    covered_line_ids = set(
-        r[0] for r in db.execute(
-            text("SELECT DISTINCT transfer_line_id FROM interunit_transfer_boxes "
-                 "WHERE header_id = :h AND transfer_line_id IS NOT NULL"),
-            {"h": header_id},
-        )
-    )
-    uncovered_lines = [l for l in lines if l.id not in covered_line_ids]
+    uncovered_lines = _uncovered_lines(db, header_id, lines)
     if uncovered_lines:
         park_lines_in_pending(
             transfer_out_id=header_id,
@@ -1655,8 +1690,12 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
             ).fetchone()
             boxes.append(box_row)
 
-    # Line weights are already set correctly from frontend per-box values.
-    # Each line represents one box entry   no need to sum box weights back into lines.
+    # Same rule as create: the scanned boxes — not the re-sent article lines — decide
+    # qty/weights, so an edit can't reinstate the duplicate/manual lines create collapsed
+    # (that was the doubled "View DC" after editing a scanned Direct Out).
+    lines = _boxes_authoritative(
+        db, header_id, data.header.from_warehouse, data.boxes or [], lines,
+    )
 
     # Park dispatched boxes into pending_transfer_stock (deducts source inventory)
     if boxes:
@@ -1698,20 +1737,10 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
                 )
 
     # MIXED scan + manual: park ALSO the lines that have no scanned/derived box, so
-    # manually-filled entries are NEVER dropped. The old `elif lines` skipped line parking
-    # whenever ANY box was scanned → manual stock vanished + transfer went Partial.
-    # Coverage is counted per (article, lot); each article entry == 1 box in this form.
-    _covered: dict = {}
-    for _b in (data.boxes or []):
-        _k = ((_b.article or "").strip().upper(), (_b.lot_number or "").strip())
-        _covered[_k] = _covered.get(_k, 0) + 1
-    uncovered_lines = []
-    for _l in lines:
-        _k = ((_l.item_desc_raw or "").strip().upper(), (_l.lot_number or "").strip())
-        if _covered.get(_k, 0) > 0:
-            _covered[_k] -= 1            # this line's box was scanned / auto-derived
-        else:
-            uncovered_lines.append(_l)   # manual / unscanned → park box-less so it isn't lost
+    # manually-filled entries are NEVER dropped. Same box-table coverage check as create
+    # (lot-text matching broke once _boxes_authoritative collapsed multi-lot boxes onto
+    # one line — the collapsed line looked uncovered and got double-parked).
+    uncovered_lines = _uncovered_lines(db, header_id, lines)
     if uncovered_lines:
         park_lines_in_pending(
             transfer_out_id=header_id,

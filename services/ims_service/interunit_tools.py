@@ -497,6 +497,33 @@ def _generate_challan_no() -> str:
     return f"TRANS{now_ist().strftime('%Y%m%d%H%M%S')}"
 
 
+def unique_challan_no(db: Session, requested: Optional[str]) -> str:
+    """Server-side allocation of the challan_no — the client's is only a suggestion.
+
+    Every transfer form mints TRANS<yyyymmddhhmm> in the browser with no uniqueness
+    check, so a restored draft (the number is saved with the draft and survives to the
+    next day), two operators submitting inside the same minute, or a resubmit after a
+    failed save all reuse a number that already exists — which used to surface as a raw
+    500 IntegrityError toast AFTER the operator had scanned every box
+    (TRANS202607301239 on 31-Jul, already taken by transfer 1615 on 30-Jul).
+    The number is machine-generated, so re-minting it is free; failing the save is not.
+    """
+    asked = (requested or "").strip()
+    base = _generate_challan_no()          # seconds precision, unlike the form's minutes
+    for candidate in (asked or base, base, *(f"{base}-{n}" for n in range(2, 12))):
+        taken = db.execute(
+            text("SELECT 1 FROM interunit_transfers_header WHERE challan_no = :c LIMIT 1"),
+            {"c": candidate},
+        ).fetchone()
+        if not taken:
+            if asked and candidate != asked:
+                logger.info("CHALLAN_NO: %r already taken — allocated %r", asked, candidate)
+            return candidate
+    # ponytail: check-then-insert, so two requests in the same second can still race the
+    # unique index. Swap for an INSERT ... ON CONFLICT retry loop if that ever fires.
+    raise HTTPException(409, "Could not allocate a unique challan number — retry.")
+
+
 def _map_transfer_line(row) -> dict:
     return {
         "id": row.id,
@@ -892,7 +919,7 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
         )
 
     stock_trf_date = _convert_date(data.header.stock_trf_date)
-    challan_no = data.header.challan_no or _generate_challan_no()
+    challan_no = unique_challan_no(db, data.header.challan_no)
 
     # Insert header
     header = db.execute(

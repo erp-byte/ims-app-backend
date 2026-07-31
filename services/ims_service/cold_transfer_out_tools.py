@@ -148,6 +148,11 @@ def create_cold_transfer_out(
             ),
         )
 
+    # The cold form mints the same client-side TRANS<yyyymmddhhmm> as the warehouse
+    # forms, so it collides the same way — let the server own uniqueness.
+    from services.ims_service.interunit_tools import unique_challan_no
+    payload.challan_no = unique_challan_no(db, payload.challan_no)
+
     # Defaults for NOT NULL columns (stock_trf_date, vehicle_no, remark, reason_code).
     stock_trf_date = _parse_trf_date(payload.stock_trf_date)
     vehicle_no = payload.vehicle_no or ""

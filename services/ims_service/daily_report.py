@@ -88,6 +88,7 @@ REPORT_TO = [
     "yash@candorfoods.in",
     "sunil.jasoria@candorfoods.in",
     "stores@candorfoods.in",
+    "sachin.more@candorfoods.in",
 ]
 REPORT_CC = [
     "vaibhav.kumkar@candorfoods.in",

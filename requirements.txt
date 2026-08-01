@@ -31,5 +31,8 @@ anthropic>=0.77.0
 openpyxl>=3.1.0
 PyMuPDF>=1.24.0
 
+# PDF generation (daily inward/transfer report) — pure-python wheel, no system libs
+reportlab>=4.2.0
+
 # Environment
 python-dotenv==1.0.1

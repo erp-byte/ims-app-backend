@@ -16,6 +16,7 @@ from shared.exceptions import (
     NoActiveSession,
 )
 from shared.logger import get_logger
+from shared.mail_identity import Module, SubjectPolicy, stamp
 from shared.kafka_producer import publish_geocoding_task
 from services.auth_service.authenticator import verify_password, hash_password
 from services.auth_service.token_manager import (
@@ -427,6 +428,14 @@ def _send_otp_email(recipient: str, otp: str) -> None:
 
     # HTML version
     msg.add_alternative(_build_otp_html(otp), subtype="html")
+
+    # Each code is its own mail — never threaded with the previous one, or the
+    # recipient ends up reading an expired code from the collapsed conversation.
+    stamp(msg, module=Module.SECURITY, policy=SubjectPolicy.EVENT,
+          entity_type="VerificationCode", entity_id=recipient,
+          event="OTP_ISSUED", status="issued",
+          event_label="Your verification code (valid 3 minutes)",
+          sender=settings.SMTP_EMAIL)
 
     with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
         server.starttls()

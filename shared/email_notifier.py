@@ -8,6 +8,7 @@ from urllib.parse import quote
 from shared.canonicalize import canonical_warehouse
 from shared.config_loader import settings
 from shared.logger import get_logger
+from shared.mail_identity import Module, SubjectPolicy, stamp
 from shared.timezone import now_ist, fmt_ist
 
 logger = get_logger("email.notifier")
@@ -208,8 +209,23 @@ def _send_email_background(
     cc: list[str] | None = None,
     message_id: str | None = None,
     in_reply_to: str | None = None,
+    *,
+    module: Module = Module.RETURNS,
+    policy: SubjectPolicy = SubjectPolicy.ANCHOR,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    event: str | None = None,
+    event_label: str | None = None,
+    status: str | None = None,
+    actor: str | None = None,
 ) -> None:
-    """Send email in a background thread so API response is not delayed."""
+    """Send email in a background thread so API response is not delayed.
+
+    The identity defaults to Customer Returns on the ANCHOR policy because that is
+    what most callers here are, and ANCHOR is the safe default everywhere: it keeps
+    the subject byte-stable, so no existing conversation can be split by adding
+    identity. Callers that are genuinely one-off mails opt into SubjectPolicy.EVENT.
+    """
     def _send():
         try:
             to_list = [to] if isinstance(to, str) else list(to)
@@ -228,6 +244,12 @@ def _send_email_background(
             if in_reply_to:
                 msg["In-Reply-To"] = f"<{in_reply_to}>"
                 msg["References"] = f"<{in_reply_to}>"
+
+            # Identity last: reads the subject already set, and never touches
+            # Message-ID / In-Reply-To / References above.
+            stamp(msg, module=module, policy=policy, entity_type=entity_type,
+                  entity_id=entity_id, event=event, event_label=event_label,
+                  status=status, actor=actor, sender=settings.SMTP_EMAIL)
 
             recipients = to_list + (cc or [])
 
@@ -1275,6 +1297,7 @@ def notify_job_work_material_out_created(payload: dict, header_id: int, created_
     if created_by and created_by not in cc and created_by != JOB_WORK_TO:
         cc.append(created_by)
     _send_email_background(
+        module=Module.JOB_WORK,
         subject=f"Job Work Challan: {challan_no or header_id}",
         html_body=html,
         plain_body="\n".join(plain_lines),
@@ -1590,6 +1613,7 @@ def notify_job_work_material_in_created(
     if created_by and created_by not in cc and created_by != JOB_WORK_TO:
         cc.append(created_by)
     _send_email_background(
+        module=Module.JOB_WORK,
         subject=f"Job Work Challan: {original_challan_no}",
         html_body=html,
         plain_body="\n".join(plain_lines),
@@ -1733,6 +1757,7 @@ def notify_job_work_material_out_updated(payload: dict, record_id: int, updated_
     if updated_by and updated_by not in cc and updated_by != JOB_WORK_TO:
         cc.append(updated_by)
     _send_email_background(
+        module=Module.JOB_WORK,
         subject=f"Job Work Challan: {challan_no or record_id}",
         html_body=html,
         plain_body="\n".join(plain_lines),
@@ -1775,6 +1800,7 @@ def notify_job_work_material_out_deleted(challan_no: str, record_id: int, delete
     if deleted_by and deleted_by not in cc and deleted_by != JOB_WORK_TO:
         cc.append(deleted_by)
     _send_email_background(
+        module=Module.JOB_WORK,
         subject=f"Job Work Challan: {challan_no or record_id}",
         html_body=html,
         plain_body=plain,
@@ -1819,6 +1845,7 @@ def notify_job_work_material_in_deleted(ir_number: str, ir_id: int, challan_no: 
     if deleted_by and deleted_by not in cc and deleted_by != JOB_WORK_TO:
         cc.append(deleted_by)
     _send_email_background(
+        module=Module.JOB_WORK,
         subject=f"Job Work Challan: {challan_no or ir_id}",
         html_body=html,
         plain_body=plain,
@@ -1866,6 +1893,7 @@ def notify_job_work_status_changed(
     if changed_by and changed_by not in cc and changed_by != JOB_WORK_TO:
         cc.append(changed_by)
     _send_email_background(
+        module=Module.JOB_WORK,
         subject=f"Job Work Challan: {challan_no or header_id}",
         html_body=html,
         plain_body=plain,
@@ -1920,6 +1948,7 @@ def notify_job_work_excess_loss(
     if created_by and created_by not in cc and created_by != JOB_WORK_TO:
         cc.append(created_by)
     _send_email_background(
+        module=Module.JOB_WORK,
         subject=f"Job Work Challan: {challan_no or header_id}",
         html_body=html,
         plain_body=plain,
@@ -2109,6 +2138,15 @@ def send_job_work_weekly_digest() -> None:
         html_body=html,
         plain_body=plain,
         to=WEEKLY_DIGEST_TO,
+        # A digest is a one-off per week, so it can carry a real event subject
+        # without any conversation to break.
+        module=Module.JOB_WORK,
+        policy=SubjectPolicy.EVENT,
+        entity_type="JobWorkDigest",
+        entity_id=str(today),
+        event="WEEKLY_DIGEST",
+        status="report",
+        event_label=f"Weekly digest — {len(open_jwos)} open, {overdue_count} overdue",
     )
     logger.info(f"Weekly digest sent to {WEEKLY_DIGEST_TO}")
 
@@ -2233,4 +2271,13 @@ def notify_inward_deleted(
         html_body=html,
         plain_body=plain,
         to=INWARD_DELETE_TO,
+        # A deletion happens once per transaction — its own row, never a thread.
+        module=Module.INWARD,
+        policy=SubjectPolicy.EVENT,
+        entity_type="InwardTransaction",
+        entity_id=transaction_no,
+        event="INWARD_DELETED",
+        status="deleted",
+        actor=deleted_by,
+        event_label=f"GRN deleted ({company})",
     )

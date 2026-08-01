@@ -60,3 +60,33 @@ def job_work_weekly_digest():
         send_job_work_weekly_digest()
     except Exception as e:
         logger.error(f"Weekly jobwork digest failed: {e}")
+
+
+def daily_report_evening():
+    """Run at 7 PM IST — email the day's inward & transfer report.
+
+    Sends every Mon-Sat; on Sunday only when the day actually had activity.
+    """
+    logger.info("Running daily inward/transfer report (evening)...")
+    try:
+        from services.ims_service.daily_report import run_evening_report
+        result = run_evening_report()
+        logger.info(f"Daily report (evening): {result}")
+    except Exception as e:
+        logger.error(f"Daily report (evening) failed: {e}")
+
+
+def daily_report_morning_revision():
+    """Run at 10:30 AM IST — re-send yesterday's report only if it changed.
+
+    Covers entries keyed after the 7 PM cut-off, and doubles as a catch-up when
+    the evening send never happened (host idled the service through 7 PM).
+    Sends nothing when yesterday's figures are unchanged.
+    """
+    logger.info("Running daily inward/transfer report (morning revision check)...")
+    try:
+        from services.ims_service.daily_report import run_morning_revision
+        result = run_morning_revision()
+        logger.info(f"Daily report (morning revision): {result}")
+    except Exception as e:
+        logger.error(f"Daily report (morning revision) failed: {e}")

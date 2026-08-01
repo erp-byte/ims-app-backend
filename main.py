@@ -15,11 +15,17 @@ from shared.database import engine, SessionLocal
 from shared.logger import get_logger
 from shared.middleware import RouteObfuscationMiddleware
 from shared.kafka_producer import shutdown_executor
-from shared.scheduler import auto_punch_out_and_revoke
+from shared.timezone import IST
+from shared.scheduler import (
+    auto_punch_out_and_revoke,
+    daily_report_evening,
+    daily_report_morning_revision,
+)
 from shared.email_reply_listener import poll_once as rtv_email_poll, shutdown as rtv_email_shutdown
 from services.auth_service.server import router as auth_router
 from services.ims_service.server import router as ims_router
 from services.ims_service.inward_server import router as inward_router
+from services.ims_service.daily_report_server import router as daily_report_router
 from services.ims_service.interunit_server import router as interunit_router
 from services.ims_service.cold_storage_server import router as cold_storage_router
 from services.cold_storage_service.server import router as cold_storage_service_router
@@ -252,6 +258,27 @@ async def lifespan(app: FastAPI):
         IntervalTrigger(minutes=7),
         id="keep_alive",
     )
+    # Daily inward & transfer report — 7:00 PM IST every day. The job itself
+    # applies the Sunday rule (send only if the day had activity), so the
+    # trigger stays simple and the decision lives with the data.
+    scheduler.add_job(
+        daily_report_evening,
+        CronTrigger(hour=19, minute=0, timezone=IST),
+        id="daily_report_evening",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,   # still fire if the worker was busy/asleep briefly
+    )
+    # 10:30 AM IST — re-send yesterday only if entries landed after the 7 PM
+    # cut-off, or if yesterday's evening send was missed entirely.
+    scheduler.add_job(
+        daily_report_morning_revision,
+        CronTrigger(hour=10, minute=30, timezone=IST),
+        id="daily_report_morning_revision",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
     if settings.RTV_EMAIL_APPROVAL_ENABLED:
         scheduler.add_job(
             rtv_email_poll,
@@ -268,6 +295,18 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("Scheduler started — auto punch-out at 11:00 PM IST daily")
     logger.info("Keep-alive ping scheduled every 7 minutes")
+    logger.info(
+        "Daily inward/transfer report scheduled — 7:00 PM IST daily "
+        "(Sunday only if there was activity), revision check 10:30 AM IST"
+    )
+
+    # A missed 7 PM send (host asleep / mid-deploy) would otherwise be lost
+    # silently, so on boot we settle any recent business day that never went out.
+    try:
+        from services.ims_service.daily_report import run_startup_catchup
+        run_startup_catchup()
+    except Exception as exc:
+        logger.warning("Daily report catch-up could not start: %s", exc)
 
     yield
 
@@ -324,6 +363,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(ims_router)
 app.include_router(inward_router)
+app.include_router(daily_report_router)
 app.include_router(interunit_router)
 app.include_router(cold_storage_router)
 app.include_router(cold_storage_service_router)

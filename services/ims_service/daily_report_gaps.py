@@ -90,14 +90,23 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
-# "1 of 2 job cards do not balance" reads as a typo, and a summary that looks
-# careless gets treated as one.
-def _has(n: int) -> str:
-    return "has" if n == 1 else "have"
+# "1 of 2 job cards do not balance" and "1 of 1 sample requisitions" both read
+# as typos, and a summary that looks careless gets treated as one.
+def _has(singular: bool) -> str:
+    return "has" if singular else "have"
 
 
-def _does(n: int) -> str:
-    return "does" if n == 1 else "do"
+def _does(singular: bool) -> str:
+    return "does" if singular else "do"
+
+
+def _share(k: int, total: int, noun: str) -> tuple[str, bool]:
+    """'The only X' / 'All N Xs' / 'k of N Xs', plus whether it reads singular."""
+    if total <= 1:
+        return f"The only {noun}", True
+    if k >= total:
+        return f"All {total} {noun}s", False
+    return f"{k} of {total} {noun}s", k == 1
 
 
 def _gap(module: str, site: str, message: str, rank: int) -> dict:
@@ -252,24 +261,28 @@ def _jobcard_gaps(jc, expected: set[str]) -> list[dict]:
             gaps.append(_gap("jobcards", name, "No job card closed today", R_UNFINISHED))
 
         if v.get("no_acct"):
-            k = v["no_acct"]
+            s, one = _share(v["no_acct"], n, "job card")
             gaps.append(_gap("jobcards", name,
-                             f"{k} of {n} job cards {_has(k)} no accounting entry",
-                             R_MISSING_DATA))
+                             f"{s} {_has(one)} no accounting entry", R_MISSING_DATA))
         if v.get("unbalanced"):
-            u = v["unbalanced"]
+            s, one = _share(v["unbalanced"], v["acct_rows"], "accounted job card")
             gaps.append(_gap("jobcards", name,
-                             f"{u} of {v['acct_rows']} accounted job cards {_does(u)} "
-                             f"not balance", R_MISSING_DATA))
+                             f"{s} {_does(one)} not balance", R_MISSING_DATA))
         if not v["users"]:
             gaps.append(_gap("jobcards", name,
-                             f"{_plural(n, 'job card')} {_has(n)} no team leader named",
-                             R_MISSING_DATA))
+                             f"{_plural(n, 'job card')} {_has(n == 1)} no team leader "
+                             f"named", R_MISSING_DATA))
         if v.get("no_fg"):
-            k = v["no_fg"]
+            s, one = _share(v["no_fg"], n, "job card")
             gaps.append(_gap("jobcards", name,
-                             f"{k} of {n} job cards {_has(k)} no FG item", R_MISSING_DATA))
+                             f"{s} {_has(one)} no FG item", R_MISSING_DATA))
     return gaps
+
+
+# A requisition that was rejected or cancelled is finished business. Its blank
+# fields are never going to be filled in, so reporting them daily is noise that
+# can only ever be ignored — the data-quality rules run over live ones only.
+_DEAD_SAMPLE = {"CANCELLED", "REJECTED", "BH_REJECTED"}
 
 
 def _sample_gaps(sm, expected: set[str], canon_site) -> list[dict]:
@@ -288,25 +301,37 @@ def _sample_gaps(sm, expected: set[str], canon_site) -> list[dict]:
                          "No sample requisition or NPD card raised", R_SILENT))
 
     for site, v in sorted(by_site.items()):
-        reqs, npd = v["reqs"], v["npd"]
+        live = [r for r in v["reqs"]
+                if str(r.get("status") or "").strip().upper() not in _DEAD_SAMPLE]
+        total = len(live)
 
-        unmapped = [r for r in reqs if not (r.get("sale_groups") or "").strip()]
-        if unmapped:
-            k = len(unmapped)
+        # Two different faults that both surface as a blank sales group, and
+        # they need different people: an empty requisition is the requester's
+        # to fix, an unmapped SKU is the master-data owner's.
+        bare = [r for r in live if not r.get("articles")]
+        if bare:
+            s, one = _share(len(bare), total, "sample requisition")
             gaps.append(_gap("samples", site,
-                             f"{k} of {len(reqs)} sample requisitions {_has(k)} no sales "
-                             f"group in all_sku", R_MISSING_DATA))
+                             f"{s} {_has(one)} no article lines added", R_MISSING_DATA))
 
-        faceless = [r for r in reqs
+        unmapped = [r for r in live
+                    if r.get("articles") and not (r.get("sale_groups") or "").strip()]
+        if unmapped:
+            s, one = _share(len(unmapped), total, "sample requisition")
+            gaps.append(_gap("samples", site,
+                             f"{s} {_has(one)} articles not mapped to a sales group in "
+                             f"all_sku", R_MISSING_DATA))
+
+        faceless = [r for r in live
                     if not (r.get("customer_name") or r.get("company_name") or "").strip()
                     and not (r.get("npd_target_name") or "").strip()]
         if faceless:
             k = len(faceless)
             gaps.append(_gap("samples", site,
-                             f"{_plural(k, 'sample requisition')} {_has(k)} no customer "
-                             f"named", R_MISSING_DATA))
+                             f"{_plural(k, 'sample requisition')} {_has(k == 1)} no "
+                             f"customer named", R_MISSING_DATA))
 
-        open_npd = [n for n in npd
+        open_npd = [n for n in v["npd"]
                     if str(n.get("status") or "").strip().upper() not in
                     ("CLOSED", "CANCELLED") and not n.get("output_qty")]
         if open_npd:

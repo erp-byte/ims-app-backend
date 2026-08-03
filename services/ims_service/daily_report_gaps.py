@@ -59,28 +59,49 @@ MIN_ACTIVE_DAYS = 3     # absolute floor, so a one-off site is never flagged
 MIN_SHARE = 0.40        # ...and it must cover 40% of the module's own active days
 MIN_MODULE_DAYS = 8     # below this the module is occasional: no per-site flags
 
-# Rank orders the panel: the whole module being silent outranks one site being
-# silent, which outranks work left unfinished, which outranks a blank field.
-R_MODULE_SILENT = 0
-R_SITE_SILENT = 1
-R_UNFINISHED = 2
-R_MISSING_DATA = 3
+# Rank orders the phrases inside a warehouse's line: nothing entered at all
+# outranks work left unfinished, which outranks a field left blank.
+R_SILENT = 0
+R_UNFINISHED = 1
+R_MISSING_DATA = 2
 
-ALL_SITES = ""          # a gap that belongs to the company, not to one warehouse
-
-_UNKNOWN = {"(unassigned)", "(uncategorised)", "(blank)", "-", "", "none", "null"}
+# EVERY gap names a warehouse. There was briefly an "All sites" bucket for the
+# figures that are aggregated company-wide — unbalanced job cards, requisitions
+# with no sales group — but nobody owns "All sites", so nobody acts on it. Each
+# of those is attributable: accounting rows carry a factory, requisitions carry
+# a warehouse. They are counted per site now, and a module that is silent
+# everywhere reports once per site that should have reported rather than once
+# for the company.
+_UNKNOWN = {"(uncategorised)", "(blank)", "-", "", "none", "null"}
+UNASSIGNED = "(No warehouse)"
 
 
 def _unknown(site) -> bool:
     return str(site or "").strip().lower() in _UNKNOWN
 
 
+def _site(raw) -> str:
+    """A blank warehouse is still a bucket — one that says its own name."""
+    s = str(raw or "").strip()
+    return UNASSIGNED if not s or s.lower() in _UNKNOWN or s == "(Unassigned)" else s
+
+
 def _plural(n: int, word: str) -> str:
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
+# "1 of 2 job cards do not balance" reads as a typo, and a summary that looks
+# careless gets treated as one.
+def _has(n: int) -> str:
+    return "has" if n == 1 else "have"
+
+
+def _does(n: int) -> str:
+    return "does" if n == 1 else "do"
+
+
 def _gap(module: str, site: str, message: str, rank: int) -> dict:
-    return {"module": module, "site": site or ALL_SITES, "text": message, "rank": rank}
+    return {"module": module, "site": _site(site), "text": message, "rank": rank}
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -182,49 +203,37 @@ def _inward_gaps(agg, expected: set[str]) -> list[dict]:
     gaps: list[dict] = []
     active = {name for name, w in agg["wh"].items() if w["itx"]}
 
-    if not agg["head"]["inw_txns"]:
-        gaps.append(_gap("inward", ALL_SITES, "No inward anywhere", R_MODULE_SILENT))
-    else:
-        for site in sorted(expected - active):
-            gaps.append(_gap("inward", site, "No inward entered", R_SITE_SILENT))
+    for site in sorted(expected - active):
+        gaps.append(_gap("inward", site, "No inward entry made", R_SILENT))
 
     for name, w in sorted(agg["wh"].items()):
         if not w["itx"]:
             continue
-        if _unknown(name):
-            gaps.append(_gap("inward", "(Unassigned)",
-                             f"{_plural(len(w['itx']), 'entry')} without a warehouse",
-                             R_MISSING_DATA))
+        if _unknown(name) or name == "(Unassigned)":
+            gaps.append(_gap("inward", name,
+                             f"{_plural(len(w['itx']), 'inward entry')} saved with no "
+                             f"warehouse", R_MISSING_DATA))
         lines, miss = w.get("ilines", 0), w.get("imiss", 0)
         if miss and lines:
-            where = "the only line" if lines == 1 else (
+            where = "its only line" if lines == 1 else (
                 f"all {lines} lines" if miss == lines else f"{miss} of {lines} lines")
-            gaps.append(_gap("inward", name, f"Value blank on {where}", R_MISSING_DATA))
+            gaps.append(_gap("inward", name,
+                             f"Inward value not entered on {where}", R_MISSING_DATA))
     return gaps
 
 
 def _transfer_gaps(agg, expected: set[str]) -> list[dict]:
     gaps: list[dict] = []
-    h = agg["head"]
     active = {name for name, w in agg["wh"].items() if w["och"] or w["igrn"]}
-
-    if not (h["out_chl"] or h["in_grn"]):
-        gaps.append(_gap("transfers", ALL_SITES, "No transfers anywhere", R_MODULE_SILENT))
-    else:
-        for site in sorted(expected - active):
-            gaps.append(_gap("transfers", site, "No transfers in or out", R_SITE_SILENT))
-    return gaps
+    return gaps + [_gap("transfers", site, "No transfer dispatched or received", R_SILENT)
+                   for site in sorted(expected - active)]
 
 
 def _jobcard_gaps(jc, expected: set[str]) -> list[dict]:
     gaps: list[dict] = []
 
-    if jc["empty"]:
-        gaps.append(_gap("jobcards", ALL_SITES, "No job cards anywhere", R_MODULE_SILENT))
-        return gaps
-
     for site in sorted(expected - set(jc["wh"])):
-        gaps.append(_gap("jobcards", site, "No job cards entered", R_SITE_SILENT))
+        gaps.append(_gap("jobcards", site, "No job card initiated or entered", R_SILENT))
 
     for name, v in sorted(jc["wh"].items()):
         n = len(v["cards"])
@@ -235,65 +244,75 @@ def _jobcard_gaps(jc, expected: set[str]) -> list[dict]:
         started = len(v.get("started", ()))
 
         if not closed and not closed_today:
-            state = "open, none closed" if started else "planned, none started"
+            state = ("open, none closed today" if started
+                     else "planned, none started today")
             gaps.append(_gap("jobcards", name,
                              f"{_plural(n, 'job card')} {state}", R_UNFINISHED))
         elif not closed_today:
-            gaps.append(_gap("jobcards", name, "None closed today", R_UNFINISHED))
+            gaps.append(_gap("jobcards", name, "No job card closed today", R_UNFINISHED))
 
         if v.get("no_acct"):
+            k = v["no_acct"]
             gaps.append(_gap("jobcards", name,
-                             f"{v['no_acct']} of {n} without accounting", R_MISSING_DATA))
+                             f"{k} of {n} job cards {_has(k)} no accounting entry",
+                             R_MISSING_DATA))
+        if v.get("unbalanced"):
+            u = v["unbalanced"]
+            gaps.append(_gap("jobcards", name,
+                             f"{u} of {v['acct_rows']} accounted job cards {_does(u)} "
+                             f"not balance", R_MISSING_DATA))
         if not v["users"]:
             gaps.append(_gap("jobcards", name,
-                             f"{_plural(n, 'job card')} without a team leader",
+                             f"{_plural(n, 'job card')} {_has(n)} no team leader named",
                              R_MISSING_DATA))
         if v.get("no_fg"):
+            k = v["no_fg"]
             gaps.append(_gap("jobcards", name,
-                             f"{v['no_fg']} of {n} without an FG item", R_MISSING_DATA))
-
-    loss = jc.get("loss") or {}
-    if loss.get("unbalanced"):
-        gaps.append(_gap("jobcards", ALL_SITES,
-                         f"{loss['unbalanced']} of {loss['rows']} job cards unbalanced",
-                         R_MISSING_DATA))
+                             f"{k} of {n} job cards {_has(k)} no FG item", R_MISSING_DATA))
     return gaps
 
 
 def _sample_gaps(sm, expected: set[str], canon_site) -> list[dict]:
+    """Requisitions and NPD cards both carry a warehouse, so both are filed under
+    one rather than pooled into a company-wide count nobody owns."""
     gaps: list[dict] = []
 
-    if sm["empty"]:
-        gaps.append(_gap("samples", ALL_SITES, "No sample or NPD activity", R_MODULE_SILENT))
-        return gaps
+    by_site: dict[str, dict] = defaultdict(lambda: {"reqs": [], "npd": []})
+    for r in sm["requisitions"]:
+        by_site[_site(canon_site(r.get("warehouse")))]["reqs"].append(r)
+    for n in sm["npd_jobcards"]:
+        by_site[_site(canon_site(n.get("warehouse")))]["npd"].append(n)
 
-    active = {canon_site(r.get("warehouse")) for r in sm["requisitions"]}
-    active |= {canon_site(n.get("warehouse")) for n in sm["npd_jobcards"]}
-    for site in sorted(expected - active):
-        gaps.append(_gap("samples", site, "No sample or NPD activity", R_SITE_SILENT))
+    for site in sorted(expected - set(by_site)):
+        gaps.append(_gap("samples", site,
+                         "No sample requisition or NPD card raised", R_SILENT))
 
-    total = len(sm["requisitions"])
-    unmapped = [r for r in sm["requisitions"] if not (r.get("sale_groups") or "").strip()]
-    if unmapped:
-        gaps.append(_gap("samples", ALL_SITES,
-                         f"{len(unmapped)} of {total} requisitions without a sales group",
-                         R_MISSING_DATA))
+    for site, v in sorted(by_site.items()):
+        reqs, npd = v["reqs"], v["npd"]
 
-    faceless = [r for r in sm["requisitions"]
-                if not (r.get("customer_name") or r.get("company_name") or "").strip()
-                and not (r.get("npd_target_name") or "").strip()]
-    if faceless:
-        gaps.append(_gap("samples", ALL_SITES,
-                         f"{_plural(len(faceless), 'requisition')} without a customer",
-                         R_MISSING_DATA))
+        unmapped = [r for r in reqs if not (r.get("sale_groups") or "").strip()]
+        if unmapped:
+            k = len(unmapped)
+            gaps.append(_gap("samples", site,
+                             f"{k} of {len(reqs)} sample requisitions {_has(k)} no sales "
+                             f"group in all_sku", R_MISSING_DATA))
 
-    open_npd = [n for n in sm["npd_jobcards"]
-                if str(n.get("status") or "").strip().upper() not in
-                ("CLOSED", "CANCELLED") and not n.get("output_qty")]
-    if open_npd:
-        gaps.append(_gap("samples", ALL_SITES,
-                         f"{_plural(len(open_npd), 'NPD card')} without output qty",
-                         R_MISSING_DATA))
+        faceless = [r for r in reqs
+                    if not (r.get("customer_name") or r.get("company_name") or "").strip()
+                    and not (r.get("npd_target_name") or "").strip()]
+        if faceless:
+            k = len(faceless)
+            gaps.append(_gap("samples", site,
+                             f"{_plural(k, 'sample requisition')} {_has(k)} no customer "
+                             f"named", R_MISSING_DATA))
+
+        open_npd = [n for n in npd
+                    if str(n.get("status") or "").strip().upper() not in
+                    ("CLOSED", "CANCELLED") and not n.get("output_qty")]
+        if open_npd:
+            gaps.append(_gap("samples", site,
+                             f"{_plural(len(open_npd), 'NPD card')} open with no output "
+                             f"quantity", R_MISSING_DATA))
     return gaps
 
 
@@ -333,28 +352,28 @@ def compute_gaps(db: Session, day: date, agg: dict, ops: dict, *, canon_site) ->
     return gaps
 
 
-# Reading order inside a warehouse's line. Grouping by module keeps the
-# same-coloured phrases adjacent, which is what makes a run-on line scannable;
-# ordering by rank instead would interleave two modules and read as noise.
+# Tie-break only. Severity leads inside a warehouse's line — "no job card
+# entered" has to come before "one card has no FG item" — and each phrase names
+# its own subject, so modules interleaving costs nothing.
 _MODULE_ORDER = {"inward": 0, "transfers": 1, "jobcards": 2, "samples": 3}
 
 
 def group_by_site(gaps: list[dict]) -> list[tuple[str, list[dict]]]:
     """Warehouse-first ordering, because that is how the panel is read.
 
-    A site is judged by its worst gap, then by how many it has. Company-wide
-    items are pushed to the end: they are real, but a supervisor scans for their
-    own warehouse first.
+    A site is judged by its worst gap, then by how many it has. The bucket for
+    records saved without a warehouse sorts last — it is a data-entry fault
+    rather than a place, and no one goes looking for it first.
     """
     by_site: dict[str, list[dict]] = defaultdict(list)
     for g in gaps:
         by_site[g["site"]].append(g)
     for rows in by_site.values():
-        rows.sort(key=lambda g: (_MODULE_ORDER.get(g["module"], 9), g["rank"], g["text"]))
+        rows.sort(key=lambda g: (g["rank"], _MODULE_ORDER.get(g["module"], 9), g["text"]))
 
     def order(item):
         site, rows = item
-        return (1 if site == ALL_SITES else 0,
+        return (1 if site == UNASSIGNED else 0,
                 min(r["rank"] for r in rows), -len(rows), site)
 
     return sorted(by_site.items(), key=order)

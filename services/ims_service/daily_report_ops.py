@@ -123,7 +123,8 @@ def aggregate_jobcards(rows: list[dict], day: date | None = None) -> dict:
     wh = defaultdict(lambda: {"cards": set(), "users": set(), "fg": set(),
                               "kg": 0.0, "units": 0.0, "status": defaultdict(int),
                               "closed": set(), "closed_today": set(), "started": set(),
-                              "no_fg": 0, "no_acct": 0})
+                              "no_fg": 0, "no_acct": 0,
+                              "acct_rows": 0, "unbalanced": 0})
     status_all = defaultdict(int)
     users_all: set[str] = set()
     fg_all: set[str] = set()
@@ -166,6 +167,12 @@ def aggregate_jobcards(rows: list[dict], day: date | None = None) -> dict:
         acct_seen.add(key)
         acct_rows += 1
         balanced += 1 if r["is_balanced"] else 0
+        # ...and again per factory, so "does not balance" can name a warehouse
+        # instead of landing in a company-wide total nobody owns.
+        fb = wh[canon_factory(r["factory"])]
+        fb["acct_rows"] += 1
+        if not r["is_balanced"]:
+            fb["unbalanced"] += 1
         loss["input"] += _f(r["total_input_qty"])
         loss["output"] += _f(r["output_qty"])
         loss["process"] += _f(r["process_loss_qty"])

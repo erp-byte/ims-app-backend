@@ -25,7 +25,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from html import escape
 
-from services.ims_service.daily_report_gaps import ALL_SITES, group_by_site
+from services.ims_service.daily_report_gaps import group_by_site
 
 NAVY = "#29417A"
 NAVY_D = "#1F3260"
@@ -275,7 +275,6 @@ def gaps_panel(gaps: list[dict]) -> str:
     dot = f'<span style="color:{GREY};font-weight:400;"> &middot; </span>'
     rows_html = ""
     for i, (site, rows) in enumerate(group_by_site(gaps)):
-        named = site != ALL_SITES
         phrases = dot.join(
             f'<span style="color:{(SECTION.get(g["module"]) or {}).get("deep", INK)};">'
             f'{e(g["text"])}</span>' for g in rows
@@ -285,8 +284,7 @@ def gaps_panel(gaps: list[dict]) -> str:
             + (f'border-top:1px solid {ALERT_RULE};' if i else '')
             + f'font:700 {FS_GAP}px/1.45 Arial,Helvetica,sans-serif;color:{INK};">'
             f'<span style="color:{ALERT};">&bull;&nbsp;</span>'
-            f'<span style="color:{ALERT_DEEP if named else GREY};">'
-            f'{e(site if named else "All sites")}</span>'
+            f'<span style="color:{ALERT_DEEP};">{e(site)}</span>'
             f'<span style="color:{GREY};font-weight:400;"> &mdash; </span>'
             f'{phrases}</div>'
         )

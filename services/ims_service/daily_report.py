@@ -52,7 +52,7 @@ from shared.logger import get_logger
 from shared.timezone import IST, now_ist
 from shared.mail_identity import Module, SubjectPolicy, stamp
 from services.ims_service.daily_report_ops import fetch_and_aggregate as ops_data
-from services.ims_service.daily_report_gaps import ALL_SITES, compute_gaps
+from services.ims_service.daily_report_gaps import compute_gaps
 from services.ims_service.daily_report_html import render_email, render_page
 
 logger = get_logger("daily_report")
@@ -998,7 +998,7 @@ def send_report(day: date, *, kind: str, revised: bool = False,
                 "revised": revised, "fingerprint": fp,
                 "inward_txns": h["inw_txns"], "transfer_out": h["out_chl"],
                 "transfer_in": h["in_grn"], "gaps": len(gaps),
-                "gap_sites": sorted({g["site"] for g in gaps if g["site"] != ALL_SITES})}
+                "gap_sites": sorted({g["site"] for g in gaps})}
     except Exception as exc:                                  # noqa: BLE001
         logger.error("Daily report %s (%s) FAILED: %s", day, kind, exc)
         try:

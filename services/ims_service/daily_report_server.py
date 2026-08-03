@@ -24,11 +24,13 @@ from services.ims_service.daily_report import (
     REPORT_TO,
     aggregate,
     build_pdf,
+    canon_wh,
     ensure_log_table,
     fetch,
     send_report,
 )
 from services.ims_service.daily_report_ops import fetch_and_aggregate as ops_data
+from services.ims_service.daily_report_gaps import compute_gaps
 from services.ims_service.daily_report_html import render_email, render_page
 
 logger = get_logger("daily_report_server")
@@ -70,7 +72,8 @@ def view(day: str | None = Query(default=None, description="YYYY-MM-DD, defaults
     d = _parse_day(day)
     agg = aggregate(fetch(db, d))
     ops = ops_data(db, d)
-    return HTMLResponse(render_page(d, agg, ops, now_ist()))
+    gaps = compute_gaps(db, d, agg, ops, canon_site=canon_wh)
+    return HTMLResponse(render_page(d, agg, ops, now_ist(), gaps=gaps))
 
 
 @router.get("/email-preview", response_class=HTMLResponse)
@@ -81,9 +84,10 @@ def email_preview(day: str | None = Query(default=None),
     d = _parse_day(day)
     agg = aggregate(fetch(db, d))
     ops = ops_data(db, d)
+    gaps = compute_gaps(db, d, agg, ops, canon_site=canon_wh)
     from services.ims_service.daily_report import view_url
-    return HTMLResponse(render_email(d, agg, ops, now_ist(),
-                                     revised=revised, view_url=view_url(d)))
+    return HTMLResponse(render_email(d, agg, ops, now_ist(), revised=revised,
+                                     view_url=view_url(d), gaps=gaps))
 
 
 @router.get("/summary")
@@ -97,6 +101,7 @@ def summary(day: str | None = Query(default=None), db: Session = Depends(get_db)
     return {
         "day": str(d),
         "empty": agg["empty"] and jc["empty"] and sm["empty"],
+        "gaps": compute_gaps(db, d, agg, ops, canon_site=canon_wh),
         "jobcards": {"active": jc["total_cards"], "users": jc["total_users"],
                      "fg_items": jc["total_fg"], "planned_kg": round(jc["total_kg"], 3),
                      "status": jc["status"], "loss": jc["loss"]},

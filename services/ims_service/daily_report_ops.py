@@ -51,6 +51,13 @@ def canon_factory(raw: str | None) -> str:
     return _FACTORY_ALIASES.get(raw.strip().lower().replace(" ", ""), raw.strip())
 
 
+# The only two states that mean a card is finished. Checked against the live
+# table rather than assumed: every `completed`/`closed` card has both a
+# start_time and an end_time, while all 430 `locked`/`unlocked`/`assigned` cards
+# have neither and carry no accounting row — those are planned, not worked.
+JC_CLOSED_STATES = {"completed", "closed"}
+
+
 def _clean_person(raw: str | None) -> str:
     """Team-leader names are free text ('Monika'/'MONIKA'/'monika')."""
     if not raw or not raw.strip():
@@ -96,18 +103,27 @@ def fetch_jobcards(db: Session, day: date) -> list[dict]:
         return []
 
 
-def aggregate_jobcards(rows: list[dict]) -> dict:
-    """Warehouse-wise cards/users/FG/qty, status counts and the loss accounting."""
+def aggregate_jobcards(rows: list[dict], day: date | None = None) -> dict:
+    """Warehouse-wise cards/users/FG/qty, status counts and the loss accounting.
+
+    Also records, per factory, what did NOT happen — cards never started, cards
+    worked on but not closed, cards with no accounting entry. The exception panel
+    is built from these; counting them here rather than re-querying keeps the two
+    views of a day from disagreeing.
+    """
     # One job card can have several accounting rows; keep card-level facts unique.
     cards: dict[object, dict] = {}
     acct_seen: set[tuple] = set()
+    acct_cards: set[object] = set()
     loss = defaultdict(float)
     acct_rows = balanced = 0
     pct_proc: list[float] = []
     pct_total: list[float] = []
 
     wh = defaultdict(lambda: {"cards": set(), "users": set(), "fg": set(),
-                              "kg": 0.0, "units": 0.0, "status": defaultdict(int)})
+                              "kg": 0.0, "units": 0.0, "status": defaultdict(int),
+                              "closed": set(), "closed_today": set(), "started": set(),
+                              "no_fg": 0, "no_acct": 0})
     status_all = defaultdict(int)
     users_all: set[str] = set()
     fg_all: set[str] = set()
@@ -126,14 +142,23 @@ def aggregate_jobcards(rows: list[dict]) -> dict:
             if r["fg_sku_name"]:
                 b["fg"].add(r["fg_sku_name"])
                 fg_all.add(r["fg_sku_name"])
+            else:
+                b["no_fg"] += 1
             if person != "(Unassigned)":
                 b["users"].add(person)
                 users_all.add(person)
+            if str(r["status"] or "").strip().lower() in JC_CLOSED_STATES:
+                b["closed"].add(jid)
+            if r["started_on"]:
+                b["started"].add(jid)
+            if day is not None and r["ended_on"] == day:
+                b["closed_today"].add(jid)
             status_all[r["status"] or "(blank)"] += 1
 
         # accounting is per (card, output row); dedupe on the measured tuple
         if r["total_input_qty"] is None and r["output_qty"] is None:
             continue
+        acct_cards.add(jid)
         key = (jid, r["total_input_qty"], r["output_qty"], r["process_loss_qty"],
                r["balance_difference_qty"])
         if key in acct_seen:
@@ -160,8 +185,13 @@ def aggregate_jobcards(rows: list[dict]) -> dict:
     loss["balanced"] = balanced
     loss["unbalanced"] = acct_rows - balanced
 
+    for b in wh.values():
+        b["no_acct"] = len(b["cards"] - acct_cards)
+
     return {
         "rows": list(cards.values()),
+        "acct_cards": acct_cards,
+        "no_acct": len(set(cards) - acct_cards),
         "wh": wh,
         "status": dict(status_all),
         "loss": dict(loss),
@@ -310,6 +340,6 @@ def aggregate_samples(data: dict) -> dict:
 
 def fetch_and_aggregate(db: Session, day: date) -> dict:
     """Both extra sections in one call, so callers stay simple."""
-    jc = aggregate_jobcards(fetch_jobcards(db, day))
+    jc = aggregate_jobcards(fetch_jobcards(db, day), day)
     sm = aggregate_samples(fetch_samples(db, day))
     return {"jobcards": jc, "samples": sm}

@@ -52,6 +52,7 @@ from shared.logger import get_logger
 from shared.timezone import IST, now_ist
 from shared.mail_identity import Module, SubjectPolicy, stamp
 from services.ims_service.daily_report_ops import fetch_and_aggregate as ops_data
+from services.ims_service.daily_report_gaps import ALL_SITES, compute_gaps
 from services.ims_service.daily_report_html import render_email, render_page
 
 logger = get_logger("daily_report")
@@ -378,7 +379,10 @@ def src_site(row) -> str:
 
 
 def _mk():
-    return {"itx": set(), "im": Measure(), "ival": 0.0, "imiss": 0,
+    # `ilines` / `imiss` are the pair behind "value not entered on 4 of 8 lines":
+    # a bare count of blanks cannot say whether that is most of the day's keying
+    # or one line out of fifty.
+    return {"itx": set(), "im": Measure(), "ival": 0.0, "ilines": 0, "imiss": 0,
             "och": set(), "om": Measure(), "igrn": set(), "inm": Measure()}
 
 
@@ -419,6 +423,7 @@ def aggregate(data: dict) -> dict:
 
         if has_line:
             art_lines += 1
+            w["ilines"] += 1
             if not val:
                 miss_lines += 1
                 w["imiss"] += 1
@@ -469,6 +474,13 @@ def fingerprint(agg: dict, ops: dict | None = None) -> str:
 
     Job cards and samples are included, so a late job card or sample approval
     triggers the revision just as a late GRN would.
+
+    The exception panel is deliberately NOT fingerprinted. Every gap it can
+    report is derived from figures already in here — entering the missing value
+    or closing the job card moves those figures — so filling a gap still
+    triggers a revision. What it avoids is re-mailing a whole report because a
+    site drifted across the 30-day "normally active" threshold overnight, which
+    changes the panel without anything having actually happened.
     """
     h = agg["head"]
     parts = [
@@ -783,7 +795,23 @@ def build_pdf(day: date, agg: dict, generated: datetime, *, revised: bool = Fals
 # ═════════════════════════════════════════════════════════════════════════
 #  EMAIL
 # ═════════════════════════════════════════════════════════════════════════
-def _plain_summary(day: date, agg: dict, ops: dict, revised: bool) -> str:
+def _plain_gaps(gaps: list[dict]) -> list[str]:
+    """The exception panel as text — same warehouse-first grouping as the HTML."""
+    from services.ims_service.daily_report_gaps import group_by_site
+    if not gaps:
+        return ["NOT ENTERED TODAY",
+                "  Nothing missing - every site that normally reports has entered its "
+                "inward, transfers and job cards."]
+    out = [f"NOT ENTERED TODAY - {len(gaps)} item(s) need attention"]
+    for site, rows in group_by_site(gaps):
+        out.append(f"  {site or 'All sites'}")
+        for g in rows:
+            out.append(f"    [{g['module'].upper()}] {g['text']}")
+    return out
+
+
+def _plain_summary(day: date, agg: dict, ops: dict, revised: bool,
+                   gaps: list[dict] | None = None) -> str:
     """Text alternative. Clients that refuse HTML still get the day's numbers."""
     h, vg = agg["head"], agg["val_gap"]
     jc, sm = ops["jobcards"], ops["samples"]
@@ -795,6 +823,7 @@ def _plain_summary(day: date, agg: dict, ops: dict, revised: bool) -> str:
     lines = [
         f"Daily Report{' - REVISED' if revised else ''}: {day:%A, %d %B %Y}",
         "", banner, "",
+        *_plain_gaps(gaps or []), "",
         "INWARD",
         f"  {h['inw_txns']} transactions | {h['inw_m'].phrase()} | Rs. {inr(h['inw_val'])}",
     ]
@@ -945,9 +974,10 @@ def send_report(day: date, *, kind: str, revised: bool = False,
             return {"day": str(day), "status": "skipped_empty", "sent": False}
 
         generated = now_ist()
+        gaps = compute_gaps(db, day, agg, ops, canon_site=canon_wh)
         html = render_email(day, agg, ops, generated,
-                            revised=revised, view_url=view_url(day))
-        plain = _plain_summary(day, agg, ops, revised)
+                            revised=revised, view_url=view_url(day), gaps=gaps)
+        plain = _plain_summary(day, agg, ops, revised, gaps)
         # The first send of a day owns the thread anchor; anything after it replies
         # into that same conversation.
         anchor = day_anchor(day)
@@ -970,7 +1000,8 @@ def send_report(day: date, *, kind: str, revised: bool = False,
         return {"day": str(day), "status": "sent", "sent": True, "kind": kind,
                 "revised": revised, "fingerprint": fp,
                 "inward_txns": h["inw_txns"], "transfer_out": h["out_chl"],
-                "transfer_in": h["in_grn"]}
+                "transfer_in": h["in_grn"], "gaps": len(gaps),
+                "gap_sites": sorted({g["site"] for g in gaps if g["site"] != ALL_SITES})}
     except Exception as exc:                                  # noqa: BLE001
         logger.error("Daily report %s (%s) FAILED: %s", day, kind, exc)
         try:

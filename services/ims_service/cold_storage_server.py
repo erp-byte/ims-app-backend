@@ -31,6 +31,36 @@ def _get_cold_table(company: Optional[str]) -> str:
     return table
 
 
+# Stable identity of one cold-stock pile. /stocks/search groups by exactly these
+# columns and /stocks/pick-boxes filters on the SAME expression, so the row the
+# operator clicked in the list is the row the picker draws boxes from.
+#
+# Before this key existed, search grouped by 6 columns but pick-boxes filtered on
+# only 3 (item, lot, inward_no) — two piles of the same lot that differed by date /
+# unit / site / mark were one pick key, so the 2nd pile re-picked the 1st pile's
+# boxes (blocked add, or a save rejected as duplicate box_id). Lot-less piles were
+# unpickable outright because `CAST(lot_no AS TEXT) = ''` is NULL for a NULL lot.
+_PILE_KEY_SQL = """md5(concat_ws('|',
+        COALESCE(item_description, ''),
+        COALESCE(CAST(lot_no AS TEXT), ''),
+        COALESCE(inward_no, ''),
+        COALESCE(item_mark, ''),
+        COALESCE(storage_location, ''),
+        COALESCE(unit, ''),
+        COALESCE(CAST(inward_dt AS TEXT), '')))"""
+
+# Same tuple, as GROUP BY / equality terms.
+_PILE_COLS = (
+    "item_description",
+    "COALESCE(CAST(lot_no AS TEXT), '')",
+    "COALESCE(inward_no, '')",
+    "COALESCE(item_mark, '')",
+    "COALESCE(storage_location, '')",
+    "COALESCE(unit, '')",
+    "inward_dt",
+)
+
+
 @router.get("/storage-locations")
 def get_storage_locations(
     company: str = Query(..., description="Company code: cfpl or cdpl"),
@@ -433,15 +463,18 @@ def search_cold_storage_stocks(
     where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
     params["limit"] = limit
 
-    _SEARCH_SQL = """
+    # GROUP BY = _PILE_COLS exactly (inward_dt included, so a lot inwarded on two
+    # dates stays two selectable rows instead of collapsing under MIN(inward_dt)).
+    _SEARCH_SQL = f"""
         SELECT MIN(id) AS id,
-               MIN(inward_dt) AS inward_dt,
-               MIN(unit) AS unit,
+               MIN({_PILE_KEY_SQL}) AS pile_key,
+               inward_dt,
+               COALESCE(unit, '') AS unit,
                COALESCE(inward_no, '') AS inward_no,
                item_description,
                COALESCE(item_mark, '') AS item_mark,
                MAX(vakkal) AS vakkal,
-               COALESCE(lot_no, '') AS lot_no,
+               COALESCE(CAST(lot_no AS TEXT), '') AS lot_no,
                SUM(no_of_cartons) AS no_of_cartons,
                MIN(weight_kg) AS weight_kg,
                SUM(COALESCE(no_of_cartons, 0) * COALESCE(weight_kg, 0)) AS total_inventory_kgs,
@@ -452,10 +485,10 @@ def search_cold_storage_stocks(
                SUM(value) AS value,
                MIN(box_id) AS box_id,
                MIN(transaction_no) AS transaction_no
-        FROM {table}
-        WHERE {where_sql}
-        GROUP BY item_description, COALESCE(lot_no, ''), COALESCE(inward_no, ''), COALESCE(item_mark, ''), COALESCE(storage_location, ''), COALESCE(unit, '')
-        ORDER BY MIN(inward_dt) ASC, MIN(id) ASC
+        FROM {{table}}
+        WHERE {{where_sql}}
+        GROUP BY {", ".join(_PILE_COLS)}
+        ORDER BY inward_dt ASC NULLS LAST, MIN(id) ASC
         LIMIT :limit
     """
 
@@ -476,6 +509,9 @@ def search_cold_storage_stocks(
         results.extend(
             {
                 "id": r.id,
+                # Opaque, stable pile identity — pass it back to /stocks/pick-boxes
+                # and use it as the row key. Two rows in this list NEVER share one.
+                "pile_key": r.pile_key,
                 "inward_dt": str(r.inward_dt) if r.inward_dt else None,
                 "unit": r.unit,
                 "inward_no": r.inward_no,
@@ -505,14 +541,45 @@ def search_cold_storage_stocks(
 @router.get("/stocks/pick-boxes")
 def pick_boxes(
     company: str = Query(..., description="Company code: cfpl or cdpl"),
-    item_description: str = Query(...),
-    lot_no: str = Query(...),
-    inward_no: str = Query(...),
+    item_description: Optional[str] = Query(None),
+    lot_no: Optional[str] = Query(None),
+    inward_no: Optional[str] = Query(None),
+    pile_key: Optional[str] = Query(
+        None,
+        description="pile_key from /stocks/search — the ONLY selector that separates "
+                    "two piles of the same lot (different inward date / unit / site / mark). "
+                    "Send it whenever you have it; the item/lot/inward params are the legacy fallback.",
+    ),
     qty: int = Query(..., ge=1, description="Number of boxes to pick"),
     db: Session = Depends(get_db),
 ):
-    """Return individual box rows in FIFO order (by id ASC) for a given item+lot+inward_no."""
+    """Return individual box rows in FIFO order (by id ASC) for one cold-stock pile.
+
+    `pile_key` pins the exact search row. Without it the filter falls back to
+    (item_description, lot_no, inward_no), which cannot tell two same-lot piles
+    apart — the caller then silently gets the FIRST pile's boxes.
+    """
     table = _get_cold_table(company)
+
+    where = []
+    params: dict = {"qty": qty}
+    if pile_key:
+        where.append(f"{_PILE_KEY_SQL} = :pile_key")
+        params["pile_key"] = pile_key
+    if item_description:
+        where.append("item_description = :item_description")
+        params["item_description"] = item_description
+    # Empty lot / inward are REAL values (disposition-recovered and transfer-in piles
+    # carry NULL lot_no), so match them via COALESCE instead of skipping the filter —
+    # `CAST(NULL AS TEXT) = ''` is NULL and matched nothing.
+    if lot_no is not None:
+        where.append("COALESCE(CAST(lot_no AS TEXT), '') = :lot_no")
+        params["lot_no"] = lot_no
+    if inward_no is not None:
+        where.append("COALESCE(inward_no, '') = :inward_no")
+        params["inward_no"] = inward_no
+    if not where:
+        raise HTTPException(400, "pick-boxes needs pile_key (or item_description/lot_no/inward_no)")
 
     rows = db.execute(
         text(f"""
@@ -521,18 +588,11 @@ def pick_boxes(
                    vakkal, lot_no, no_of_cartons, total_inventory_kgs,
                    group_name, storage_location, exporter, last_purchase_rate, value
             FROM {table}
-            WHERE item_description = :item_description
-              AND CAST(lot_no AS TEXT) = :lot_no
-              AND COALESCE(inward_no, '') = :inward_no
+            WHERE {" AND ".join(where)}
             ORDER BY id ASC
             LIMIT :qty
         """),
-        {
-            "item_description": item_description,
-            "lot_no": lot_no,
-            "inward_no": inward_no,
-            "qty": qty,
-        },
+        params,
     ).fetchall()
 
     return {

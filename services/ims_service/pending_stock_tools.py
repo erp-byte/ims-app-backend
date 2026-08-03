@@ -69,6 +69,11 @@ def _find_in_cold_stocks(db: Session, box_id: str, transaction_no: str, lot_no: 
     if that resolves to multiple rows, the one whose lot matches `lot_no` is chosen.
     The old box_id-only (no transaction_no) fallback is removed — it grabbed a
     same-labelled box from a DIFFERENT batch (the root cause of wrong-item parking).
+
+    transaction_no is compared through COALESCE: disposition-recovered piles were
+    re-inserted with a NULL transaction_no, and `transaction_no = ''` never matches
+    NULL in SQL — so the dispatch found no source row, skipped the cold_stocks
+    deduction and left the box counted in BOTH cold stock and in-transit.
     Returns (table, row) or (None, None).
     """
     lot = (lot_no or "").strip().upper()
@@ -77,7 +82,8 @@ def _find_in_cold_stocks(db: Session, box_id: str, transaction_no: str, lot_no: 
         if not _table_exists(db, table):
             continue
         rows = db.execute(
-            text(f"SELECT * FROM {table} WHERE box_id = :bid AND transaction_no = :tno"),
+            text(f"SELECT * FROM {table} WHERE box_id = :bid "
+                 f"AND COALESCE(transaction_no, '') = COALESCE(:tno, '')"),
             {"bid": box_id, "tno": transaction_no},
         ).fetchall()
         candidates.extend((table, r) for r in rows)

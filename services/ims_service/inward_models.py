@@ -43,6 +43,11 @@ class TransactionIn(BaseModel):
 
 class ArticleIn(BaseModel):
     transaction_no: str
+    # Stable per-transaction article identity (1-based). Two articles with the same
+    # item_description but different grade/rate are distinguished by this, NOT the name.
+    # Optional on the wire: create_inward/update_inward assign it by article order when
+    # omitted (back-compat with older single-article-per-name callers).
+    line_number: Optional[int] = None
     sku_id: Optional[int] = None
     item_description: str
     item_category: Optional[str] = None
@@ -73,6 +78,10 @@ class ArticleIn(BaseModel):
 
 class BoxIn(BaseModel):
     transaction_no: str
+    # line_number ties this box to its article (see ArticleIn.line_number). Optional on
+    # the wire: when omitted, the write path derives it from article_description (legacy
+    # single-name payloads). article_description is kept for display / search.
+    line_number: Optional[int] = None
     article_description: str
     box_number: PositiveInt
     net_weight: Optional[Decimal18_3] = None
@@ -152,6 +161,7 @@ class InwardPayloadFlexible(BaseModel):
 
         article = ArticleIn(
             transaction_no=self.transaction.transaction_no,
+            line_number=1,
             sku_id=sku_id,
             item_description=item_description,
             item_category=self.article_details.get("item_category"),
@@ -169,6 +179,7 @@ class InwardPayloadFlexible(BaseModel):
 
         box = BoxIn(
             transaction_no=self.transaction.transaction_no,
+            line_number=1,
             article_description=item_description,
             box_number=1,
             net_weight=self.ledger_details.get("net_weight"),
@@ -301,7 +312,9 @@ class ApprovalTransactionFields(BaseModel):
 
 
 class ApprovalArticleFields(BaseModel):
-    """Article fields filled at approval. Matched by item_description."""
+    """Article fields filled at approval. Matched by line_number when supplied,
+    else by item_description (legacy)."""
+    line_number: Optional[int] = None
     item_description: str
     quality_grade: Optional[str] = None
     uom: Optional[str] = None
@@ -328,6 +341,7 @@ class ApprovalArticleFields(BaseModel):
 
 class ApprovalBoxFields(BaseModel):
     """Box fields filled at approval."""
+    line_number: Optional[int] = None
     article_description: str
     box_number: PositiveInt
     net_weight: Optional[Decimal18_3] = None
@@ -348,6 +362,7 @@ class ApprovalRequest(BaseModel):
 
 class BoxUpsertRequest(BaseModel):
     """Single box upsert - called when the Print button is clicked."""
+    line_number: Optional[int] = None
     article_description: str
     box_number: PositiveInt
     net_weight: Optional[Decimal18_3] = None
@@ -360,6 +375,7 @@ class BoxUpsertResponse(BaseModel):
     status: str  # "inserted" or "updated"
     box_id: str
     transaction_no: str
+    line_number: Optional[int] = None
     article_description: str
     box_number: int
 
@@ -383,6 +399,7 @@ class BoxEditLogRequest(BaseModel):
 class BulkStickerArticleIn(BaseModel):
     """Article + box generation params for bulk-sticker endpoint."""
     transaction_no: str
+    line_number: Optional[int] = None
     sku_id: Optional[int] = None
     item_description: str
     item_category: Optional[str] = None
@@ -417,6 +434,7 @@ class BulkStickerPayload(BaseModel):
 class GeneratedBoxInfo(BaseModel):
     box_number: int
     box_id: str
+    line_number: Optional[int] = None
     article_description: str
     net_weight: Optional[float] = None
     gross_weight: Optional[float] = None
@@ -424,6 +442,7 @@ class GeneratedBoxInfo(BaseModel):
 
 
 class ArticleBoxGroup(BaseModel):
+    line_number: Optional[int] = None
     article_description: str
     box_ids: List[str]
     boxes: List[GeneratedBoxInfo]

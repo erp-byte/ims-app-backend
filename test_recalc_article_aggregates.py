@@ -65,18 +65,46 @@ def test_recalc_sets_aggregates_from_box_sums():
 
 
 def test_recalc_scopes_to_transaction_and_article():
+    # Legacy call (no line_number): keys by article_description / item_description.
     db = RecalcDB(cnt=1720, net=11340, gross=11900)
     recalc_article_aggregates(db, CFPL, "INW-1000", "Onion 50kg")
     # the box SELECT is scoped to the (txn, article) pair
     s = db.selects[0]
     assert s["params"]["txno"] == "INW-1000"
-    assert s["params"]["art_desc"] == "Onion 50kg"
+    assert s["params"]["key"] == "Onion 50kg"
+    assert "article_description = :key" in s["sql"], s["sql"]
     # the article UPDATE is scoped to the same pair, keyed on item_description
     u = db.updates[0]
-    assert "item_description" in u["sql"], "article table keys on item_description"
+    assert "item_description = :key" in u["sql"], "article table keys on item_description"
     assert u["params"]["txno"] == "INW-1000"
-    assert u["params"]["art_desc"] == "Onion 50kg"
+    assert u["params"]["key"] == "Onion 50kg"
     print("PASS test_recalc_scopes_to_transaction_and_article")
+
+
+def test_recalc_keys_by_line_number_on_v2():
+    # When line_number is supplied against the v2 tables, identity is line_number so two
+    # articles with the same name recompute independently (the same-name-different-grade fix).
+    db = RecalcDB(cnt=7, net=70, gross=77)
+    result = recalc_article_aggregates(db, CFPL, "TR-1", "cashew 320", line_number=2)
+    assert result == {"quantity_units": 7, "net_weight": 70, "total_weight": 77}, result
+    s = db.selects[0]
+    assert "line_number = :key" in s["sql"], s["sql"]
+    assert s["params"]["key"] == 2, s["params"]
+    u = db.updates[0]
+    assert "line_number = :key" in u["sql"], u["sql"]
+    assert u["params"]["key"] == 2, u["params"]
+    print("PASS test_recalc_keys_by_line_number_on_v2")
+
+
+def test_recalc_ignores_line_number_on_bulk_entry():
+    # The *_bulk_entry_* tables have no line_number column, so even if a line_number is
+    # passed the recalc must fall back to the article_description string key.
+    db = RecalcDB(cnt=2, net=20, gross=22)
+    recalc_article_aggregates(db, BULK, "BE-9", "ART-B", line_number=3)
+    s = db.selects[0]
+    assert "article_description = :key" in s["sql"], s["sql"]
+    assert s["params"]["key"] == "ART-B", s["params"]
+    print("PASS test_recalc_ignores_line_number_on_bulk_entry")
 
 
 def test_recalc_zero_boxes_zeroes_aggregates():
@@ -107,6 +135,8 @@ def test_recalc_targets_resolved_table_set():
 ALL = [
     test_recalc_sets_aggregates_from_box_sums,
     test_recalc_scopes_to_transaction_and_article,
+    test_recalc_keys_by_line_number_on_v2,
+    test_recalc_ignores_line_number_on_bulk_entry,
     test_recalc_zero_boxes_zeroes_aggregates,
     test_recalc_handles_null_sums_as_zero,
     test_recalc_targets_resolved_table_set,

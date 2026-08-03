@@ -589,17 +589,17 @@ def union_source_ctes(company: Company) -> str:
             FROM {prefix}_bulk_entry_transactions
         ),
         all_art AS (
-            SELECT {_ART_UNION_PROJ}, 'inward'::text AS _source
+            SELECT {_ART_UNION_PROJ}, line_number::integer AS line_number, 'inward'::text AS _source
             FROM {prefix}_articles_v2
             UNION ALL
-            SELECT {_ART_UNION_PROJ}, 'bulk_entry'::text AS _source
+            SELECT {_ART_UNION_PROJ}, NULL::integer AS line_number, 'bulk_entry'::text AS _source
             FROM {prefix}_bulk_entry_articles
         ),
         all_box AS (
-            SELECT {_BOX_UNION_PROJ}, 'inward'::text AS _source
+            SELECT {_BOX_UNION_PROJ}, line_number::integer AS line_number, 'inward'::text AS _source
             FROM {prefix}_boxes_v2
             UNION ALL
-            SELECT {_BOX_UNION_PROJ}, 'bulk_entry'::text AS _source
+            SELECT {_BOX_UNION_PROJ}, NULL::integer AS line_number, 'bulk_entry'::text AS _source
             FROM {prefix}_bulk_entry_boxes
         )
     """
@@ -983,6 +983,8 @@ def list_inward_records(
                     art.article_quantities,
                     art.article_items_with_qty,
                     bx.box_count,
+                    bx.box_net_weight,
+                    bx.box_gross_weight,
                     bx.box_descriptions
                 FROM all_tx t
                 INNER JOIN paged_transactions ft
@@ -1036,7 +1038,11 @@ def list_inward_records(
                 ) art ON TRUE
                 LEFT JOIN LATERAL (
                     SELECT
-                        COUNT(DISTINCT b.box_number) AS box_count,
+                        -- COUNT(*) not COUNT(DISTINCT box_number): box_number restarts at 1 per
+                        -- article, so DISTINCT under-counts a multi-article transaction.
+                        COUNT(*) AS box_count,
+                        SUM(b.net_weight) AS box_net_weight,
+                        SUM(b.gross_weight) AS box_gross_weight,
                         STRING_AGG(DISTINCT b.article_description, ', ' ORDER BY b.article_description) AS box_descriptions
                     FROM all_box b
                     WHERE b.transaction_no = t.transaction_no AND b._source = t._source
@@ -1065,6 +1071,11 @@ def list_inward_records(
                 td.destination_location,
                 td.remark,
                 td.box_count,
+                -- Transaction totals are box-derived (boxes are the source of truth, and this
+                -- inherently includes boxes whose article row is missing — the orphan case),
+                -- falling back to the stored article sums only when there are no box rows.
+                COALESCE(td.box_net_weight, td.net_weight) AS net_weight,
+                COALESCE(td.box_gross_weight, td.total_weight) AS total_weight,
                 COALESCE(td.article_descriptions, td.box_descriptions) AS item_descriptions_text,
                 CASE
                     WHEN td.article_quantities IS NOT NULL THEN td.article_quantities
@@ -1072,8 +1083,6 @@ def list_inward_records(
                     ELSE NULL
                 END AS quantities_and_uoms_text,
                 td.article_items_with_qty AS article_items_with_qty_text,
-                td.net_weight,
-                td.total_weight,
                 CASE
                     WHEN td._source = 'inward' THEN EXISTS (
                         SELECT 1 FROM box_edit_logs el WHERE el.transaction_no = td.transaction_no
@@ -1399,7 +1408,11 @@ def export_inward_records(
 
                 ON t.transaction_no = b.transaction_no AND t._source = b._source
 
-            ORDER BY {order_clause}, a.item_description, b.box_number
+                AND (b.line_number = a.line_number
+
+                     OR (b.line_number IS NULL AND b.article_description = a.item_description))
+
+            ORDER BY {order_clause}, a.line_number NULLS LAST, a.item_description, b.box_number
 
         """),
 
@@ -1544,7 +1557,7 @@ def export_inward_records(
 
 _ARTICLE_COLUMNS = (
 
-    "transaction_no, sku_id, item_description, item_category, sub_category, "
+    "transaction_no, line_number, sku_id, item_description, item_category, sub_category, "
 
     "material_type, quality_grade, uom, po_quantity, units, quantity_units, "
 
@@ -1558,7 +1571,7 @@ _ARTICLE_COLUMNS = (
 
 _ARTICLE_PARAMS = (
 
-    ":transaction_no, :sku_id, :item_description, :item_category, :sub_category, "
+    ":transaction_no, :line_number, :sku_id, :item_description, :item_category, :sub_category, "
 
     ":material_type, :quality_grade, :uom, :po_quantity, :units, :quantity_units, "
 
@@ -1567,6 +1580,48 @@ _ARTICLE_PARAMS = (
     ":unit_rate, :total_amount, :carton_weight"
 
 )
+
+
+# ── Article identity: line_number helpers ──────────────────────────────────────
+# The inward *_v2 tables identify an article by (transaction_no, line_number) so two
+# articles with the same item_description (different grade/rate) stay separate. The
+# *_bulk_entry_* fallback tables have no line_number column and keep the legacy
+# article_description keying — every identity branch below gates on _is_v2_tables().
+
+def _is_v2_tables(tables: dict) -> bool:
+    """True for the main *_v2 inward tables (carry line_number); False for the
+    *_bulk_entry_* fallback (legacy article_description keying)."""
+    return str(tables.get("box", "")).endswith("_boxes_v2")
+
+
+def _assign_line_numbers(articles: list) -> None:
+    """Ensure every article carries a stable 1-based line_number. Any line_number the
+    caller already supplied is preserved; omissions are filled by article order so
+    older single-article-per-name callers keep working."""
+    used = {a.line_number for a in articles if getattr(a, "line_number", None)}
+    nxt = 1
+    for a in articles:
+        if getattr(a, "line_number", None):
+            continue
+        while nxt in used:
+            nxt += 1
+        a.line_number = nxt
+        used.add(nxt)
+        nxt += 1
+
+
+def _resolve_box_line_numbers(articles: list, boxes: list) -> None:
+    """Fill each box.line_number from its article_description when the caller didn't
+    send one (legacy payloads). Exact when the name is unique; if a name repeats the
+    first matching line wins — but the current frontend always sends box.line_number,
+    so this fallback only runs for single-name legacy payloads."""
+    by_desc: dict = {}
+    for a in articles:
+        by_desc.setdefault(a.item_description, a.line_number)
+    for b in boxes:
+        if getattr(b, "line_number", None):
+            continue
+        b.line_number = by_desc.get(b.article_description)
 
 
 
@@ -1664,6 +1719,11 @@ def create_inward(payload: InwardPayloadFlexible, db: Session) -> dict:
 
 
 
+    # Stamp stable per-article identities (idempotent if the client already sent them)
+    # so same-name/different-grade articles no longer collapse on insert.
+    _assign_line_numbers(payload.articles)
+    _resolve_box_line_numbers(payload.articles, payload.boxes)
+
     # 2) Bulk insert articles
 
     if payload.articles:
@@ -1678,7 +1738,7 @@ def create_inward(payload: InwardPayloadFlexible, db: Session) -> dict:
 
                 VALUES ({_ARTICLE_PARAMS})
 
-                ON CONFLICT (transaction_no, item_description) DO NOTHING
+                ON CONFLICT (transaction_no, line_number) DO NOTHING
 
             """),
 
@@ -1700,15 +1760,15 @@ def create_inward(payload: InwardPayloadFlexible, db: Session) -> dict:
 
                 INSERT INTO {tables['box']} (
 
-                    transaction_no, article_description, box_number, net_weight, gross_weight, lot_number, count
+                    transaction_no, line_number, article_description, box_number, net_weight, gross_weight, lot_number, count
 
                 ) VALUES (
 
-                    :transaction_no, :article_description, :box_number, :net_weight, :gross_weight, :lot_number, :count
+                    :transaction_no, :line_number, :article_description, :box_number, :net_weight, :gross_weight, :lot_number, :count
 
                 )
 
-                ON CONFLICT (transaction_no, article_description, box_number) DO NOTHING
+                ON CONFLICT (transaction_no, line_number, box_number) DO NOTHING
 
             """),
 
@@ -1765,6 +1825,9 @@ def create_inward_bulk_sticker(payload, db: Session) -> dict:
             raise HTTPException(400, f"Article '{a.item_description}' has mismatched transaction_no")
 
 
+
+    # Stable per-article identity so same-name/different-grade articles stay separate.
+    _assign_line_numbers(payload.articles)
 
     _ensure_skus(payload.articles, tables, db)
 
@@ -1844,7 +1907,7 @@ def create_inward_bulk_sticker(payload, db: Session) -> dict:
 
                 VALUES ({_ARTICLE_PARAMS})
 
-                ON CONFLICT (transaction_no, item_description) DO NOTHING
+                ON CONFLICT (transaction_no, line_number) DO NOTHING
 
             """),
 
@@ -1886,6 +1949,8 @@ def create_inward_bulk_sticker(payload, db: Session) -> dict:
 
                 "transaction_no": txno,
 
+                "line_number": article.line_number,
+
                 "article_description": article.item_description,
 
                 "box_number": box_num,
@@ -1910,6 +1975,8 @@ def create_inward_bulk_sticker(payload, db: Session) -> dict:
 
                 box_id=box_id,
 
+                line_number=article.line_number,
+
                 article_description=article.item_description,
 
                 net_weight=float(article.box_net_weight) if article.box_net_weight is not None else None,
@@ -1930,19 +1997,19 @@ def create_inward_bulk_sticker(payload, db: Session) -> dict:
 
                     INSERT INTO {tables['box']} (
 
-                        transaction_no, article_description, box_number,
+                        transaction_no, line_number, article_description, box_number,
 
                         net_weight, gross_weight, lot_number, count, box_id
 
                     ) VALUES (
 
-                        :transaction_no, :article_description, :box_number,
+                        :transaction_no, :line_number, :article_description, :box_number,
 
                         :net_weight, :gross_weight, :lot_number, :count, :box_id
 
                     )
 
-                    ON CONFLICT (transaction_no, article_description, box_number) DO NOTHING
+                    ON CONFLICT (transaction_no, line_number, box_number) DO NOTHING
 
                 """),
 
@@ -1953,6 +2020,8 @@ def create_inward_bulk_sticker(payload, db: Session) -> dict:
 
 
         all_box_groups.append(ArticleBoxGroup(
+
+            line_number=article.line_number,
 
             article_description=article.item_description,
 
@@ -2039,6 +2108,61 @@ def create_inward_bulk_sticker(payload, db: Session) -> dict:
 
 
 
+def _surface_orphan_box_articles(transaction_no: str, articles: list, boxes: list) -> list:
+    """Return synthetic article dicts for box-groups that have NO matching article row.
+
+    Legacy transactions (created before the line_number identity fix) can hold boxes whose
+    article was dropped by the old ``ON CONFLICT (transaction_no, item_description)`` — e.g. a
+    2nd "cashew 300" whose boxes were saved but whose article row never was. Those boxes are
+    real and in the DB, so every read surfaces them as read-only, box-derived articles instead
+    of counting them in the transaction totals while hiding them from the article list (the
+    exact hover/view/review mismatch this fixes). Grouping is by ``line_number`` when the boxes
+    carry one (post-migration / v2), else by ``article_description``. Also covers the
+    all-orphan case (no article rows at all), so it subsumes the old "synthesize when empty".
+    """
+    covered_lines = {a.get("line_number") for a in articles if a.get("line_number") is not None}
+    covered_descs = {a.get("item_description") for a in articles}
+    groups: dict = {}
+    for box in boxes:
+        ln = box.get("line_number")
+        desc = box.get("article_description")
+        # Already represented by a real article row? (keyed on line_number when present)
+        if ln is not None:
+            if ln in covered_lines:
+                continue
+        elif desc in covered_descs:
+            continue
+        key = ln if ln is not None else desc
+        g = groups.get(key)
+        if g is None:
+            g = {
+                "transaction_no": transaction_no,
+                "line_number": ln,
+                "sku_id": 0,
+                "item_description": desc,
+                "item_category": None, "sub_category": None, "material_type": None,
+                "quality_grade": None, "uom": "BOX", "po_quantity": None, "units": None,
+                "quantity_units": 0, "net_weight": 0, "total_weight": 0, "po_weight": None,
+                "lot_number": None, "manufacturing_date": None, "expiry_date": None,
+                "unit_rate": 0, "total_amount": 0, "carton_weight": None,
+                "box_count": 0, "total_net_weight": 0, "total_gross_weight": 0,
+                # Flag so the UI/repair can tell these came from orphaned boxes.
+                "is_orphan_surfaced": True,
+            }
+            groups[key] = g
+        g["box_count"] += 1
+        if box.get("net_weight"):
+            g["total_net_weight"] += float(box["net_weight"])
+        if box.get("gross_weight"):
+            g["total_gross_weight"] += float(box["gross_weight"])
+    out = list(groups.values())
+    for g in out:
+        g["quantity_units"] = g["box_count"]
+        g["net_weight"] = g["total_net_weight"]
+        g["total_weight"] = g["total_gross_weight"]
+    return out
+
+
 def get_inward(company: Company, transaction_no: str, db: Session, page: Optional[int] = None) -> dict:
 
     tables = table_names(company)
@@ -2102,7 +2226,7 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
 
                 WHERE a.transaction_no = :txno
 
-                ORDER BY a.id ASC
+                ORDER BY a.line_number ASC NULLS LAST, a.id ASC
 
             """),
 
@@ -2129,7 +2253,7 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
 
                 WHERE transaction_no = :txno
 
-                ORDER BY article_description ASC, box_number ASC{box_pagination_sql}
+                ORDER BY line_number ASC NULLS LAST, box_number ASC{box_pagination_sql}
 
             """),
 
@@ -2147,19 +2271,22 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
     # pagination applied above.
     if articles:
         _box_tbl = _be['box'] if _using_bulk_entry else tables['box']
+        # v2 sums are keyed by line_number (so same-name articles get their own sums);
+        # bulk_entry has no line_number column and keeps the legacy description key.
+        _grp = "article_description" if _using_bulk_entry else "line_number"
         _sum_rows = db.execute(
             text(f"""
-                SELECT article_description AS art_desc,
+                SELECT {_grp} AS art_key,
                        COUNT(*) AS cnt,
                        COALESCE(SUM(net_weight), 0) AS net,
                        COALESCE(SUM(gross_weight), 0) AS gross
                 FROM {_box_tbl}
                 WHERE transaction_no = :txno
-                GROUP BY article_description
+                GROUP BY {_grp}
             """),
             {"txno": transaction_no},
         ).fetchall()
-        _box_sums = {r.art_desc: {"cnt": r.cnt, "net": r.net, "gross": r.gross} for r in _sum_rows}
+        _box_sums = {r.art_key: {"cnt": r.cnt, "net": r.net, "gross": r.gross} for r in _sum_rows}
         overlay_box_derived_aggregates(articles, _box_sums)
 
     # Synthesize articles from boxes if none exist
@@ -2172,11 +2299,17 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
 
             desc = box["article_description"]
 
-            if desc not in article_groups:
+            # Group by line_number when present (v2) so two same-name lines synthesize as
+            # two separate articles; fall back to the description for legacy/bulk_entry boxes.
+            grp_key = box.get("line_number") if box.get("line_number") is not None else desc
 
-                article_groups[desc] = {
+            if grp_key not in article_groups:
+
+                article_groups[grp_key] = {
 
                     "transaction_no": transaction_no,
+
+                    "line_number": box.get("line_number"),
 
                     "sku_id": 0,
 
@@ -2224,15 +2357,15 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
 
                 }
 
-            article_groups[desc]["box_count"] += 1
+            article_groups[grp_key]["box_count"] += 1
 
             if box["net_weight"]:
 
-                article_groups[desc]["total_net_weight"] += float(box["net_weight"])
+                article_groups[grp_key]["total_net_weight"] += float(box["net_weight"])
 
             if box["gross_weight"]:
 
-                article_groups[desc]["total_gross_weight"] += float(box["gross_weight"])
+                article_groups[grp_key]["total_gross_weight"] += float(box["gross_weight"])
 
 
 
@@ -2246,7 +2379,11 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
 
             article["total_weight"] = article["total_gross_weight"]
 
-
+    # Surface boxes whose article row is missing (legacy orphans, e.g. a 2nd same-name
+    # article the old ON CONFLICT dropped) so they appear in the article list with their
+    # box-derived accounting instead of being silently hidden while still counted in totals.
+    # No-op when every box already maps to an article (incl. the synth-from-empty case above).
+    articles.extend(_surface_orphan_box_articles(transaction_no, articles, boxes))
 
     # Fetch edit logs for this transaction
 
@@ -2290,7 +2427,9 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
 
 
 
-def recalc_article_aggregates(db, tables: dict, transaction_no: str, article_description: str) -> dict:
+def recalc_article_aggregates(
+    db, tables: dict, transaction_no: str, article_description: str = None, *, line_number: int = None
+) -> dict:
     """Recompute an article's aggregates from its current box rows and persist them.
 
     The box rows are the source of truth (locked decision): quantity_units is strictly the box
@@ -2300,20 +2439,26 @@ def recalc_article_aggregates(db, tables: dict, transaction_no: str, article_des
         net_weight     = SUM(box.net_weight)
         total_weight   = SUM(box.gross_weight)
 
-    for the (transaction_no, article_description) pair. ``tables`` is a resolved ``table_names()``
-    dict, so this works against both the main ``_v2`` tables and the ``_bulk_entry_*`` fallback that
-    ``upsert_box`` may select. Note the column split: boxes key on ``article_description``, articles
-    on ``item_description`` (both filter by the same value). Returns the recomputed aggregates.
+    Identity: on the main ``_v2`` tables the box/article pair is keyed by ``line_number`` (so two
+    articles with the same name stay separate); on the ``_bulk_entry_*`` fallback (no line_number
+    column) it falls back to the legacy ``article_description``/``item_description`` string. ``tables``
+    is a resolved ``table_names()`` dict. Returns the recomputed aggregates.
     """
+    use_line = line_number is not None and _is_v2_tables(tables)
+    if use_line:
+        box_where, art_where, key = "line_number = :key", "line_number = :key", line_number
+    else:
+        box_where, art_where, key = "article_description = :key", "item_description = :key", article_description
+
     agg = db.execute(
         text(f"""
             SELECT COUNT(*) AS cnt,
                    COALESCE(SUM(net_weight), 0) AS net,
                    COALESCE(SUM(gross_weight), 0) AS gross
             FROM {tables['box']}
-            WHERE transaction_no = :txno AND article_description = :art_desc
+            WHERE transaction_no = :txno AND {box_where}
         """),
-        {"txno": transaction_no, "art_desc": article_description},
+        {"txno": transaction_no, "key": key},
     ).fetchone()
 
     qty = (agg.cnt if agg else 0) or 0
@@ -2326,14 +2471,14 @@ def recalc_article_aggregates(db, tables: dict, transaction_no: str, article_des
             SET quantity_units = :quantity_units,
                 net_weight = :net_weight,
                 total_weight = :total_weight
-            WHERE transaction_no = :txno AND item_description = :art_desc
+            WHERE transaction_no = :txno AND {art_where}
         """),
         {
             "quantity_units": qty,
             "net_weight": net,
             "total_weight": total,
             "txno": transaction_no,
-            "art_desc": article_description,
+            "key": key,
         },
     )
 
@@ -2349,20 +2494,35 @@ def backfill_article_aggregates(db, tables: dict, *, apply: bool = False) -> dic
     :func:`recalc_article_aggregates`. Articles with no boxes are left untouched (they were never
     the drift). Safe-by-default: dry-run unless ``apply=True``. Returns a summary.
     """
-    pairs = db.execute(
-        text(f"""
-            SELECT DISTINCT transaction_no, article_description
-            FROM {tables['box']}
-            ORDER BY transaction_no, article_description
-        """)
-    ).fetchall()
+    _v2 = _is_v2_tables(tables)
+    if _v2:
+        pairs = db.execute(
+            text(f"""
+                SELECT DISTINCT transaction_no, line_number, article_description
+                FROM {tables['box']}
+                WHERE line_number IS NOT NULL
+                ORDER BY transaction_no, line_number
+            """)
+        ).fetchall()
+    else:
+        pairs = db.execute(
+            text(f"""
+                SELECT DISTINCT transaction_no, article_description
+                FROM {tables['box']}
+                ORDER BY transaction_no, article_description
+            """)
+        ).fetchall()
 
     fixed = []
     if apply:
         for p in pairs:
-            agg = recalc_article_aggregates(db, tables, p.transaction_no, p.article_description)
+            _ln = getattr(p, "line_number", None) if _v2 else None
+            agg = recalc_article_aggregates(
+                db, tables, p.transaction_no, p.article_description, line_number=_ln
+            )
             fixed.append({
                 "transaction_no": p.transaction_no,
+                "line_number": _ln,
                 "article_description": p.article_description,
                 **agg,
             })
@@ -2381,13 +2541,14 @@ def overlay_box_derived_aggregates(articles: list, box_sums: dict) -> list:
 
     For every article that has boxes, overwrite ``quantity_units`` / ``net_weight`` /
     ``total_weight`` with the box-derived sums so the UI is correct even before the one-time
-    backfill runs. ``box_sums`` is ``{article_description: {"cnt", "net", "gross"}}``; articles are
-    matched by ``item_description`` (the same string the boxes carry as ``article_description``).
-    Articles with no boxes are left untouched — we don't zero a legacy boxless article on read.
-    Mutates and returns ``articles``.
+    backfill runs. ``box_sums`` is keyed by ``line_number`` on the v2 tables (so two same-name
+    articles get their own sums) and falls back to ``article_description`` for legacy/bulk_entry
+    rows. Articles with no boxes are left untouched — we don't zero a legacy boxless article on
+    read. Mutates and returns ``articles``.
     """
     for a in articles:
-        s = box_sums.get(a.get("item_description"))
+        # int line_number keys and string item_description keys never collide.
+        s = box_sums.get(a.get("line_number")) or box_sums.get(a.get("item_description"))
         if s:
             a["quantity_units"] = s["cnt"]
             a["net_weight"] = s["net"]
@@ -2462,7 +2623,13 @@ def update_inward(
             tx_changes,
         )
 
-    # ── 2) Articles: upsert by (transaction_no, item_description) ──
+    # ── 2) Articles: upsert by (transaction_no, line_number) ──
+    # Stamp identities first (idempotent) so same-name articles don't collapse.
+    if payload.articles:
+        _assign_line_numbers(payload.articles)
+    if payload.boxes:
+        _resolve_box_line_numbers(payload.articles or [], payload.boxes)
+
     articles_count = 0
     if payload.articles:
         _ensure_skus(payload.articles, tables, db)
@@ -2471,18 +2638,27 @@ def update_inward(
             text(f"SELECT * FROM {tables['art']} WHERE transaction_no = :txno"),
             {"txno": transaction_no},
         ).fetchall()
-        existing_art_map = {r.item_description: dict(r._mapping) for r in existing_arts}
+        # Primary key = line_number; fall back to item_description for legacy rows whose
+        # line_number is still NULL (pre-migration) or absent.
+        existing_art_by_line = {r.line_number: dict(r._mapping) for r in existing_arts if r.line_number is not None}
+        existing_art_by_desc = {r.item_description: dict(r._mapping) for r in existing_arts}
 
         for article in payload.articles:
             art_data = _round_weights(clean_date_fields(article.model_dump()))
-            art_key = art_data["item_description"]
+            art_line = art_data.get("line_number")
 
-            if art_key in existing_art_map:
+            if art_line is not None and art_line in existing_art_by_line:
+                old_art, where_art, key_val = existing_art_by_line[art_line], "line_number = :art_key", art_line
+            elif art_data["item_description"] in existing_art_by_desc:
+                old_art, where_art, key_val = existing_art_by_desc[art_data["item_description"]], "item_description = :art_key", art_data["item_description"]
+            else:
+                old_art = None
+
+            if old_art is not None:
                 # State comparison — only update fields that actually changed
-                old_art = existing_art_map[art_key]
                 art_changes = {}
                 for field, new_val in art_data.items():
-                    if field in ("transaction_no", "item_description"):
+                    if field in ("transaction_no", "item_description", "line_number"):
                         continue
                     if new_val is None:
                         continue
@@ -2502,11 +2678,11 @@ def update_inward(
                 if art_changes:
                     set_parts = [f"{k} = :{k}" for k in art_changes]
                     art_changes["txno"] = transaction_no
-                    art_changes["item_desc"] = art_key
+                    art_changes["art_key"] = key_val
                     db.execute(
                         text(
                             f"UPDATE {tables['art']} SET {', '.join(set_parts)} "
-                            f"WHERE transaction_no = :txno AND item_description = :item_desc"
+                            f"WHERE transaction_no = :txno AND {where_art}"
                         ),
                         art_changes,
                     )
@@ -2523,26 +2699,39 @@ def update_inward(
             {"txno": transaction_no},
         ).scalar()
 
-    # ── 3) Boxes: upsert by (transaction_no, article_description, box_number) ──
+    # ── 3) Boxes: upsert by (transaction_no, line_number, box_number) ──
     boxes_count = 0
     if payload.boxes:
         existing_boxes = db.execute(
             text(f"SELECT * FROM {tables['box']} WHERE transaction_no = :txno"),
             {"txno": transaction_no},
         ).fetchall()
-        existing_box_map = {
+        # Primary key = (line_number, box_number); legacy fallback = (article_description, box_number).
+        existing_box_by_line = {
+            (r.line_number, r.box_number): dict(r._mapping) for r in existing_boxes if r.line_number is not None
+        }
+        existing_box_by_desc = {
             (r.article_description, r.box_number): dict(r._mapping) for r in existing_boxes
         }
 
         for box in payload.boxes:
             box_data = _round_weights(box.model_dump())
-            box_key = (box_data["article_description"], box_data["box_number"])
+            box_line = box_data.get("line_number")
+            box_num = box_data["box_number"]
 
-            if box_key in existing_box_map:
-                old_box = existing_box_map[box_key]
+            if box_line is not None and (box_line, box_num) in existing_box_by_line:
+                old_box, where_box = existing_box_by_line[(box_line, box_num)], "line_number = :key AND box_number = :bn"
+                key_val = box_line
+            elif (box_data["article_description"], box_num) in existing_box_by_desc:
+                old_box, where_box = existing_box_by_desc[(box_data["article_description"], box_num)], "article_description = :key AND box_number = :bn"
+                key_val = box_data["article_description"]
+            else:
+                old_box = None
+
+            if old_box is not None:
                 box_changes = {}
                 for field, new_val in box_data.items():
-                    if field in ("transaction_no", "article_description", "box_number"):
+                    if field in ("transaction_no", "article_description", "box_number", "line_number"):
                         continue
                     if new_val is None:
                         continue
@@ -2559,12 +2748,12 @@ def update_inward(
                 if box_changes:
                     set_parts = [f"{k} = :{k}" for k in box_changes]
                     box_changes["txno"] = transaction_no
-                    box_changes["art_desc"] = box_key[0]
-                    box_changes["bn"] = box_key[1]
+                    box_changes["key"] = key_val
+                    box_changes["bn"] = box_num
                     db.execute(
                         text(
                             f"UPDATE {tables['box']} SET {', '.join(set_parts)} "
-                            f"WHERE transaction_no = :txno AND article_description = :art_desc AND box_number = :bn"
+                            f"WHERE transaction_no = :txno AND {where_box}"
                         ),
                         box_changes,
                     )
@@ -2573,8 +2762,8 @@ def update_inward(
                 db.execute(
                     text(
                         f"INSERT INTO {tables['box']} "
-                        f"(transaction_no, article_description, box_number, net_weight, gross_weight, lot_number, count) "
-                        f"VALUES (:transaction_no, :article_description, :box_number, :net_weight, :gross_weight, :lot_number, :count)"
+                        f"(transaction_no, line_number, article_description, box_number, net_weight, gross_weight, lot_number, count) "
+                        f"VALUES (:transaction_no, :line_number, :article_description, :box_number, :net_weight, :gross_weight, :lot_number, :count)"
                     ),
                     box_data,
                 )
@@ -2587,11 +2776,17 @@ def update_inward(
 
     # Item 1A: every article touched by the box upserts above must have its aggregates recomputed
     # from the box rows, so quantity_units / net_weight / total_weight stay authoritative. Each
-    # distinct article is recomputed once, in the same transaction as the box writes.
+    # distinct article (by line_number, with a description fallback) is recomputed once.
     if payload.boxes:
-        touched_articles = {b.model_dump()["article_description"] for b in payload.boxes}
-        for art_desc in touched_articles:
-            recalc_article_aggregates(db, tables, transaction_no, art_desc)
+        seen = set()
+        for b in payload.boxes:
+            bd = b.model_dump()
+            _ln = bd.get("line_number")
+            _dk = _ln if _ln is not None else bd["article_description"]
+            if _dk in seen:
+                continue
+            seen.add(_dk)
+            recalc_article_aggregates(db, tables, transaction_no, bd["article_description"], line_number=_ln)
 
     # Re-sync cold_stocks from the edited articles/boxes (cold warehouses only),
     # so lot/item_mark/vakkal/box edits made here reach the cold ledger. No-op for
@@ -2642,10 +2837,10 @@ def delete_inward(company: Company, transaction_no: str, db: Session, deleted_by
                 f"SELECT a.item_description, a.lot_number, a.net_weight, "
                 f"COALESCE(b_agg.gross_weight, 0) AS gross_weight "
                 f"FROM {tables['art']} a "
-                f"LEFT JOIN (SELECT article_description, lot_number, SUM(gross_weight) AS gross_weight "
-                f"  FROM {tables['box']} WHERE transaction_no = :txno GROUP BY article_description, lot_number) b_agg "
-                f"ON b_agg.article_description = a.item_description AND b_agg.lot_number = a.lot_number "
-                f"WHERE a.transaction_no = :txno ORDER BY a.item_description"
+                f"LEFT JOIN (SELECT line_number, SUM(gross_weight) AS gross_weight "
+                f"  FROM {tables['box']} WHERE transaction_no = :txno GROUP BY line_number) b_agg "
+                f"ON b_agg.line_number = a.line_number "
+                f"WHERE a.transaction_no = :txno ORDER BY a.line_number NULLS LAST, a.item_description"
             ),
             {"txno": transaction_no},
         ).fetchall()
@@ -2876,6 +3071,15 @@ def sync_cold_stocks_from_inward(
 
     unit = _COLD_UNIT_MAP.get(warehouse, warehouse)
 
+    # Join boxes to their article by line_number on v2 (so a box under a same-name
+    # article mirrors to exactly one cold row, not once per matching name); the
+    # bulk_entry fallback has no line_number and keeps the legacy description join.
+    _join_on = (
+        "b.line_number = a.line_number"
+        if _is_v2_tables(tables)
+        else "b.article_description = a.item_description"
+    )
+
     inserted = db.execute(
         text(f"""
             INSERT INTO {cold} (
@@ -2898,7 +3102,7 @@ def sync_cold_stocks_from_inward(
             FROM {tables['box']} b
             JOIN {tables['art']} a
               ON b.transaction_no = a.transaction_no
-             AND b.article_description = a.item_description
+             AND {_join_on}
             WHERE b.transaction_no = :txno
               AND b.box_id IS NOT NULL
         """),
@@ -3012,7 +3216,15 @@ def approve_inward(
 
 
 
-    # 2) Update articles if provided (merge by item_description)
+    # Identity: on v2 tables an article/box is keyed by line_number so same-name
+    # articles stay separate; the bulk_entry fallback keeps the legacy description key.
+    _v2 = _is_v2_tables(tables)
+    _desc_to_line: dict = {}
+    for _a in (payload.articles or []):
+        if getattr(_a, "line_number", None) is not None:
+            _desc_to_line.setdefault(_a.item_description, _a.line_number)
+
+    # 2) Update articles if provided (merge by line_number on v2, else item_description)
 
     if payload.articles:
 
@@ -3037,6 +3249,8 @@ def approve_inward(
 
             item_desc = art_data.pop("item_description")
 
+            art_line = art_data.pop("line_number", None)  # identity key, never in SET
+
             art_data = {k: v for k, v in art_data.items() if k in _art_cols}
 
             if art_data:
@@ -3045,7 +3259,12 @@ def approve_inward(
 
                 art_data["txno"] = transaction_no
 
-                art_data["item_desc"] = item_desc
+                if _v2 and art_line is not None:
+                    where_art = "line_number = :art_key"
+                    art_data["art_key"] = art_line
+                else:
+                    where_art = "item_description = :art_key"
+                    art_data["art_key"] = item_desc
 
                 db.execute(
 
@@ -3055,7 +3274,7 @@ def approve_inward(
 
                         SET {', '.join(set_parts)}
 
-                        WHERE transaction_no = :txno AND item_description = :item_desc
+                        WHERE transaction_no = :txno AND {where_art}
 
                     """),
 
@@ -3071,11 +3290,17 @@ def approve_inward(
 
         for b in payload.boxes:
 
+            box_line = b.line_number if b.line_number is not None else _desc_to_line.get(b.article_description)
+            _use_line = _v2 and box_line is not None
+            _key_where = "line_number = :line_key" if _use_line else "article_description = :art_desc"
+
             box_params = {
 
                 "txno": transaction_no,
 
                 "art_desc": b.article_description,
+
+                "line_key": box_line,
 
                 "box_num": b.box_number,
 
@@ -3097,7 +3322,7 @@ def approve_inward(
 
                     WHERE transaction_no = :txno
 
-                      AND article_description = :art_desc AND box_number = :box_num
+                      AND {_key_where} AND box_number = :box_num
 
                 """),
 
@@ -3123,7 +3348,7 @@ def approve_inward(
 
                         WHERE transaction_no = :txno
 
-                          AND article_description = :art_desc AND box_number = :box_num
+                          AND {_key_where} AND box_number = :box_num
 
                     """),
 
@@ -3141,13 +3366,13 @@ def approve_inward(
 
                         INSERT INTO {tables['box']} (
 
-                            transaction_no, article_description, box_number,
+                            transaction_no, {"line_number, " if _use_line else ""}article_description, box_number,
 
                             net_weight, gross_weight, lot_number, count
 
                         ) VALUES (
 
-                            :txno, :art_desc, :box_num,
+                            :txno, {":line_key, " if _use_line else ""}:art_desc, :box_num,
 
                             :net_weight, :gross_weight, :lot_number, :count
 
@@ -3226,33 +3451,19 @@ def upsert_box(
 
 
 
-    # Check if box already exists
-
-    existing_box = db.execute(
-
-        text(f"""
-
-            SELECT id, box_id FROM {tables['box']}
-
-            WHERE transaction_no = :txno
-
-              AND article_description = :art_desc
-
-              AND box_number = :box_num
-
-        """),
-
-        {"txno": transaction_no, "art_desc": payload.article_description, "box_num": payload.box_number},
-
-    ).fetchone()
-
-
+    # Identity: on v2 tables the box is keyed by (line_number, box_number) so a box under
+    # a same-name article can't resolve to another article's row (the "same box_id" bug);
+    # the bulk_entry fallback keeps the legacy (article_description, box_number) key.
+    _use_line = _is_v2_tables(tables) and payload.line_number is not None
+    _key_where = "line_number = :line_key" if _use_line else "article_description = :art_desc"
 
     params = {
 
         "txno": transaction_no,
 
         "art_desc": payload.article_description,
+
+        "line_key": payload.line_number,
 
         "box_num": payload.box_number,
 
@@ -3265,6 +3476,26 @@ def upsert_box(
         "count": payload.count,
 
     }
+
+    # Check if box already exists
+
+    existing_box = db.execute(
+
+        text(f"""
+
+            SELECT id, box_id FROM {tables['box']}
+
+            WHERE transaction_no = :txno
+
+              AND {_key_where}
+
+              AND box_number = :box_num
+
+        """),
+
+        params,
+
+    ).fetchone()
 
 
 
@@ -3284,7 +3515,7 @@ def upsert_box(
 
                 WHERE transaction_no = :txno
 
-                  AND article_description = :art_desc AND box_number = :box_num
+                  AND {_key_where} AND box_number = :box_num
 
             """),
 
@@ -3298,11 +3529,11 @@ def upsert_box(
 
     else:
 
-        # Generate new box_id
-
+        # Generate new box_id. Include line_number so two same-name articles printed in
+        # the same millisecond can't mint the same id (base is epoch-ms, shared).
         base = str(int(time.time() * 1000))[-8:]
 
-        box_id = f"{base}-{payload.box_number}"
+        box_id = f"{base}-{payload.line_number}-{payload.box_number}" if _use_line else f"{base}-{payload.box_number}"
 
         params["box_id"] = box_id
 
@@ -3324,7 +3555,7 @@ def upsert_box(
 
                     WHERE transaction_no = :txno
 
-                      AND article_description = :art_desc AND box_number = :box_num
+                      AND {_key_where} AND box_number = :box_num
 
                 """),
 
@@ -3342,13 +3573,13 @@ def upsert_box(
 
                     INSERT INTO {tables['box']} (
 
-                        transaction_no, article_description, box_number,
+                        transaction_no, {"line_number, " if _use_line else ""}article_description, box_number,
 
                         net_weight, gross_weight, lot_number, count, box_id
 
                     ) VALUES (
 
-                        :txno, :art_desc, :box_num,
+                        :txno, {":line_key, " if _use_line else ""}:art_desc, :box_num,
 
                         :net_weight, :gross_weight, :lot_number, :count, :box_id
 
@@ -3367,7 +3598,10 @@ def upsert_box(
     # Item 1A: the box rows are the source of truth — recompute the parent article so its
     # quantity_units / net_weight / total_weight can never drift from the boxes again. Uses the
     # resolved `tables` (handles the _bulk_entry_* fallback above) and runs in the same transaction.
-    recalc_article_aggregates(db, tables, transaction_no, payload.article_description)
+    recalc_article_aggregates(
+        db, tables, transaction_no, payload.article_description,
+        line_number=payload.line_number if _use_line else None,
+    )
 
     db.commit()
 
@@ -3380,6 +3614,8 @@ def upsert_box(
         box_id=box_id,
 
         transaction_no=transaction_no,
+
+        line_number=payload.line_number,
 
         article_description=payload.article_description,
 
@@ -3481,7 +3717,7 @@ def get_box_by_number(company: Company, box_number: int, transaction_no: str, db
 
                 ON b.transaction_no = a.transaction_no
 
-                AND b.article_description = a.item_description
+                AND b.line_number = a.line_number
 
             LEFT JOIN {sku_table} s ON a.sku_id = s.id
 
@@ -3599,7 +3835,7 @@ def get_box_by_box_id(company: Company, box_id: str, transaction_no: str, db: Se
 
                     ON b.transaction_no = a.transaction_no
 
-                    AND b.article_description = a.item_description
+                    AND b.line_number = a.line_number
 
                 LEFT JOIN {sku_table} s ON a.sku_id = s.id
 

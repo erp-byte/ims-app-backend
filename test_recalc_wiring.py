@@ -76,14 +76,15 @@ class UpsertDB:
 def test_upsert_box_recomputes_article_aggregates():
     db = UpsertDB(agg=SimpleNamespace(cnt=1720, net=11340, gross=11900))
     payload = SimpleNamespace(
-        article_description="Onion 50kg", box_number=1720,
+        line_number=2, article_description="Onion 50kg", box_number=1720,
         net_weight=6.6, gross_weight=6.93, lot_number="L1", count=1,
     )
     upsert_box("CFPL", "INW-1000", payload, db)
     assert db.article_updates, "upsert_box must recompute the parent article after a box mutation"
     p = db.article_updates[0]
     assert p["quantity_units"] == 1720, p
-    assert p["txno"] == "INW-1000" and p["art_desc"] == "Onion 50kg", p
+    # v2 tables + a line_number → identity is line_number (bound as :key)
+    assert p["txno"] == "INW-1000" and p["key"] == 2, p
     assert db.commits == 1, f"exactly one commit, got {db.commits}"
     print("PASS test_upsert_box_recomputes_article_aggregates")
 
@@ -113,11 +114,18 @@ class UpdateDB:
         self.commits += 1
 
 
-def _box(desc, n):
-    return SimpleNamespace(model_dump=lambda **k: {
-        "transaction_no": "TX1", "article_description": desc, "box_number": n,
-        "net_weight": 6.6, "gross_weight": 6.93, "lot_number": "L1", "count": 1,
-    })
+def _box(desc, n, line):
+    # Carries line_number both as an attribute (_resolve_box_line_numbers) and in
+    # model_dump (the write path) — matching the real BoxIn model.
+    return SimpleNamespace(
+        line_number=line,
+        article_description=desc,
+        box_number=n,
+        model_dump=lambda **k: {
+            "transaction_no": "TX1", "line_number": line, "article_description": desc, "box_number": n,
+            "net_weight": 6.6, "gross_weight": 6.93, "lot_number": "L1", "count": 1,
+        },
+    )
 
 
 def test_update_inward_recomputes_article_after_box_insert():
@@ -125,27 +133,29 @@ def test_update_inward_recomputes_article_after_box_insert():
     payload = SimpleNamespace(
         transaction=SimpleNamespace(transaction_no="TX1", model_dump=lambda **k: {"transaction_no": "TX1"}),
         articles=[],
-        boxes=[_box("Onion 50kg", 1720)],
+        boxes=[_box("Onion 50kg", 1720, 1)],
     )
     update_inward("CFPL", "TX1", payload, db)
     assert db.article_updates, "update_inward must recompute the article after saving boxes"
-    descs = {p["art_desc"] for p in db.article_updates}
-    assert "Onion 50kg" in descs, descs
+    keys = {p["key"] for p in db.article_updates}
+    assert 1 in keys, keys
     assert db.commits == 1, f"exactly one commit, got {db.commits}"
     print("PASS test_update_inward_recomputes_article_after_box_insert")
 
 
 def test_update_inward_recomputes_each_distinct_article_once():
     db = UpdateDB(agg=SimpleNamespace(cnt=2, net=12, gross=14))
+    # Two boxes on line 1 (same article) + one box on line 2 (a different article that
+    # happens to share nothing here). Recompute must fire once per distinct line_number.
     payload = SimpleNamespace(
         transaction=SimpleNamespace(transaction_no="TX1", model_dump=lambda **k: {"transaction_no": "TX1"}),
         articles=[],
-        boxes=[_box("ART-A", 1), _box("ART-A", 2), _box("ART-B", 1)],
+        boxes=[_box("ART-A", 1, 1), _box("ART-A", 2, 1), _box("ART-B", 1, 2)],
     )
     update_inward("CFPL", "TX1", payload, db)
-    descs = sorted({p["art_desc"] for p in db.article_updates})
-    assert descs == ["ART-A", "ART-B"], descs
-    # ART-A appears in two boxes but must be recomputed once, not twice
+    keys = sorted({p["key"] for p in db.article_updates})
+    assert keys == [1, 2], keys
+    # line 1 appears in two boxes but must be recomputed once, not twice
     assert len(db.article_updates) == 2, db.article_updates
     print("PASS test_update_inward_recomputes_each_distinct_article_once")
 

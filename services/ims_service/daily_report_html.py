@@ -49,6 +49,30 @@ TABS = [
     ("samples", "Samples / NPD"),
 ]
 
+# One colour per module, so a section is identifiable before a word is read.
+# Every section used the same navy, which made four different kinds of work look
+# like one continuous table. (deep, mid, tint, header-text-on-tint)
+SECTION = {
+    "inward":    {"deep": "#1E3A6E", "mid": "#2F5FA8", "tint": "#EAF0FA", "name": "Inward"},
+    "transfers": {"deep": "#0E5A54", "mid": "#12857B", "tint": "#E4F4F2", "name": "Transfers"},
+    "jobcards":  {"deep": "#7A4310", "mid": "#B4661A", "tint": "#FBEFE1", "name": "Job Cards"},
+    "samples":   {"deep": "#553087", "mid": "#7B4FBF", "tint": "#F1EAFB", "name": "Samples / NPD"},
+}
+
+# Type scale. The previous 12–13px body was unreadable on a phone; this roughly
+# doubles the small text and lifts everything else with it. Table cells stop
+# short of a literal 2x because a 27px cell forces horizontal scrolling on any
+# table wider than four columns, which costs more legibility than it buys.
+FS_CELL = 21        # was 12  -> 1.75x
+FS_HEAD = 18        # was 12  -> 1.5x
+FS_TILE = 38        # was 17
+FS_TILE_LABEL = 16  # was 10
+FS_SECTION = 27     # was 14
+FS_H3 = 23          # was 13
+FS_NOTE = 16        # was 11
+FS_BADGE = 16       # was 11
+FS_SUB = 15         # gross sub-line inside a cell
+
 
 def e(v) -> str:
     return escape("" if v is None else str(v))
@@ -79,8 +103,22 @@ def _pct(v) -> str:
 
 
 # ── table builder ────────────────────────────────────────────────────────
+def _sub(cell_html: str) -> str:
+    """Render the gross sub-line marker as a small second line in the same cell.
+
+    Net is the reported figure; gross sits under it in smaller, lighter type so
+    it can inform without ever being mistaken for the headline number.
+    """
+    if "␟" not in cell_html:
+        return cell_html.replace("\n", "<br>")
+    main, _, sub = cell_html.partition("␟")
+    return (main.replace("\n", "<br>")
+            + f'<div style="font-size:{FS_SUB}px;color:{GREY};font-weight:400;'
+              f'margin-top:4px;">{sub.strip()}</div>')
+
+
 def table(headers, rows, aligns=None, *, cap=None, total=None, note=None,
-          widths=None, empty="Nothing recorded for this day") -> str:
+          widths=None, tone=None, empty="Nothing recorded for this day") -> str:
     """One responsive table. `cap` limits rows and appends a "+N more" line.
 
     Columns are sized by what they hold rather than split evenly: a right-aligned
@@ -98,56 +136,56 @@ def table(headers, rows, aligns=None, *, cap=None, total=None, note=None,
     if widths:
         cols = "<colgroup>" + "".join(f'<col style="width:{w}%;">' for w in widths) + "</colgroup>"
 
-    hcell = (f'padding:9px 11px;background:{NAVY};color:#fff;font-weight:700;'
-             f'font-size:12.5px;line-height:1.3;white-space:nowrap;'
-             f'border:1px solid {NAVY};text-align:')
+    hbg = tone["mid"] if tone else NAVY
+    hcell = (f'padding:13px 10px;background:{hbg};color:#fff;font-weight:700;'
+             f'font-size:{FS_HEAD}px;line-height:1.25;'
+             f'border:1px solid {hbg};text-align:')
     th = "".join(f'<th style="{hcell}{a};">{e(h)}</th>' for h, a in zip(headers, aligns))
 
     if not rows:
-        body = (f'<tr><td colspan="{len(headers)}" style="padding:18px 12px;text-align:center;'
-                f'color:{GREY};border:1px solid {RULE};font-style:italic;font-size:13px;">'
+        body = (f'<tr><td colspan="{len(headers)}" style="padding:24px 14px;text-align:center;'
+                f'color:{GREY};border:1px solid {RULE};font-style:italic;font-size:{FS_CELL}px;">'
                 f'{e(empty)}</td></tr>')
     else:
-        # Row striping goes on <tr bgcolor>, and the text colour is set once on the
-        # table. Repeating either per cell inflates the message by ~20 KB on a busy
-        # day, which is what pushes Gmail into clipping the last section away.
+        # Row striping goes on <tr bgcolor>, and text colour / tabular figures are
+        # set once on the <table>. Repeating any of them per cell inflates the
+        # message by ~20 KB on a busy day, which is what pushes Gmail into clipping
+        # the last section away entirely.
+        stripe = tone["tint"] if tone else BAND
         body = ""
-        # tabular-nums is declared once on the <table> and inherited — repeating it
-        # per cell cost ~20 KB on a busy day, enough to trip Gmail's clip limit and
-        # drop the last section out of the mail entirely.
-        txt = f'padding:9px 11px;border:1px solid {RULE};text-align:left;'
-        num = f'padding:9px 11px;border:1px solid {RULE};text-align:right;white-space:nowrap;'
+        txt = f'padding:12px 10px;border:1px solid {RULE};text-align:left;word-break:break-word;'
+        num = f'padding:12px 10px;border:1px solid {RULE};text-align:right;word-break:break-word;'
         for i, r in enumerate(rows):
             tds = "".join(
                 f'<td style="{num if a == "right" else txt}">'
-                f'{c if isinstance(c, _Raw) else e(c)}</td>'
+                f'{c if isinstance(c, _Raw) else _sub(e(c))}</td>'
                 for c, a in zip(r, aligns)
             )
-            body += f'<tr bgcolor="{"#ffffff" if i % 2 == 0 else BAND}">{tds}</tr>'
+            body += f'<tr bgcolor="{"#ffffff" if i % 2 == 0 else stripe}">{tds}</tr>'
 
     if hidden:
-        body += (f'<tr><td colspan="{len(headers)}" style="padding:9px 11px;text-align:center;'
+        body += (f'<tr><td colspan="{len(headers)}" style="padding:12px 14px;text-align:center;'
                  f'color:{AMBER};background:{AMBER_BG};border:1px solid {RULE};'
-                 f'font-size:12px;font-weight:600;">'
+                 f'font-size:{FS_NOTE}px;font-weight:600;">'
                  f'+ {hidden} more row{"s" if hidden != 1 else ""} — open the full view for all'
                  f'</td></tr>')
 
     if total:
-        tcell = (f'padding:10px 11px;border:1px solid {RULE};border-top:2px solid {NAVY};'
-                 f'font-weight:700;font-size:13.5px;color:{NAVY_D};text-align:')
-        tds = "".join(f'<td style="{tcell}{a};">{c if isinstance(c, _Raw) else e(c)}</td>'
+        tdeep = tone["deep"] if tone else NAVY
+        tcell = (f'padding:14px 14px;border:1px solid {RULE};border-top:3px solid {tdeep};'
+                 f'font-weight:700;font-size:{FS_CELL + 1}px;color:{tdeep};text-align:')
+        tds = "".join(f'<td style="{tcell}{a};">{c if isinstance(c, _Raw) else _sub(e(c))}</td>'
                       for c, a in zip(total, aligns))
-        body += f'<tr bgcolor="{NAVY_L}">{tds}</tr>'
+        body += f'<tr bgcolor="{tone["tint"] if tone else NAVY_L}">{tds}</tr>'
 
-    n = (f'<div style="font-size:12px;line-height:1.5;color:{GREY};margin:7px 2px 0;">{note}</div>'
-         if note else "")
+    n = (f'<div style="font-size:{FS_NOTE}px;line-height:1.55;color:{GREY};'
+         f'margin:9px 2px 0;">{note}</div>' if note else "")
 
     return (
-        f'<div class="scroll" style="overflow-x:auto;-webkit-overflow-scrolling:touch;'
-        f'margin:0 0 6px;border-radius:6px;">'
+        f'<div class="scroll" style="margin:0 0 8px;">'
         f'<table role="presentation" cellspacing="0" cellpadding="0" '
-        f'style="border-collapse:collapse;width:100%;min-width:{min(len(headers) * 96, 640)}px;'
-        f'font-size:13.5px;line-height:1.4;font-variant-numeric:tabular-nums;'
+        f'style="border-collapse:collapse;width:100%;table-layout:fixed;'
+        f'font-size:{FS_CELL}px;line-height:1.45;font-variant-numeric:tabular-nums;'
         f'color:{INK};font-family:Arial,Helvetica,sans-serif;">'
         f"{cols}<thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></div>{n}"
     )
@@ -163,42 +201,46 @@ def badge(txt, kind="neutral") -> _Raw:
         "warn": (AMBER, AMBER_BG), "neutral": (NAVY_D, NAVY_L),
     }
     fg, bg = colors.get(kind, colors["neutral"])
-    return _Raw(f'<span style="display:inline-block;padding:3px 10px;border-radius:11px;'
-                f'background:{bg};color:{fg};font-size:12px;font-weight:700;'
-                f'white-space:nowrap;">{escape(str(txt))}</span>')
+    return _Raw(f'<span style="display:inline-block;padding:5px 13px;border-radius:13px;'
+                f'background:{bg};color:{fg};font-size:{FS_BADGE}px;font-weight:700;'
+                f'">{escape(str(txt))}</span>')
 
 
-def h3(txt) -> str:
-    return (f'<div style="font:700 15px/1.3 Arial,Helvetica,sans-serif;color:{NAVY};'
-            f'margin:22px 0 8px;padding-bottom:5px;'
-            f'border-bottom:2px solid {NAVY_L};">{e(txt)}</div>')
+def h3(txt, tone=None) -> str:
+    c = tone["deep"] if tone else NAVY
+    u = tone["tint"] if tone else NAVY_L
+    return (f'<div style="font:700 {FS_H3}px/1.3 Arial,Helvetica,sans-serif;color:{c};'
+            f'margin:28px 0 10px;padding-bottom:7px;'
+            f'border-bottom:3px solid {u};">{e(txt)}</div>')
 
 
 def flag(txt, kind="warn") -> str:
     """A callout that has to be read, not skimmed past."""
     fg, bg = (AMBER, AMBER_BG) if kind == "warn" else (NAVY_D, NAVY_L)
-    return (f'<div style="margin:12px 0;padding:12px 15px;background:{bg};'
-            f'border-left:5px solid {fg};color:{fg};'
-            f'font:700 13.5px/1.5 Arial,Helvetica,sans-serif;'
-            f'border-radius:0 6px 6px 0;">{txt}</div>')
+    return (f'<div style="margin:16px 0;padding:15px 18px;background:{bg};'
+            f'border-left:6px solid {fg};color:{fg};'
+            f'font:700 {FS_NOTE + 2}px/1.55 Arial,Helvetica,sans-serif;'
+            f'border-radius:0 7px 7px 0;">{txt}</div>')
 
 
-def tiles(items) -> str:
+def tiles(items, tone=None) -> str:
     """Headline numbers — the largest type on the page, because they are what the
     mail is scanned for. A table, not flexbox: Outlook ignores flex."""
+    deep = tone["deep"] if tone else NAVY
+    tint = tone["tint"] if tone else BAND
     cells = ""
     for label, value, sub in items:
         cells += (
-            f'<td class="tile" style="padding:13px 15px;background:{BAND};'
-            f'border:1px solid {RULE};border-top:3px solid {NAVY};'
-            f'border-radius:8px;vertical-align:top;">'
-            f'<div style="font:700 24px/1.15 Arial,Helvetica,sans-serif;color:{NAVY_D};'
+            f'<td class="tile" style="padding:18px 20px;background:{tint};'
+            f'border:2px solid {deep};border-top:6px solid {deep};'
+            f'border-radius:10px;vertical-align:top;">'
+            f'<div style="font:700 {FS_TILE}px/1.12 Arial,Helvetica,sans-serif;color:{deep};'
             f'font-variant-numeric:tabular-nums;">{e(value)}</div>'
-            f'<div style="font:700 11.5px/1.3 Arial,Helvetica,sans-serif;color:{GREY};'
-            f'text-transform:uppercase;letter-spacing:.5px;margin-top:5px;">{e(label)}</div>'
-            + (f'<div style="font:12.5px/1.4 Arial,Helvetica,sans-serif;color:{INK};'
-               f'margin-top:4px;">{e(sub)}</div>' if sub else "")
-            + '</td><td style="width:9px;"></td>'
+            f'<div style="font:700 {FS_TILE_LABEL}px/1.3 Arial,Helvetica,sans-serif;color:{GREY};'
+            f'text-transform:uppercase;letter-spacing:.6px;margin-top:8px;">{e(label)}</div>'
+            + (f'<div style="font:{FS_NOTE}px/1.45 Arial,Helvetica,sans-serif;color:{INK};'
+               f'margin-top:6px;">{e(sub)}</div>' if sub else "")
+            + '</td><td style="width:12px;"></td>'
         )
     return (f'<table role="presentation" cellspacing="0" cellpadding="0" class="tiles" '
             f'style="width:100%;border-collapse:separate;margin:4px 0 8px;"><tr>{cells}</tr></table>')
@@ -207,11 +249,56 @@ def tiles(items) -> str:
 # ═════════════════════════════════════════════════════════════════════════
 #  SECTIONS  (shared by the mail body and the hosted page)
 # ═════════════════════════════════════════════════════════════════════════
-def _section_inward(agg, cap, scap) -> str:
+def _gross_sub(m) -> str | None:
+    """Gross as a tile sub-line. Net stays the headline; gross only informs."""
+    return f"gross {m.gross:,.2f} kg" if getattr(m, "gross", 0) > 0 else None
+
+
+def _gsuffix(m) -> str:
+    return f" · gross {m.gross:,.2f} kg" if getattr(m, "gross", 0) > 0 else ""
+
+
+def _tone_helpers(tone, slim=False):
+    """Bind a section's colour once, so every table/heading/tile in that section
+    carries it without threading `tone=` through dozens of call sites.
+
+    `slim` is the mail. A phone gives a table about 390px; at a readable 21px
+    that is roughly four columns. Wide tables therefore keep only the columns
+    that answer "what happened", and `keep=` names them — the hosted page still
+    renders every column. Squeezing nine columns onto a phone is what made the
+    text unreadable, not the font size.
+    """
+    def T(*a, **k):
+        k.setdefault("tone", tone)
+        keep = k.pop("keep", None)
+        if slim and keep:
+            headers, rows = a[0], a[1]
+            aligns = a[2] if len(a) > 2 else (["left"] + ["right"] * (len(headers) - 1))
+            a = ([headers[i] for i in keep],
+                 [[r[i] for i in keep] for r in rows],
+                 [aligns[i] for i in keep]) + a[3:]
+            k.pop("widths", None)
+            if k.get("total"):
+                k["total"] = [k["total"][i] for i in keep]
+        else:
+            k.pop("keep", None)
+        return table(*a, **k)
+
+    def H(txt):
+        return h3(txt, tone=tone)
+
+    def TI(items):
+        return tiles(items, tone=tone)
+
+    return T, H, TI
+
+
+def _section_inward(agg, cap, scap, tone=None, slim=False) -> str:
+    T, H, TI = _tone_helpers(tone, slim)
     h, vg = agg["head"], agg["val_gap"]
-    out = tiles([
+    out = TI([
         ("Transactions", _n(h["inw_txns"]), None),
-        ("Total received", h["inw_m"].phrase(), None),
+        ("Total received (net)", h["inw_m"].phrase(), _gross_sub(h["inw_m"])),
         ("Value entered", "Rs. " + _inr(h["inw_val"]), f"{vg['missing']} of {vg['lines']} lines blank"),
     ])
     if vg["missing"]:
@@ -226,8 +313,8 @@ def _section_inward(agg, cap, scap) -> str:
         rows.append([name, _n(len(w["itx"])), w["im"].cell().replace("\n", " + "),
                      badge("not entered", "warn") if not w["ival"] else _inr(w["ival"])])
         tot_tx += len(w["itx"]); tot_val += w["ival"]
-    out += h3("Warehouse-wise")
-    out += table(["Warehouse", "Transactions", "Kgs / Qty", "Value (Rs.)"], rows,
+    out += H("Warehouse-wise")
+    out += T(["Warehouse", "Transactions", "Kgs / Qty", "Value (Rs.)"], rows,
                  ["left", "right", "right", "right"], cap=scap,
                  total=["TOTAL", _n(tot_tx), h["inw_m"].cell().replace("\n", " + "), _inr(tot_val)],
                  empty="No inward recorded for this day")
@@ -237,8 +324,8 @@ def _section_inward(agg, cap, scap) -> str:
         u = agg["usr"][name]
         if u["itx"]:
             rows.append([name, _n(len(u["itx"])), u["im"].cell().replace("\n", " + ")])
-    out += h3("Who keyed it")
-    out += table(["User", "Transactions", "Kgs / Qty"], rows, ["left", "right", "right"],
+    out += H("Who keyed it")
+    out += T(["User", "Transactions", "Kgs / Qty"], rows, ["left", "right", "right"],
                  cap=scap,
                  note="The IMS login that saved the GRN — not the purchase head or approval authority.",
                  empty="No inward recorded for this day")
@@ -249,18 +336,19 @@ def _section_inward(agg, cap, scap) -> str:
             continue
         rows.append([w, g, v["m"].cell().replace("\n", " + "),
                      badge("not entered", "warn") if not v["val"] else _inr(v["val"])])
-    out += h3("Warehouse × category")
-    out += table(["Warehouse", "Category / Group", "Kgs / Qty", "Value (Rs.)"], rows,
+    out += H("Warehouse × category")
+    out += T(["Warehouse", "Category / Group", "Kgs / Qty", "Value (Rs.)"], rows,
                  ["left", "left", "right", "right"], cap=cap, widths=[18, 32, 24, 26],
                  empty="No inward recorded for this day")
     return out
 
 
-def _section_transfers(agg, cap, scap) -> str:
+def _section_transfers(agg, cap, scap, tone=None, slim=False) -> str:
+    T, H, TI = _tone_helpers(tone, slim)
     h = agg["head"]
-    out = tiles([
-        ("Dispatched", _n(h["out_chl"]) + " challans", h["out_m"].phrase()),
-        ("Received", _n(h["in_grn"]) + " GRNs", h["in_m"].phrase()),
+    out = TI([
+        ("Dispatched (net)", _n(h["out_chl"]) + " challans", h["out_m"].phrase() + _gsuffix(h["out_m"])),
+        ("Received (net)", _n(h["in_grn"]) + " GRNs", h["in_m"].phrase() + _gsuffix(h["in_m"])),
         ("Routes", _n(len(agg["route"])), None),
     ])
     out += (f'<div style="font-size:11px;color:{GREY};font-style:italic;margin:2px 2px 0;">'
@@ -272,8 +360,8 @@ def _section_transfers(agg, cap, scap) -> str:
     for (f_, t_), v in sorted(agg["route"].items(), key=lambda kv: -kv[1]["m"].kg):
         rows.append([f_, t_, _n(len(v["ch"])), v["m"].cell().replace("\n", " + ")])
         tc += len(v["ch"])
-    out += h3("Routes")
-    out += table(["From", "To", "Challans", "Kgs / Qty"], rows,
+    out += H("Routes")
+    out += T(["From", "To", "Challans", "Kgs / Qty"], rows,
                  ["left", "left", "right", "right"], cap=scap,
                  total=["TOTAL", "", _n(tc), h["out_m"].cell().replace("\n", " + ")],
                  empty="No transfers dispatched on this day")
@@ -284,9 +372,9 @@ def _section_transfers(agg, cap, scap) -> str:
         if u["och"] or u["igrn"]:
             rows.append([name, _n(len(u["och"])), u["om"].cell().replace("\n", " + "),
                          _n(len(u["igrn"])), u["inm"].cell().replace("\n", " + ")])
-    out += h3("Who keyed it")
-    out += table(["User", "Out challans", "Out Kgs", "In GRNs", "In Kgs"], rows,
-                 ["left", "right", "right", "right", "right"], cap=scap,
+    out += H("Who keyed it")
+    out += T(["User", "Out challans", "Out Kgs", "In GRNs", "In Kgs"], rows,
+                 ["left", "right", "right", "right", "right"], cap=scap, keep=[0, 1, 2],
                  empty="No transfer activity for this day")
 
     rows = []
@@ -297,8 +385,8 @@ def _section_transfers(agg, cap, scap) -> str:
         rows.append([f"{f_} → {t_}", g,
                      o.cell().replace("\n", " + ") if o and not o.is_empty else "–",
                      i.cell().replace("\n", " + ") if i and not i.is_empty else "–"])
-    out += h3("Route × category")
-    out += table(["Route", "Category / Group", "Out Kgs / Qty", "In Kgs / Qty"], rows,
+    out += H("Route × category")
+    out += T(["Route", "Category / Group", "Out Kgs / Qty", "In Kgs / Qty"], rows,
                  ["left", "left", "right", "right"], cap=cap, widths=[26, 28, 23, 23],
                  note="Out and In will not match — a consignment is usually received a day or more "
                       "after it is dispatched.",
@@ -319,14 +407,15 @@ def _status_badge(s) -> _Raw:
     return badge(str(s or "-").replace("_", " ").title(), _STATUS_KIND.get(key, "neutral"))
 
 
-def _section_jobcards(jc, cap, scap) -> str:
+def _section_jobcards(jc, cap, scap, tone=None, slim=False) -> str:
+    T, H, TI = _tone_helpers(tone, slim)
     if jc["empty"]:
-        return (tiles([("Job cards", "0", "none active"), ("Users", "0", None), ("FG items", "0", None)])
-                + table(["Job card", "Factory", "FG item", "Status"], [],
+        return (TI([("Job cards", "0", "none active"), ("Users", "0", None), ("FG items", "0", None)])
+                + T(["Job card", "Factory", "FG item", "Status"], [],
                         empty="No job card activity for this day"))
 
     loss = jc["loss"]
-    out = tiles([
+    out = TI([
         ("Job cards", _n(jc["total_cards"]), "active on the day"),
         ("Users", _n(jc["total_users"]), "team leaders"),
         ("FG items", _n(jc["total_fg"]), None),
@@ -339,26 +428,26 @@ def _section_jobcards(jc, cap, scap) -> str:
                        sorted(v["status"].items(), key=lambda x: -x[1]))
         rows.append([w, _n(len(v["cards"])), _n(len(v["users"])), _n(len(v["fg"])),
                      _kg(v["kg"]), _n(v["units"]), st])
-    out += h3("Warehouse-wise")
-    out += table(["Factory", "Job cards", "Users", "FG items", "Planned kg", "Units", "Status mix"],
+    out += H("Warehouse-wise")
+    out += T(["Factory", "Job cards", "Users", "FG items", "Planned kg", "Units", "Status mix"],
                  rows, ["left", "right", "right", "right", "right", "right", "left"],
-                 cap=scap,
+                 cap=scap, keep=[0, 1, 2, 4],
                  total=["TOTAL", _n(jc["total_cards"]), _n(jc["total_users"]), _n(jc["total_fg"]),
                         _kg(jc["total_kg"]), _n(jc["total_units"]), ""])
 
-    out += h3("Status update")
-    out += table(["Status", "Job cards"],
+    out += H("Status update")
+    out += T(["Status", "Job cards"],
                  [[_status_badge(k), _n(v)] for k, v in
                   sorted(jc["status"].items(), key=lambda x: -x[1])],
                  ["left", "right"], cap=scap)
 
-    out += h3("Loss metrics (accounting summary)")
+    out += H("Loss metrics (accounting summary)")
     if loss.get("rows"):
         bal_kind = "good" if loss["unbalanced"] == 0 else "warn"
         if loss["unbalanced"]:
             out += flag(f"{loss['unbalanced']} of {loss['rows']} accounted job cards do not "
                         f"balance — input, output and losses do not reconcile on those cards.")
-        out += table(
+        out += T(
             ["Measure", "Quantity", "Measure", "Quantity"],
             [
                 ["Total input", _kg(loss["input"]) + " kg", "Off-grade", _kg(loss["offgrade"]) + " kg"],
@@ -372,7 +461,7 @@ def _section_jobcards(jc, cap, scap) -> str:
             ["left", "right", "left", "right"],
             note="From job card accounting. Cards without an accounting entry are excluded from these totals.")
     else:
-        out += table(["Measure", "Quantity"], [],
+        out += T(["Measure", "Quantity"], [],
                      empty="No accounting entries recorded against these job cards")
 
     rows = []
@@ -381,15 +470,16 @@ def _section_jobcards(jc, cap, scap) -> str:
                      r["fg_sku_name"] or "-", r["customer_name"] or "-",
                      _kg(r["planned_qty_kg"]), _status_badge(r["status"]),
                      (r["assigned_to_team_leader"] or "–")])
-    out += h3("Job cards")
-    out += table(["Job card", "Factory", "FG item", "Customer", "Planned kg", "Status", "Team leader"],
+    out += H("Job cards")
+    out += T(["Job card", "Factory", "FG item", "Customer", "Planned kg", "Status", "Team leader"],
                  rows, ["left", "left", "left", "left", "right", "left", "left"], cap=cap,
-                 widths=[18, 8, 22, 20, 11, 11, 10])
+                 widths=[18, 8, 22, 20, 11, 11, 10], keep=[0, 2, 4, 5])
     return out
 
 
-def _section_samples(sm, cap, scap) -> str:
-    out = tiles([
+def _section_samples(sm, cap, scap, tone=None, slim=False) -> str:
+    T, H, TI = _tone_helpers(tone, slim)
+    out = TI([
         ("Requisitions", _n(len(sm["requisitions"])), "raised today"),
         ("Actions", _n(len(sm["actions"])), "approvals / status changes"),
         ("NPD job cards", _n(len(sm["npd_jobcards"])), None),
@@ -397,7 +487,7 @@ def _section_samples(sm, cap, scap) -> str:
     ])
 
     if sm["empty"]:
-        return out + table(["Requisition", "Type", "Status"], [],
+        return out + T(["Requisition", "Type", "Status"], [],
                            empty="No sample or NPD activity for this day")
 
     rows = []
@@ -409,18 +499,18 @@ def _section_samples(sm, cap, scap) -> str:
                      r["npd_target_name"] or r["customer_name"] or "-",
                      (r["customer_name"] or r["company_name"] or "-"),
                      (r["sale_groups"] or "not mapped").upper(), qty, r["requestor"]])
-    out += h3("Requisitions raised")
-    out += table(["Req", "Type", "Status", "Target / item", "Customer", "Sales group",
+    out += H("Requisitions raised")
+    out += T(["Req", "Type", "Status", "Target / item", "Customer", "Sales group",
                   "Quantity", "Requested by"], rows,
                  ["left", "left", "left", "left", "left", "left", "right", "left"], cap=cap,
-                 widths=[6, 9, 13, 20, 17, 12, 11, 12],
+                 widths=[6, 9, 13, 20, 17, 12, 11, 12], keep=[0, 2, 3, 6],
                  note="Sales group is taken from all_sku via the requisition's articles.",
                  empty="No requisitions raised on this day")
 
     rows = [[g, _n(v["reqs"]), _kg(v["qty"])] for g, v in
             sorted(sm["by_sale_group"].items(), key=lambda kv: -kv[1]["reqs"])]
-    out += h3("By sales group")
-    out += table(["Sales group", "Requisitions", "Quantity"], rows,
+    out += H("By sales group")
+    out += T(["Sales group", "Requisitions", "Quantity"], rows,
                  ["left", "right", "right"], cap=scap)
 
     rows = []
@@ -428,10 +518,10 @@ def _section_samples(sm, cap, scap) -> str:
         move = f"{a['from']} → {a['to']}" if a["from"] and a["to"] else (a["to"] or a["from"] or "-")
         rows.append([f"#{a['req']}", a["event"], move, a["target"] or "-",
                      a["actor"], a["role"] or "-", a["remarks"] or "-"])
-    out += h3("Actions taken")
-    out += table(["Req", "Action", "Movement", "Target", "By", "Role", "Remarks"], rows,
+    out += H("Actions taken")
+    out += T(["Req", "Action", "Movement", "Target", "By", "Role", "Remarks"], rows,
                  ["left", "left", "left", "left", "left", "left", "left"], cap=cap,
-                 widths=[6, 13, 22, 17, 15, 11, 16],
+                 widths=[6, 13, 22, 17, 15, 11, 16], keep=[0, 1, 2, 4],
                  empty="No sample actions on this day")
 
     rows = []
@@ -441,11 +531,11 @@ def _section_samples(sm, cap, scap) -> str:
                      _kg(n["output_qty"]), _pct(n["yield_pct"]),
                      _status_badge(n["status"]),
                      (n["customer_name"] or n["company_name"] or "-"), n["created_by_name"]])
-    out += h3("NPD development job cards")
-    out += table(["Card", "Title", "FG item", "Target", "Output", "Yield", "Status",
+    out += H("NPD development job cards")
+    out += T(["Card", "Title", "FG item", "Target", "Output", "Yield", "Status",
                   "Customer", "By"], rows,
                  ["left", "left", "left", "right", "right", "right", "left", "left", "left"],
-                 cap=cap, empty="No NPD development job cards on this day")
+                 cap=cap, keep=[0, 1, 4, 6], empty="No NPD development job cards on this day")
     return out
 
 
@@ -462,7 +552,7 @@ def _inr(v) -> str:
     return f"{sign}{whole}.{frac}"
 
 
-def build_sections(agg, ops, cap) -> dict[str, str]:
+def build_sections(agg, ops, cap, slim: bool = False) -> dict[str, str]:
     """`cap` bounds detail tables; summary tables get a looser bound.
 
     Both are bounded, because the size guard can only shrink the mail if every
@@ -473,10 +563,10 @@ def build_sections(agg, ops, cap) -> dict[str, str]:
     """
     scap = None if cap is None else max(cap * 3, 12)
     return {
-        "inward": _section_inward(agg, cap, scap),
-        "transfers": _section_transfers(agg, cap, scap),
-        "jobcards": _section_jobcards(ops["jobcards"], cap, scap),
-        "samples": _section_samples(ops["samples"], cap, scap),
+        "inward": _section_inward(agg, cap, scap, SECTION["inward"], slim),
+        "transfers": _section_transfers(agg, cap, scap, SECTION["transfers"], slim),
+        "jobcards": _section_jobcards(ops["jobcards"], cap, scap, SECTION["jobcards"], slim),
+        "samples": _section_samples(ops["samples"], cap, scap, SECTION["samples"], slim),
     }
 
 
@@ -505,17 +595,19 @@ def render_email(day: date, agg, ops, generated: datetime, *,
     clipping costs a whole section.
     """
     cap = MAIL_ROW_CAP if _cap is None else _cap
-    sections = build_sections(agg, ops, cap)
+    sections = build_sections(agg, ops, cap, slim=True)
     counts = _counts(agg, ops)
 
     nav = ""
     for key, label in TABS:
+        t = SECTION[key]
         nav += (
-            f'<td style="padding:0 5px 7px 0;">'
-            f'<a href="#sec-{key}" style="display:block;padding:11px 12px;background:{NAVY_L};'
-            f'border:1px solid {RULE};border-radius:8px;text-decoration:none;color:{NAVY_D};'
-            f'font:700 14px Arial,Helvetica,sans-serif;text-align:center;white-space:nowrap;">'
-            f'{e(label)} <span style="color:{GREY};font-weight:400;">({e(counts[key])})</span>'
+            f'<td style="padding:0 6px 9px 0;">'
+            f'<a href="#sec-{key}" style="display:block;padding:14px 14px;'
+            f'background:{t["tint"]};border:2px solid {t["deep"]};border-radius:9px;'
+            f'text-decoration:none;color:{t["deep"]};'
+            f'font:700 {FS_NOTE + 3}px Arial,Helvetica,sans-serif;text-align:center;">'
+            f'{e(label)} <span style="font-weight:400;">({e(counts[key])})</span>'
             f'</a></td>'
         )
 
@@ -532,16 +624,19 @@ def render_email(day: date, agg, ops, generated: datetime, *,
 
     body = ""
     for key, label in TABS:
+        t = SECTION[key]
         body += (
             f'<a name="sec-{key}"></a>'
-            f'<div id="sec-{key}" style="margin:0 0 14px;">'
+            f'<div id="sec-{key}" style="margin:0 0 26px;">'
             f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>'
-            f'<td style="background:{NAVY};color:#fff;padding:13px 16px;border-radius:8px 8px 0 0;'
-            f'font:700 17px Arial,Helvetica,sans-serif;">{e(label)}'
-            f'<span style="float:right;font-weight:400;font-size:14px;opacity:.9;">'
+            f'<td style="background:{t["deep"]};color:#fff;padding:18px 20px;'
+            f'border-radius:10px 10px 0 0;'
+            f'font:700 {FS_SECTION}px Arial,Helvetica,sans-serif;">{e(label)}'
+            f'<span style="float:right;font-weight:400;font-size:{FS_H3}px;opacity:.92;">'
             f'{e(counts[key])}</span></td></tr></table>'
-            f'<div style="border:1px solid {RULE};border-top:0;border-radius:0 0 8px 8px;'
-            f'padding:15px 16px 18px;">{sections[key]}</div>'
+            f'<div style="border:3px solid {t["deep"]};border-top:0;'
+            f'border-radius:0 0 10px 10px;background:#fff;'
+            f'padding:20px 20px 24px;">{sections[key]}</div>'
             + (f'<div style="text-align:right;margin:7px 2px 0;">'
                f'<a href="#top" style="font:12.5px Arial,Helvetica,sans-serif;color:{GREY};'
                f'text-decoration:none;">&uarr; back to top</a></div>')
@@ -571,8 +666,9 @@ def render_email(day: date, agg, ops, generated: datetime, *,
     .tiles td {{ width:auto !important; }}
     .nav td {{ display:inline-block !important; width:47% !important; }}
     .hdr h1 {{ font-size:19px !important; }}
-    .scroll table {{ font-size:14px !important; }}
-    .scroll td, .scroll th {{ padding:10px 11px !important; }}
+    .scroll table {{ font-size:20px !important; }}
+    .scroll td, .scroll th {{ padding:11px 7px !important; }}
+    .wrap {{ padding:8px 4px !important; }}
   }}
 </style></head>
 <body>
@@ -646,7 +742,7 @@ def render_page(day: date, agg, ops, generated: datetime, *, revised: bool = Fal
          -webkit-overflow-scrolling:touch;scrollbar-width:none}}
   .tabs::-webkit-scrollbar{{display:none}}
   .tab{{flex:0 0 auto;border:0;background:rgba(255,255,255,.13);color:#fff;cursor:pointer;
-        padding:10px 15px;border-radius:9px 9px 0 0;font:600 13px inherit;white-space:nowrap;
+        padding:10px 15px;border-radius:9px 9px 0 0;font:600 13px inherit;
         display:flex;align-items:center;gap:7px}}
   .tab:hover{{background:rgba(255,255,255,.22)}}
   .tab[aria-selected=true]{{background:#F1F4F9;color:{NAVY_D}}}

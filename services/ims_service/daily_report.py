@@ -218,13 +218,15 @@ class Measure:
     alongside the weight and printed in its own unit.
     """
 
-    __slots__ = ("kg", "qty")
+    __slots__ = ("kg", "gross", "qty")
 
     def __init__(self):
-        self.kg = 0.0
+        self.kg = 0.0          # NET — the reported figure everywhere
+        self.gross = 0.0       # gross, shown only as a secondary line
         self.qty: dict[str, float] = defaultdict(float)
 
-    def add_line(self, net_weight, box_kg, qty, uom):
+    def add_line(self, net_weight, box_kg, qty, uom, gross=None):
+        self.gross += float(gross or 0)
         kg = float(net_weight or 0)
         if kg <= 0:
             kg = float(box_kg or 0)          # boxes are authoritative when the line is blank
@@ -237,6 +239,7 @@ class Measure:
 
     def merge(self, other: "Measure"):
         self.kg += other.kg
+        self.gross += other.gross
         for u, q in other.qty.items():
             self.qty[u] += q
 
@@ -244,11 +247,13 @@ class Measure:
     def is_empty(self) -> bool:
         return self.kg <= 0 and not any(v > 0 for v in self.qty.values())
 
-    def cell(self, *, unit: bool = False) -> str:
+    def cell(self, *, unit: bool = False, gross: bool = False) -> str:
         """Render as 'kg' and/or 'n UOM', one per line. Never a bare 0.00.
 
-        `unit=True` spells out "kg" for prose, where there is no column header
-        to say what the number is.
+        The headline number is always NET — that is what the business counts.
+        `gross=True` appends the gross figure as a secondary line in the same
+        cell, so the packed weight is visible without ever being mistaken for
+        the reported one.
         """
         parts = []
         if self.kg > 0:
@@ -256,7 +261,10 @@ class Measure:
         for u, q in sorted(self.qty.items()):
             if q > 0:
                 parts.append(f"{q:,.0f} {u}")
-        return "\n".join(parts) if parts else DASH
+        out = "\n".join(parts) if parts else DASH
+        if gross and self.gross > 0 and self.kg > 0:
+            out += f"␟ gross {self.gross:,.2f}"     # unit-separator = sub-line marker
+        return out
 
     def phrase(self) -> str:
         """One-line form for sentences: '33,031.39 kg + 103 BOX'."""
@@ -294,11 +302,12 @@ INWARD_SQL = """
 SELECT t.transaction_no, t.warehouse, t.status,
        t.approved_by, t.approval_authority,
        a.item_category, a.net_weight, a.quantity_units, a.uom, a.total_amount,
-       COALESCE(bx.box_kg, 0) AS box_kg
+       COALESCE(bx.box_kg, 0) AS box_kg, COALESCE(bx.box_gross, 0) AS box_gross
 FROM {p}_transactions_v2 t
 LEFT JOIN {p}_articles_v2 a USING (transaction_no)
 LEFT JOIN LATERAL (
-    SELECT SUM(COALESCE(b.net_weight, 0)) AS box_kg
+    SELECT SUM(COALESCE(b.net_weight, 0)) AS box_kg,
+           SUM(COALESCE(b.gross_weight, 0)) AS box_gross
     FROM {p}_boxes_v2 b
     WHERE b.transaction_no = a.transaction_no
       AND b.article_description = a.item_description
@@ -308,7 +317,7 @@ UNION ALL
 SELECT t.transaction_no, t.warehouse, t.status,
        t.approved_by, t.approval_authority,
        a.item_category, a.net_weight, a.quantity_units, a.uom, a.total_amount,
-       0 AS box_kg
+       0 AS box_kg, 0 AS box_gross
 FROM {p}_bulk_entry_transactions t
 LEFT JOIN {p}_bulk_entry_articles a USING (transaction_no)
 WHERE NULLIF(t.entry_date::text, '')::date = :d
@@ -317,16 +326,22 @@ WHERE NULLIF(t.entry_date::text, '')::date = :d
 TRF_OUT_SQL = """
 SELECT h.id, h.from_site, h.to_site, h.from_cold_unit,
        h.created_by, h.approved_by,
-       l.item_category, l.net_weight, l.qty, l.uom
+       l.item_category, l.net_weight, l.qty, l.uom,
+       COALESCE(g.gross, 0) AS gross
 FROM interunit_transfers_header h
 JOIN interunit_transfers_lines l ON l.header_id = h.id
+LEFT JOIN LATERAL (
+    SELECT SUM(COALESCE(b.gross_weight,0)) AS gross
+    FROM interunit_transfer_boxes b
+    WHERE b.transfer_line_id = l.id
+) g ON TRUE
 WHERE h.stock_trf_date = :d
 """
 
 TRF_IN_SQL = """
 SELECT i.id, o.from_site, o.from_cold_unit,
        COALESCE(NULLIF(TRIM(i.receiving_warehouse), ''), o.to_site) AS to_site,
-       i.received_by, b.article, b.net_weight
+       i.received_by, b.article, b.net_weight, b.gross_weight AS gross
 FROM interunit_transfer_in_header i
 LEFT JOIN interunit_transfer_in_boxes b ON b.header_id = i.id
 LEFT JOIN interunit_transfers_header o ON o.id = i.transfer_out_id
@@ -388,7 +403,7 @@ def aggregate(data: dict) -> dict:
     for r in inward:
         inw_txns.add(r["transaction_no"])
         has_line = any(r[k] is not None for k in ("item_category", "net_weight", "quantity_units"))
-        args = (r["net_weight"], r["box_kg"], r["quantity_units"], r["uom"])
+        args = (r["net_weight"], r["box_kg"], r["quantity_units"], r["uom"], r["box_gross"])
         val = float(r["total_amount"] or 0)
         inw_val += val
         head_i.add_line(*args)
@@ -412,7 +427,7 @@ def aggregate(data: dict) -> dict:
 
     for r in out:
         out_chl.add(r["id"])
-        args = (r["net_weight"], 0, r["qty"], r["uom"])
+        args = (r["net_weight"], 0, r["qty"], r["uom"], r["gross"])
         head_o.add_line(*args)
         w = wh[src_site(r)]
         w["och"].add(r["id"]); w["om"].add_line(*args)
@@ -425,7 +440,7 @@ def aggregate(data: dict) -> dict:
     for r in tin:
         in_grn.add(r["id"])
         # a received box with no weight still counts as one physical box
-        args = (r["net_weight"], 0, 0 if r["net_weight"] else (1 if r.get("article") else 0), "BOX")
+        args = (r["net_weight"], 0, 0 if r["net_weight"] else (1 if r.get("article") else 0), "BOX", r["gross"])
         head_n.add_line(*args)
         w = wh[canon_wh(r["to_site"])]
         w["igrn"].add(r["id"]); w["inm"].add_line(*args)
@@ -903,7 +918,9 @@ def _last_sent(db: Session, day: date) -> tuple[str, datetime] | None:
 def send_report(day: date, *, kind: str, revised: bool = False,
                 skip_if_empty: bool = False, db: Session | None = None,
                 subject_override: str | None = None,
-                thread_onto: str | None = None) -> dict:
+                thread_onto: str | None = None,
+                to_override: list[str] | None = None,
+                cc_override: list[str] | None = None) -> dict:
     """Build and email the report for `day`. Returns a result dict; never raises.
 
     `subject_override` / `thread_onto` exist for one narrow case: replying into a
@@ -935,8 +952,10 @@ def send_report(day: date, *, kind: str, revised: bool = False,
         # into that same conversation.
         anchor = day_anchor(day)
         first_send = _last_sent(db, day) is None
+        to_list = to_override if to_override is not None else REPORT_TO
+        cc_list = cc_override if cc_override is not None else REPORT_CC
         _send_mail(
-            subject_override or day_subject(day), html, plain, REPORT_TO, REPORT_CC,
+            subject_override or day_subject(day), html, plain, to_list, cc_list,
             day=day, revised=revised,
             message_id=anchor if first_send else None,
             in_reply_to=None if first_send else (thread_onto or anchor),
@@ -946,7 +965,7 @@ def send_report(day: date, *, kind: str, revised: bool = False,
         h = agg["head"]
         logger.info("Daily report %s (%s) sent to %d recipients — "
                     "inward %d, trf-out %d, trf-in %d",
-                    day, kind, len(REPORT_TO) + len(REPORT_CC),
+                    day, kind, len(to_list) + len(cc_list),
                     h["inw_txns"], h["out_chl"], h["in_grn"])
         return {"day": str(day), "status": "sent", "sent": True, "kind": kind,
                 "revised": revised, "fingerprint": fp,

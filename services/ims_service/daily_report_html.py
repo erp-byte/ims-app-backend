@@ -44,9 +44,7 @@ RED = "#B3261E"
 # colours that are all, deliberately, calm.
 ALERT = "#C62828"
 ALERT_DEEP = "#8C1D18"
-ALERT_BG = "#FDECEA"
 ALERT_RULE = "#F5CFCB"
-ALERT_SUB = "#FBD9D5"
 
 MAIL_ROW_CAP = 12          # detail rows per table in the mail body
 GMAIL_CLIP_BYTES = 102_400  # Gmail hides everything past this behind "View entire message"
@@ -84,12 +82,11 @@ FS_NOTE = 16        # was 11
 FS_BADGE = 16       # was 11
 FS_SUB = 15         # gross sub-line inside a cell
 
-# The exception panel is the one thing that must be readable at arm's length —
-# it is deliberately the largest type in the mail, above even the headline tiles.
-FS_GAP_HEAD = 30    # "Not entered today — N items need attention"
-FS_GAP_SITE = 30    # the warehouse name each group is filed under
-FS_GAP = 25         # the gap itself
-FS_GAP_CHIP = 17    # the little module label in front of it
+# The exception panel sits just above the body text in size — enough to read
+# first, not enough to become the mail. It opens the message, so every pixel it
+# takes is a pixel of the first real table pushed below the fold on a phone.
+FS_GAP_HEAD = 22    # "Not entered today — N items"
+FS_GAP = 20         # one bullet per warehouse
 
 
 def e(v) -> str:
@@ -242,124 +239,71 @@ def flag(txt, kind="warn") -> str:
 
 
 # ── exception panel ──────────────────────────────────────────────────────
-# Everything here is built from <div>/<span> rather than a table on purpose.
-# A table needs column widths, and a fixed width is exactly what made the mail
-# unreadable on Gmail mobile before: the client scales the whole message down to
-# fit the widest element, so one wide row shrinks the type everywhere. Flowing
-# text wraps instead, and stays the size it was set to.
-def _chip(module: str) -> str:
-    t = SECTION.get(module) or {"deep": ALERT_DEEP, "tint": ALERT_BG, "name": module}
-    return (f'<span style="display:inline-block;vertical-align:middle;'
-            f'background:{t["tint"]};color:{t["deep"]};border:2px solid {t["deep"]};'
-            f'border-radius:7px;padding:3px 11px;margin:0 10px 3px 0;'
-            f'font:700 {FS_GAP_CHIP}px/1.35 Arial,Helvetica,sans-serif;'
-            f'text-transform:uppercase;letter-spacing:.5px;white-space:nowrap;">'
-            f'{e(t["name"])}</span>')
-
-
-def _gap_line(module: str, text: str, *, rule: bool, prefix: str = "") -> str:
-    """One gap. `prefix` names the site when the group itself is not site-scoped."""
-    head = ""
-    if prefix:
-        t = SECTION.get(module) or {"deep": ALERT_DEEP}
-        head = (f'<span style="color:{t["deep"]};">{e(prefix)}</span>'
-                f'<span style="color:{GREY};"> &middot; </span>')
-    return (f'<div class="gap-line" style="padding:{"11px" if rule else "3px"} 0 11px;'
-            + (f'border-top:1px solid {ALERT_RULE};' if rule else "")
-            + f'font:700 {FS_GAP}px/1.42 Arial,Helvetica,sans-serif;color:{INK};">'
-            f'{_chip(module)}{head}{e(text)}</div>')
-
-
+# Built from <div>/<span> rather than a table on purpose. A table needs column
+# widths, and a fixed width is what made the mail unreadable on Gmail mobile
+# before: the client scales the whole message down to fit the widest element, so
+# one wide row shrinks the type everywhere. Flowing text wraps instead.
+#
+# It is a SUMMARY, and summaries earn their place by being short. One bullet per
+# warehouse, its gaps run together on that line, each phrase in its own module's
+# colour so you can still tell inward from job cards without a label taking up a
+# row. An earlier version gave every gap its own line and repeated the whole
+# panel inside each section; it was accurate and nobody could see past it — on a
+# phone it pushed the first real table off the screen entirely.
 def gaps_panel(gaps: list[dict]) -> str:
-    """The warehouse-wise "what is missing" block that opens the report.
+    """The warehouse-wise "what is missing" summary that opens the report.
 
     Grouped by site rather than by module because that is how it gets read: a
     supervisor looks for their own warehouse first and wants everything wrong
     with it in one place, whichever part of the business it came from.
 
     Rendered even when there is nothing to report — a panel that only appears on
-    bad days is indistinguishable from a panel that failed to render, and the
-    reader has no way to tell which they are looking at.
+    bad days is indistinguishable from one that failed to render.
     """
     if not gaps:
         return (
             f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
-            f'style="border-collapse:separate;margin:0 0 22px;"><tr>'
-            f'<td style="background:{GREEN_BG};border:4px solid {GREEN};border-radius:12px;'
-            f'padding:18px 22px;">'
-            f'<div style="font:700 {FS_GAP_HEAD - 3}px/1.3 Arial,Helvetica,sans-serif;'
-            f'color:{GREEN};">Nothing missing today</div>'
-            f'<div style="font:700 {FS_GAP_CHIP}px/1.45 Arial,Helvetica,sans-serif;'
-            f'color:{INK};margin-top:7px;">Every site that normally reports has entered '
-            f'its inward, transfers and job cards, and no required detail was left blank.'
+            f'style="border-collapse:separate;margin:0 0 14px;"><tr>'
+            f'<td style="background:{GREEN_BG};border:3px solid {GREEN};border-radius:10px;'
+            f'padding:12px 16px;">'
+            f'<div class="gap-head" style="font:700 {FS_GAP_HEAD}px/1.35 '
+            f'Arial,Helvetica,sans-serif;color:{GREEN};">'
+            f'Nothing missing &mdash; every site that normally reports has entered'
             f'</div></td></tr></table>'
         )
 
-    groups = group_by_site(gaps)
-    blocks = ""
-    for site, rows in groups:
+    dot = f'<span style="color:{GREY};font-weight:400;"> &middot; </span>'
+    rows_html = ""
+    for i, (site, rows) in enumerate(group_by_site(gaps)):
         named = site != ALL_SITES
-        title = site if named else "All sites"
-        lines = "".join(
-            _gap_line(g["module"], g["text"], rule=i > 0) for i, g in enumerate(rows)
+        phrases = dot.join(
+            f'<span style="color:{(SECTION.get(g["module"]) or {}).get("deep", INK)};">'
+            f'{e(g["text"])}</span>' for g in rows
         )
-        blocks += (
-            f'<div style="background:#fff;border:2px solid {ALERT_RULE};'
-            f'border-left:9px solid {ALERT_DEEP if named else GREY};'
-            f'border-radius:0 9px 9px 0;padding:13px 16px 4px;margin:12px 0 0;">'
-            f'<div class="gap-wh" style="font:700 {FS_GAP_SITE}px/1.2 '
-            f'Arial,Helvetica,sans-serif;color:{ALERT_DEEP if named else GREY};'
-            f'letter-spacing:.3px;">{e(title)}'
-            f'<span style="font-weight:400;font-size:{FS_GAP_CHIP}px;color:{GREY};'
-            f'"> &nbsp;{len(rows)} item{"" if len(rows) == 1 else "s"}</span></div>'
-            f'{lines}</div>'
+        rows_html += (
+            f'<div class="gap-line" style="padding:8px 0;'
+            + (f'border-top:1px solid {ALERT_RULE};' if i else '')
+            + f'font:700 {FS_GAP}px/1.45 Arial,Helvetica,sans-serif;color:{INK};">'
+            f'<span style="color:{ALERT};">&bull;&nbsp;</span>'
+            f'<span style="color:{ALERT_DEEP if named else GREY};">'
+            f'{e(site if named else "All sites")}</span>'
+            f'<span style="color:{GREY};font-weight:400;"> &mdash; </span>'
+            f'{phrases}</div>'
         )
 
     n = len(gaps)
-    sites = len([1 for s, _ in groups if s != ALL_SITES])
-    scope = f"across {sites} warehouse{'' if sites == 1 else 's'}" if sites else "company-wide"
     return (
         f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
-        f'style="border-collapse:separate;margin:0 0 22px;"><tr>'
-        f'<td style="background:{ALERT};border:4px solid {ALERT};border-bottom:0;'
-        f'border-radius:12px 12px 0 0;padding:19px 22px;">'
-        f'<div class="gap-head" style="font:700 {FS_GAP_HEAD}px/1.24 '
+        f'style="border-collapse:separate;margin:0 0 14px;"><tr>'
+        f'<td style="background:{ALERT};border:3px solid {ALERT};'
+        f'border-radius:10px 10px 0 0;padding:11px 16px;">'
+        f'<div class="gap-head" style="font:700 {FS_GAP_HEAD}px/1.3 '
         f'Arial,Helvetica,sans-serif;color:#fff;">'
-        f'NOT ENTERED TODAY &mdash; {n} item{"" if n == 1 else "s"} need attention</div>'
-        f'<div style="font:700 {FS_GAP_CHIP}px/1.45 Arial,Helvetica,sans-serif;'
-        f'color:{ALERT_SUB};margin-top:7px;">Warehouse-wise, {e(scope)}. Each line is '
-        f'something not entered, not finished or left blank in IMS for this day.</div>'
+        f'Not entered today &mdash; {n} item{"" if n == 1 else "s"}</div>'
         f'</td></tr><tr>'
-        f'<td style="background:{ALERT_BG};border:4px solid {ALERT};border-top:0;'
-        f'border-radius:0 0 12px 12px;padding:2px 14px 16px;">{blocks}</td>'
+        f'<td style="background:#fff;border:3px solid {ALERT};border-top:0;'
+        f'border-radius:0 0 10px 10px;padding:3px 16px 9px;">{rows_html}</td>'
         f'</tr></table>'
-    )
-
-
-def gaps_strip(gaps: list[dict], module: str, tone) -> str:
-    """The same gaps again, filtered to one module, at the head of its section.
-
-    Repeated on purpose: the top panel is what you see on opening the mail, this
-    is what you see after jumping to a section, and the two are read minutes and
-    a lot of scrolling apart.
-    """
-    rows = [g for g in gaps if g["module"] == module]
-    if not rows:
-        return ""
-    rows.sort(key=lambda g: (g["rank"], g["site"] or "￿", g["text"]))
-    lines = "".join(
-        _gap_line(module, g["text"], rule=i > 0,
-                  prefix=g["site"] if g["site"] != ALL_SITES else "")
-        for i, g in enumerate(rows)
-    )
-    return (
-        f'<div style="background:{ALERT_BG};border:3px solid {ALERT};border-radius:10px;'
-        f'padding:13px 16px 5px;margin:0 0 18px;">'
-        f'<div style="font:700 {FS_GAP_CHIP + 2}px/1.3 Arial,Helvetica,sans-serif;'
-        f'color:{ALERT};text-transform:uppercase;letter-spacing:.7px;'
-        f'padding-bottom:4px;">Not entered &mdash; {len(rows)} '
-        f'item{"" if len(rows) == 1 else "s"} in {e(tone["name"])}</div>'
-        f'{lines}</div>'
     )
 
 
@@ -700,7 +644,7 @@ def _inr(v) -> str:
     return f"{sign}{whole}.{frac}"
 
 
-def build_sections(agg, ops, cap, slim: bool = False, gaps=None) -> dict[str, str]:
+def build_sections(agg, ops, cap, slim: bool = False) -> dict[str, str]:
     """`cap` bounds detail tables; summary tables get a looser bound.
 
     Both are bounded, because the size guard can only shrink the mail if every
@@ -708,21 +652,14 @@ def build_sections(agg, ops, cap, slim: bool = False, gaps=None) -> dict[str, st
     push the message past Gmail's clip limit no matter how far the detail tables
     were trimmed. In practice the summary bound is never reached: there are ~11
     warehouses and ~20 routes in the business.
-
-    Each section opens with its own share of the exception panel, so the answer
-    to "what is missing here" arrives before the tables rather than after them.
     """
     scap = None if cap is None else max(cap * 3, 12)
-    out = {
+    return {
         "inward": _section_inward(agg, cap, scap, SECTION["inward"], slim),
         "transfers": _section_transfers(agg, cap, scap, SECTION["transfers"], slim),
         "jobcards": _section_jobcards(ops["jobcards"], cap, scap, SECTION["jobcards"], slim),
         "samples": _section_samples(ops["samples"], cap, scap, SECTION["samples"], slim),
     }
-    if gaps:
-        for key in out:
-            out[key] = gaps_strip(gaps, key, SECTION[key]) + out[key]
-    return out
 
 
 def _counts(agg, ops) -> dict[str, str]:
@@ -750,7 +687,7 @@ def render_email(day: date, agg, ops, generated: datetime, *,
     clipping costs a whole section.
     """
     cap = MAIL_ROW_CAP if _cap is None else _cap
-    sections = build_sections(agg, ops, cap, slim=True, gaps=gaps)
+    sections = build_sections(agg, ops, cap, slim=True)
     counts = _counts(agg, ops)
     gcount = gap_counts(gaps)
 
@@ -830,11 +767,10 @@ def render_email(day: date, agg, ops, generated: datetime, *,
     .scroll table {{ font-size:20px !important; }}
     .scroll td, .scroll th {{ padding:11px 7px !important; }}
     .wrap {{ padding:8px 4px !important; }}
-    /* The exception panel keeps its size on a phone — it is the one thing that
-       has to be legible without opening the mail properly. */
-    .gap-head {{ font-size:26px !important; }}
-    .gap-wh {{ font-size:27px !important; }}
-    .gap-line {{ font-size:23px !important; }}
+    /* The summary stays legible but must not eat the fold — the first table
+       has to be visible on the same screen. */
+    .gap-head {{ font-size:21px !important; }}
+    .gap-line {{ font-size:19px !important; }}
   }}
 </style></head>
 <body>
@@ -880,7 +816,7 @@ def render_email(day: date, agg, ops, generated: datetime, *,
 # ═════════════════════════════════════════════════════════════════════════
 def render_page(day: date, agg, ops, generated: datetime, *, revised: bool = False,
                 gaps: list[dict] | None = None) -> str:
-    sections = build_sections(agg, ops, None, gaps=gaps)      # no cap — every row
+    sections = build_sections(agg, ops, None)      # no cap — every row
     counts = _counts(agg, ops)
     gcount = gap_counts(gaps)
 

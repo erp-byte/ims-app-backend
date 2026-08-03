@@ -79,16 +79,6 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
-# "1 of 10 job cards have no accounting entry" reads as a typo and quietly costs
-# the panel authority, which is the whole point of it.
-def _has(n: int) -> str:
-    return "has" if n == 1 else "have"
-
-
-def _does(n: int) -> str:
-    return "does" if n == 1 else "do"
-
-
 def _gap(module: str, site: str, message: str, rank: int) -> dict:
     return {"module": module, "site": site or ALL_SITES, "text": message, "rank": rank}
 
@@ -193,30 +183,23 @@ def _inward_gaps(agg, expected: set[str]) -> list[dict]:
     active = {name for name, w in agg["wh"].items() if w["itx"]}
 
     if not agg["head"]["inw_txns"]:
-        gaps.append(_gap("inward", ALL_SITES,
-                         "No inward entry made anywhere today", R_MODULE_SILENT))
+        gaps.append(_gap("inward", ALL_SITES, "No inward anywhere", R_MODULE_SILENT))
     else:
         for site in sorted(expected - active):
-            gaps.append(_gap("inward", site,
-                             "No inward entry made for the day", R_SITE_SILENT))
+            gaps.append(_gap("inward", site, "No inward entered", R_SITE_SILENT))
 
     for name, w in sorted(agg["wh"].items()):
         if not w["itx"]:
             continue
         if _unknown(name):
             gaps.append(_gap("inward", "(Unassigned)",
-                             f"{_plural(len(w['itx']), 'inward transaction')} saved "
-                             f"without a warehouse", R_MISSING_DATA))
+                             f"{_plural(len(w['itx']), 'entry')} without a warehouse",
+                             R_MISSING_DATA))
         lines, miss = w.get("ilines", 0), w.get("imiss", 0)
         if miss and lines:
-            if lines == 1:
-                what = "the only inward line"
-            elif miss == lines:
-                what = f"all {lines} inward lines"
-            else:
-                what = f"{miss} of {lines} inward lines"
-            gaps.append(_gap("inward", name,
-                             f"Value not entered on {what} keyed today", R_MISSING_DATA))
+            where = "the only line" if lines == 1 else (
+                f"all {lines} lines" if miss == lines else f"{miss} of {lines} lines")
+            gaps.append(_gap("inward", name, f"Value blank on {where}", R_MISSING_DATA))
     return gaps
 
 
@@ -226,14 +209,10 @@ def _transfer_gaps(agg, expected: set[str]) -> list[dict]:
     active = {name for name, w in agg["wh"].items() if w["och"] or w["igrn"]}
 
     if not (h["out_chl"] or h["in_grn"]):
-        gaps.append(_gap("transfers", ALL_SITES,
-                         "No transfer made anywhere today — nothing dispatched, "
-                         "nothing received", R_MODULE_SILENT))
+        gaps.append(_gap("transfers", ALL_SITES, "No transfers anywhere", R_MODULE_SILENT))
     else:
         for site in sorted(expected - active):
-            gaps.append(_gap("transfers", site,
-                             "No transfer made today — nothing dispatched, "
-                             "nothing received", R_SITE_SILENT))
+            gaps.append(_gap("transfers", site, "No transfers in or out", R_SITE_SILENT))
     return gaps
 
 
@@ -241,14 +220,11 @@ def _jobcard_gaps(jc, expected: set[str]) -> list[dict]:
     gaps: list[dict] = []
 
     if jc["empty"]:
-        gaps.append(_gap("jobcards", ALL_SITES,
-                         "No job card initiated or entered anywhere for the day",
-                         R_MODULE_SILENT))
+        gaps.append(_gap("jobcards", ALL_SITES, "No job cards anywhere", R_MODULE_SILENT))
         return gaps
 
     for site in sorted(expected - set(jc["wh"])):
-        gaps.append(_gap("jobcards", site,
-                         "No job card initiated or entered for the day", R_SITE_SILENT))
+        gaps.append(_gap("jobcards", site, "No job cards entered", R_SITE_SILENT))
 
     for name, v in sorted(jc["wh"].items()):
         n = len(v["cards"])
@@ -259,39 +235,27 @@ def _jobcard_gaps(jc, expected: set[str]) -> list[dict]:
         started = len(v.get("started", ()))
 
         if not closed and not closed_today:
-            if started:
-                gaps.append(_gap("jobcards", name,
-                                 f"{_plural(n, 'job card')} worked on, none closed today",
-                                 R_UNFINISHED))
-            else:
-                gaps.append(_gap("jobcards", name,
-                                 f"{_plural(n, 'job card')} planned, none started "
-                                 f"or closed today", R_UNFINISHED))
+            state = "open, none closed" if started else "planned, none started"
+            gaps.append(_gap("jobcards", name,
+                             f"{_plural(n, 'job card')} {state}", R_UNFINISHED))
         elif not closed_today:
-            gaps.append(_gap("jobcards", name,
-                             f"No job card closed today ({_plural(n, 'card')} active)",
-                             R_UNFINISHED))
+            gaps.append(_gap("jobcards", name, "None closed today", R_UNFINISHED))
 
-        no_acct = v.get("no_acct", 0)
-        if no_acct:
+        if v.get("no_acct"):
             gaps.append(_gap("jobcards", name,
-                             f"{no_acct} of {n} job cards {_has(no_acct)} no accounting "
-                             f"entry — loss metrics missing", R_MISSING_DATA))
+                             f"{v['no_acct']} of {n} without accounting", R_MISSING_DATA))
         if not v["users"]:
             gaps.append(_gap("jobcards", name,
-                             f"No team leader named on {_plural(n, 'job card')}",
+                             f"{_plural(n, 'job card')} without a team leader",
                              R_MISSING_DATA))
         if v.get("no_fg"):
             gaps.append(_gap("jobcards", name,
-                             f"{v['no_fg']} of {n} job cards {_has(v['no_fg'])} no FG "
-                             f"item recorded", R_MISSING_DATA))
+                             f"{v['no_fg']} of {n} without an FG item", R_MISSING_DATA))
 
     loss = jc.get("loss") or {}
     if loss.get("unbalanced"):
-        u = loss["unbalanced"]
         gaps.append(_gap("jobcards", ALL_SITES,
-                         f"{u} of {loss['rows']} accounted job cards {_does(u)} not "
-                         f"balance — input, output and losses do not reconcile",
+                         f"{loss['unbalanced']} of {loss['rows']} job cards unbalanced",
                          R_MISSING_DATA))
     return gaps
 
@@ -300,39 +264,36 @@ def _sample_gaps(sm, expected: set[str], canon_site) -> list[dict]:
     gaps: list[dict] = []
 
     if sm["empty"]:
-        gaps.append(_gap("samples", ALL_SITES,
-                         "No sample or NPD activity recorded for the day", R_MODULE_SILENT))
+        gaps.append(_gap("samples", ALL_SITES, "No sample or NPD activity", R_MODULE_SILENT))
         return gaps
 
     active = {canon_site(r.get("warehouse")) for r in sm["requisitions"]}
     active |= {canon_site(n.get("warehouse")) for n in sm["npd_jobcards"]}
     for site in sorted(expected - active):
-        gaps.append(_gap("samples", site,
-                         "No sample requisition or NPD card raised for the day",
-                         R_SITE_SILENT))
+        gaps.append(_gap("samples", site, "No sample or NPD activity", R_SITE_SILENT))
 
+    total = len(sm["requisitions"])
     unmapped = [r for r in sm["requisitions"] if not (r.get("sale_groups") or "").strip()]
     if unmapped:
         gaps.append(_gap("samples", ALL_SITES,
-                         f"{len(unmapped)} of {len(sm['requisitions'])} requisitions "
-                         f"{_has(len(unmapped))} no sales group — the articles are not "
-                         f"mapped in all_sku", R_MISSING_DATA))
+                         f"{len(unmapped)} of {total} requisitions without a sales group",
+                         R_MISSING_DATA))
 
     faceless = [r for r in sm["requisitions"]
                 if not (r.get("customer_name") or r.get("company_name") or "").strip()
                 and not (r.get("npd_target_name") or "").strip()]
     if faceless:
         gaps.append(_gap("samples", ALL_SITES,
-                         f"{_plural(len(faceless), 'requisition')} raised with no customer "
-                         f"or NPD target named", R_MISSING_DATA))
+                         f"{_plural(len(faceless), 'requisition')} without a customer",
+                         R_MISSING_DATA))
 
     open_npd = [n for n in sm["npd_jobcards"]
                 if str(n.get("status") or "").strip().upper() not in
                 ("CLOSED", "CANCELLED") and not n.get("output_qty")]
     if open_npd:
         gaps.append(_gap("samples", ALL_SITES,
-                         f"{_plural(len(open_npd), 'NPD job card')} still open with no "
-                         f"output quantity recorded", R_MISSING_DATA))
+                         f"{_plural(len(open_npd), 'NPD card')} without output qty",
+                         R_MISSING_DATA))
     return gaps
 
 
@@ -372,6 +333,12 @@ def compute_gaps(db: Session, day: date, agg: dict, ops: dict, *, canon_site) ->
     return gaps
 
 
+# Reading order inside a warehouse's line. Grouping by module keeps the
+# same-coloured phrases adjacent, which is what makes a run-on line scannable;
+# ordering by rank instead would interleave two modules and read as noise.
+_MODULE_ORDER = {"inward": 0, "transfers": 1, "jobcards": 2, "samples": 3}
+
+
 def group_by_site(gaps: list[dict]) -> list[tuple[str, list[dict]]]:
     """Warehouse-first ordering, because that is how the panel is read.
 
@@ -383,7 +350,7 @@ def group_by_site(gaps: list[dict]) -> list[tuple[str, list[dict]]]:
     for g in gaps:
         by_site[g["site"]].append(g)
     for rows in by_site.values():
-        rows.sort(key=lambda g: (g["rank"], g["module"], g["text"]))
+        rows.sort(key=lambda g: (_MODULE_ORDER.get(g["module"], 9), g["rank"], g["text"]))
 
     def order(item):
         site, rows = item

@@ -796,17 +796,14 @@ def build_pdf(day: date, agg: dict, generated: datetime, *, revised: bool = Fals
 #  EMAIL
 # ═════════════════════════════════════════════════════════════════════════
 def _plain_gaps(gaps: list[dict]) -> list[str]:
-    """The exception panel as text — same warehouse-first grouping as the HTML."""
+    """The exception summary as text — one line per warehouse, as in the HTML."""
     from services.ims_service.daily_report_gaps import group_by_site
     if not gaps:
-        return ["NOT ENTERED TODAY",
-                "  Nothing missing - every site that normally reports has entered its "
-                "inward, transfers and job cards."]
-    out = [f"NOT ENTERED TODAY - {len(gaps)} item(s) need attention"]
+        return ["NOT ENTERED TODAY: nothing missing."]
+    out = [f"NOT ENTERED TODAY - {len(gaps)} item(s)"]
     for site, rows in group_by_site(gaps):
-        out.append(f"  {site or 'All sites'}")
-        for g in rows:
-            out.append(f"    [{g['module'].upper()}] {g['text']}")
+        out.append(f"  * {site or 'All sites'} - "
+                   + " | ".join(g["text"] for g in rows))
     return out
 
 

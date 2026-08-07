@@ -20,8 +20,10 @@ from shared.scheduler import (
     auto_punch_out_and_revoke,
     daily_report_evening,
     daily_report_morning_revision,
+    job_work_weekly_digest,
+    rtv_email_poll_once,
 )
-from shared.email_reply_listener import poll_once as rtv_email_poll, shutdown as rtv_email_shutdown
+from shared.email_reply_listener import shutdown as rtv_email_shutdown
 from services.auth_service.server import router as auth_router
 from services.ims_service.server import router as ims_router
 from services.ims_service.inward_server import router as inward_router
@@ -253,6 +255,8 @@ async def lifespan(app: FastAPI):
         CronTrigger(hour=17, minute=30, timezone="UTC"),
         id="auto_punch_out",
     )
+    # Deliberately NOT claim-guarded: every instance has to keep ITSELF warm, so
+    # this is the one job that is supposed to run once per instance.
     scheduler.add_job(
         keep_alive_ping,
         IntervalTrigger(minutes=7),
@@ -279,9 +283,21 @@ async def lifespan(app: FastAPI):
         coalesce=True,
         misfire_grace_time=3600,
     )
+    # Weekly job-work digest — Monday 9:00 AM IST. shared.scheduler has carried this
+    # job (and email_notifier its recipients) since the module was written, but it was
+    # never registered here, so it had never once run. A missing add_job is silent by
+    # construction: nothing logs, nothing errors, the mail simply never exists.
+    scheduler.add_job(
+        job_work_weekly_digest,
+        CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=IST),
+        id="job_work_weekly_digest",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,   # a Monday-morning restart must not skip the week
+    )
     if settings.RTV_EMAIL_APPROVAL_ENABLED:
         scheduler.add_job(
-            rtv_email_poll,
+            rtv_email_poll_once,
             IntervalTrigger(minutes=settings.RTV_EMAIL_POLL_MINUTES),
             id="rtv_email_poll",
             max_instances=1,

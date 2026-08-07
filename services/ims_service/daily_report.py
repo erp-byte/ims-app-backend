@@ -90,6 +90,7 @@ REPORT_TO = [
     "sunil.jasoria@candorfoods.in",
     "stores@candorfoods.in",
     "sachin.more@candorfoods.in",
+    "rakesh@candorfoods.in",
 ]
 REPORT_CC = [
     "vaibhav.kumkar@candorfoods.in",
@@ -472,8 +473,8 @@ def fingerprint(agg: dict, ops: dict | None = None) -> str:
     a difference means entries landed (or were edited) after the cut-off. This
     catches back-dated edits too, which a created_at>19:00 filter would miss.
 
-    Job cards and samples are included, so a late job card or sample approval
-    triggers the revision just as a late GRN would.
+    Every section is included, so a late job card, a job-work receipt or a CR
+    approval triggers the revision just as a late GRN would.
 
     The exception panel is deliberately NOT fingerprinted. Every gap it can
     report is derived from figures already in here — entering the missing value
@@ -490,10 +491,15 @@ def fingerprint(agg: dict, ops: dict | None = None) -> str:
     ]
     if ops:
         jc, sm = ops["jobcards"], ops["samples"]
+        jw, cr = ops["jobwork"], ops["cr"]
         parts.append(f"j:{jc['total_cards']}:{jc['total_kg']:.2f}:"
                      f"{sorted(jc['status'].items())}:{jc['loss'].get('rows', 0)}")
         parts.append(f"s:{len(sm['requisitions'])}:{len(sm['actions'])}:"
                      f"{len(sm['npd_jobcards'])}:{sm['total_qty']:.3f}")
+        parts.append(f"w:{jw['out_challans']}:{jw['out_kg']:.2f}:"
+                     f"{jw['in_receipts']}:{jw['in_fg_kg']:.2f}:{jw['in_waste_kg']:.2f}")
+        parts.append(f"c:{cr['total_crs']}:{cr['total_kg']:.2f}:{cr['total_value']:.2f}:"
+                     f"{sorted(cr['by_status'].items())}")
     return "|".join(parts)
 
 
@@ -812,10 +818,12 @@ def _plain_summary(day: date, agg: dict, ops: dict, revised: bool,
     """Text alternative. Clients that refuse HTML still get the day's numbers."""
     h, vg = agg["head"], agg["val_gap"]
     jc, sm = ops["jobcards"], ops["samples"]
+    jw, cr = ops["jobwork"], ops["cr"]
     banner = ("REVISED - entries were recorded for this day after the 7:00 PM cut-off. "
               "These figures supersede yesterday evening's report."
               if revised else
-              "Daily activity across inward, transfers, job cards and samples.")
+              "Daily activity across inward, transfers, customer returns, job cards "
+              "and samples.")
 
     lines = [
         f"Daily Report{' - REVISED' if revised else ''}: {day:%A, %d %B %Y}",
@@ -831,6 +839,18 @@ def _plain_summary(day: date, agg: dict, ops: dict, revised: bool,
         "", "TRANSFERS",
         f"  Out: {h['out_chl']} challans | {h['out_m'].phrase()}",
         f"  In : {h['in_grn']} GRNs | {h['in_m'].phrase()}",
+        f"  Job work out: {jw['out_challans']} challans | {jw['out_kg']:,.2f} kg | "
+        f"{jw['out_boxes']:,} boxes",
+        f"  Job work in : {jw['in_receipts']} receipts | FG {jw['in_fg_kg']:,.2f} kg | "
+        f"waste {jw['in_waste_kg']:,.2f} kg | rejection {jw['in_rej_kg']:,.2f} kg",
+        "", "CUSTOMER RETURNS (CR)",
+        f"  {cr['total_crs']} returns | {cr['total_kg']:,.2f} kg | Rs. {inr(cr['total_value'])} | "
+        f"{cr['approved']} approved today",
+    ]
+    if cr["by_status"]:
+        lines.append("  " + " | ".join(f"{k} {n}" for k, n in
+                                       sorted(cr["by_status"].items(), key=lambda x: -x[1])))
+    lines += [
         "", "JOB CARDS",
         f"  {jc['total_cards']} active | {jc['total_users']} users | "
         f"{jc['total_fg']} FG items | {jc['total_kg']:,.2f} kg planned",
@@ -941,6 +961,18 @@ def _last_sent(db: Session, day: date) -> tuple[str, datetime] | None:
 # ═════════════════════════════════════════════════════════════════════════
 #  ORCHESTRATION
 # ═════════════════════════════════════════════════════════════════════════
+def is_quiet(agg: dict, ops: dict) -> bool:
+    """Nothing happened in any section.
+
+    Every section has to agree, in one place rather than three: a day with no GRN
+    but a job-work receipt or a customer return is not a quiet day, and a
+    "skipped_empty" that swallows it is indistinguishable from a failed send.
+    """
+    return agg["empty"] and all(
+        ops[k]["empty"] for k in ("jobcards", "samples", "jobwork", "cr"))
+
+
+
 def send_report(day: date, *, kind: str, revised: bool = False,
                 skip_if_empty: bool = False, db: Session | None = None,
                 subject_override: str | None = None,
@@ -962,10 +994,7 @@ def send_report(day: date, *, kind: str, revised: bool = False,
         ops = ops_data(db, day)
         fp = fingerprint(agg, ops)
 
-        # "Empty" must consider every section — a day with no GRN but a job card
-        # or a sample approval is not a quiet day.
-        nothing_happened = agg["empty"] and ops["jobcards"]["empty"] and ops["samples"]["empty"]
-        if skip_if_empty and nothing_happened:
+        if skip_if_empty and is_quiet(agg, ops):
             _log(db, day, kind, "skipped_empty", fp)
             logger.info("Daily report %s: no activity in any section, nothing sent", day)
             return {"day": str(day), "status": "skipped_empty", "sent": False}
@@ -1030,10 +1059,9 @@ def run_morning_revision() -> dict:
         agg = aggregate(fetch(db, day))
         ops = ops_data(db, day)
         fp = fingerprint(agg, ops)
-        nothing_happened = agg["empty"] and ops["jobcards"]["empty"] and ops["samples"]["empty"]
 
         if prev is None:
-            if nothing_happened and day.weekday() == 6:
+            if is_quiet(agg, ops) and day.weekday() == 6:
                 _log(db, day, "catchup", "skipped_empty", fp)
                 return {"day": str(day), "status": "skipped_empty", "sent": False}
             logger.warning("No evening report was sent for %s — sending catch-up now", day)
@@ -1081,7 +1109,7 @@ def run_startup_catchup(max_days: int = 7) -> None:
                     continue
                 agg = aggregate(fetch(db, day))
                 ops = ops_data(db, day)
-                if agg["empty"] and ops["jobcards"]["empty"] and ops["samples"]["empty"]:
+                if is_quiet(agg, ops):
                     continue          # nothing happened; nothing owed
                 logger.warning("Catch-up: %s was never sent — sending now", day)
                 send_report(day, kind="catchup", db=db)

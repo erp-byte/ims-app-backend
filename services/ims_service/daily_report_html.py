@@ -54,6 +54,7 @@ MAIL_MIN_ROW_CAP = 4        # never strip a table below this
 TABS = [
     ("inward", "Inward"),
     ("transfers", "Transfers"),
+    ("cr", "Customer Returns"),
     ("jobcards", "Job Cards"),
     ("samples", "Samples / NPD"),
 ]
@@ -61,9 +62,13 @@ TABS = [
 # One colour per module, so a section is identifiable before a word is read.
 # Every section used the same navy, which made four different kinds of work look
 # like one continuous table. (deep, mid, tint, header-text-on-tint)
+# CR's rose is deliberately not the alert red: the exception panel is the only
+# thing in the mail allowed to mean "wrong", and a returns section coloured like
+# it would read as a problem every day it has rows.
 SECTION = {
     "inward":    {"deep": "#1E3A6E", "mid": "#2F5FA8", "tint": "#EAF0FA", "name": "Inward"},
     "transfers": {"deep": "#0E5A54", "mid": "#12857B", "tint": "#E4F4F2", "name": "Transfers"},
+    "cr":        {"deep": "#8A2E4D", "mid": "#B8446B", "tint": "#FBEAF0", "name": "Customer Returns"},
     "jobcards":  {"deep": "#7A4310", "mid": "#B4661A", "tint": "#FBEFE1", "name": "Job Cards"},
     "samples":   {"deep": "#553087", "mid": "#7B4FBF", "tint": "#F1EAFB", "name": "Samples / NPD"},
 }
@@ -433,13 +438,18 @@ def _section_inward(agg, cap, scap, tone=None, slim=False) -> str:
     return out
 
 
-def _section_transfers(agg, cap, scap, tone=None, slim=False) -> str:
+def _section_transfers(agg, jw, cap, scap, tone=None, slim=False) -> str:
     T, H, TI = _tone_helpers(tone, slim)
     h = agg["head"]
     out = TI([
         ("Dispatched (net)", _n(h["out_chl"]) + " challans", h["out_m"].phrase() + _gsuffix(h["out_m"])),
         ("Received (net)", _n(h["in_grn"]) + " GRNs", h["in_m"].phrase() + _gsuffix(h["in_m"])),
         ("Routes", _n(len(agg["route"])), None),
+        # A literal 0 rather than the em dash the tables use: "– out · – in" reads
+        # as a rendering fault, where "0 out · 0 in" reads as the answer.
+        ("Job work", f'{jw["out_challans"]} out · {jw["in_receipts"]} in',
+         "none today" if jw["empty"] else
+         f'{_kg(jw["out_kg"])} kg sent · {_kg(jw["in_fg_kg"])} kg back'),
     ])
     out += (f'<div style="font-size:11px;color:{GREY};font-style:italic;margin:2px 2px 0;">'
             f'Transfers move existing stock between our own locations and carry no rate in IMS, '
@@ -481,6 +491,38 @@ def _section_transfers(agg, cap, scap, tone=None, slim=False) -> str:
                  note="Out and In will not match — a consignment is usually received a day or more "
                       "after it is dispatched.",
                  empty="No transfers recorded for this day")
+    out += _jobwork_tables(jw, cap, scap, T, H)
+    return out
+
+
+def _jobwork_tables(jw, cap, scap, T, H) -> str:
+    """Job work — material sent to a processing party, and what came back.
+
+    Reported per challan / per receipt, never per line: a cold dispatch keys one
+    line per box, so one day's two challans are two hundred rows. The challan is
+    the unit the business tracks, and it is the only one that fits in a mail.
+    """
+    rows = [[r["challan_no"], r["site"], r["party"], _kg(r["kg"]), _n(r["boxes"]),
+             _status_badge(r["status"])] for r in jw["out_rows"]]
+    out = H("Job work — material out")
+    out += T(["Challan", "From", "Party", "Kgs", "Boxes", "Status"], rows,
+             ["left", "left", "left", "right", "right", "left"], cap=cap,
+             widths=[17, 12, 30, 12, 10, 19], keep=[0, 2, 3],
+             total=["TOTAL", "", "", _kg(jw["out_kg"]), _n(jw["out_boxes"]), ""],
+             empty="No job work dispatched on this day")
+
+    rows = [[r["ir_number"], r["challan_no"], r["site"], r["party"], _kg(r["fg_kg"]),
+             _kg(r["waste_kg"]), _kg(r["rej_kg"]), r["kind"]] for r in jw["in_rows"]]
+    out += H("Job work — material in")
+    out += T(["Receipt", "Challan", "Warehouse", "Party", "FG kgs", "Waste kgs",
+              "Rejection kgs", "Receipt"], rows,
+             ["left", "left", "left", "left", "right", "right", "right", "left"], cap=cap,
+             widths=[19, 14, 11, 20, 10, 9, 9, 8], keep=[0, 3, 4],
+             total=["TOTAL", "", "", "", _kg(jw["in_fg_kg"]), _kg(jw["in_waste_kg"]),
+                    _kg(jw["in_rej_kg"]), ""],
+             note="FG is what the party returned as finished goods; waste and rejection are the "
+                  "rest of what was sent. A partial receipt leaves the balance still out with them.",
+             empty="No job work received back on this day")
     return out
 
 
@@ -629,6 +671,63 @@ def _section_samples(sm, cap, scap, tone=None, slim=False) -> str:
     return out
 
 
+def _section_cr(cr, cap, scap, tone=None, slim=False) -> str:
+    """Customer returns — goods coming back from a customer.
+
+    Weight is the line's declared net, not the sum of scanned boxes; the two
+    differ only while boxing is part-done, and a return must not appear to shrink
+    because the scanning has not caught up.
+    """
+    T, H, TI = _tone_helpers(tone, slim)
+    if cr["empty"]:
+        return (TI([("Customer returns", "0", "none today"), ("Returned (net)", "0 kg", None),
+                    ("Value", "Rs. 0", None), ("Approved today", "0", None)])
+                + T(["CR", "Factory", "Customer", "Status"], [],
+                    empty="No customer return raised or approved on this day"))
+
+    out = TI([
+        ("Customer returns", _n(cr["total_crs"]), "raised or approved today"),
+        ("Returned (net)", _kg(cr["total_kg"]) + " kg", _n(cr["total_qty"]) + " qty"),
+        ("Value", "Rs. " + _inr(cr["total_value"]), None),
+        ("Approved today", _n(cr["approved"]), f'{len(cr["customers"])} customers'),
+    ])
+
+    rows = [[s, _n(v["crs"]), _kg(v["kg"]), _n(v["qty"]), _inr(v["value"])]
+            for s, v in sorted(cr["by_site"].items(), key=lambda kv: -kv[1]["kg"])]
+    out += H("Factory-wise")
+    out += T(["Factory", "CRs", "Net kgs", "Qty", "Value (Rs.)"], rows,
+             ["left", "right", "right", "right", "right"], cap=scap, keep=[0, 1, 2],
+             total=["TOTAL", _n(cr["total_crs"]), _kg(cr["total_kg"]),
+                    _n(cr["total_qty"]), _inr(cr["total_value"])])
+
+    out += H("Status")
+    out += T(["Status", "CRs"],
+             [[_status_badge(k), _n(v)] for k, v in
+              sorted(cr["by_status"].items(), key=lambda x: -x[1])],
+             ["left", "right"], cap=scap,
+             note="Pending is raised but not yet sent for approval; Submitted is awaiting the "
+                  "business head; Approved is signed off.")
+
+    rows = [[c, s, _kg(v["kg"]), _n(v["qty"]), _inr(v["value"])]
+            for (c, s), v in sorted(cr["by_category"].items(), key=lambda kv: -kv[1]["kg"])]
+    out += H("Category × sub-group")
+    out += T(["Category", "Sub-group", "Net kgs", "Qty", "Value (Rs.)"], rows,
+             ["left", "left", "right", "right", "right"], cap=cap,
+             widths=[22, 28, 17, 13, 20], keep=[0, 1, 2])
+
+    rows = [[r["cr_id"], r["company"], r["site"], r["customer"], _kg(r["kg"]),
+             _inr(r["value"]), _status_badge(r["status"]), r["by"], r["approver"]]
+            for r in cr["rows"]]
+    out += H("Customer returns")
+    out += T(["CR", "Co.", "Factory", "Customer", "Net kgs", "Value (Rs.)", "Status",
+              "Raised by", "Approved by"], rows,
+             ["left", "left", "left", "left", "right", "right", "left", "left", "left"],
+             cap=cap, widths=[15, 6, 8, 20, 9, 12, 11, 10, 9], keep=[0, 3, 4, 6],
+             note="A CR appears on the day it was raised and again on the day it was approved, "
+                  "so an approval that lands later is still reported when it happens.")
+    return out
+
+
 def _inr(v) -> str:
     import re
     if v is None or float(v) == 0:
@@ -654,17 +753,22 @@ def build_sections(agg, ops, cap, slim: bool = False) -> dict[str, str]:
     scap = None if cap is None else max(cap * 3, 12)
     return {
         "inward": _section_inward(agg, cap, scap, SECTION["inward"], slim),
-        "transfers": _section_transfers(agg, cap, scap, SECTION["transfers"], slim),
+        "transfers": _section_transfers(agg, ops["jobwork"], cap, scap,
+                                        SECTION["transfers"], slim),
+        "cr": _section_cr(ops["cr"], cap, scap, SECTION["cr"], slim),
         "jobcards": _section_jobcards(ops["jobcards"], cap, scap, SECTION["jobcards"], slim),
         "samples": _section_samples(ops["samples"], cap, scap, SECTION["samples"], slim),
     }
 
 
 def _counts(agg, ops) -> dict[str, str]:
-    h = agg["head"]
+    h, jw = agg["head"], ops["jobwork"]
     return {
         "inward": f"{h['inw_txns']}",
-        "transfers": f"{h['out_chl'] + h['in_grn']}",
+        # Job work is inside this section, so it has to be inside its count too —
+        # otherwise a day of nothing but job work advertises itself as "0".
+        "transfers": f"{h['out_chl'] + h['in_grn'] + jw['out_challans'] + jw['in_receipts']}",
+        "cr": f"{ops['cr']['total_crs']}",
         "jobcards": f"{ops['jobcards']['total_cards']}",
         "samples": f"{len(ops['samples']['requisitions']) + len(ops['samples']['npd_jobcards'])}",
     }

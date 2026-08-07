@@ -1,4 +1,4 @@
-"""Jobcard and Sample/NPD sections of the daily report.
+"""Jobcard, Sample/NPD, Job work and Customer Return sections of the daily report.
 
 Kept apart from `daily_report.py` (inward + transfers) because these read a
 different part of the business and would otherwise push that module past the
@@ -20,6 +20,18 @@ SAMPLES / NPD (`sample_requisitions`, `sample_approvals`, `sample_audit_log`,
 `npd_dev_job_cards`)
     Requestors and actors are integer ids resolved against `auth_user`.
     Sales group comes from `all_sku.sale_group` via the requisition's articles.
+
+JOB WORK (`jb_materialout_*`, `jb_work_inward_*`)
+    Material sent to a processing party and what comes back from them. Reported
+    inside the Transfers section, because that is what it is: stock leaving and
+    re-entering our own books, just via an outside party rather than another of
+    our warehouses.
+
+CUSTOMER RETURNS (`{cfpl,cdpl}_rtv_header` + `_lines` + `_boxes`)
+    Goods coming back from a customer. Its own section — a return is neither an
+    inward purchase nor a transfer, and folding it into either would overstate
+    that one. A CR counts for the day it was raised OR the day it was approved,
+    so an approval that lands days later is still reported when it happens.
 """
 from __future__ import annotations
 
@@ -51,6 +63,21 @@ def canon_factory(raw: str | None) -> str:
     return _FACTORY_ALIASES.get(raw.strip().lower().replace(" ", ""), raw.strip())
 
 
+_GROUP_ACRONYMS = {"RM", "PM", "FG"}
+
+
+def canon_group_name(raw: str | None) -> str:
+    """'PISTA'/'pista' -> 'Pista'. Mirrors `daily_report.canon_group`.
+
+    Restated rather than imported: `daily_report` imports this module, so reaching
+    back the other way would make the pair circular for the sake of four lines.
+    """
+    if not raw or not str(raw).strip():
+        return "(Uncategorised)"
+    return " ".join(w.upper() if w.upper() in _GROUP_ACRONYMS else w.capitalize()
+                    for w in " ".join(str(raw).split()).split())
+
+
 # The only two states that mean a card is finished. Checked against the live
 # table rather than assumed: every `completed`/`closed` card has both a
 # start_time and an end_time, while all 430 `locked`/`unlocked`/`assigned` cards
@@ -63,6 +90,20 @@ def _clean_person(raw: str | None) -> str:
     if not raw or not raw.strip():
         return "(Unassigned)"
     return " ".join(w.capitalize() for w in raw.strip().split())
+
+
+def _who(raw: str | None) -> str:
+    """`created_by` on the job work and CR tables is the login email, not a name.
+
+    'stores-a185@candorfoods.in' printed verbatim in a report column is both
+    unreadable and wider than the column, so the local part becomes the name.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "(Not recorded)"
+    if "@" in s:
+        s = s.split("@", 1)[0].replace(".", " ").replace("_", " ").replace("-", " ")
+    return _clean_person(s)
 
 
 def _f(v) -> float:
@@ -345,8 +386,227 @@ def aggregate_samples(data: dict) -> dict:
     }
 
 
+# ═════════════════════════════════════════════════════════════════════════
+#  JOB WORK
+# ═════════════════════════════════════════════════════════════════════════
+# Both business-date columns are VARCHAR and they do NOT agree on a format:
+# material-out writes DD-MM-YYYY, the inward receipt writes YYYY-MM-DD. Checked
+# against the live tables — every row matches its own format and none is blank —
+# so the day is matched as a formatted string rather than cast. A cast is the
+# tempting version and the fragile one: a single stray value would raise and take
+# the whole day's report down with it, where a string compare simply misses that
+# row. Should the app ever start writing a second format, that is a fix here, not
+# a report-wide outage.
+JW_OUT_SQL = """
+SELECT h.id, h.challan_no, h.from_warehouse, h.to_party, h.status, h.created_by,
+       h.expected_return_date, h.purpose_of_work,
+       l.item_description, l.item_category, l.quantity_kgs, l.quantity_boxes, l.uom
+FROM jb_materialout_header h
+LEFT JOIN jb_materialout_lines l ON l.header_id = h.id
+WHERE h.job_work_date = TO_CHAR(CAST(:d AS date), 'DD-MM-YYYY')
+"""
+
+JW_IN_SQL = """
+SELECT r.id, r.ir_number, r.challan_no, r.receipt_type, r.inward_warehouse,
+       r.created_by, h.to_party, h.from_warehouse,
+       l.item_description, l.sent_kgs, l.finished_goods_kgs, l.finished_goods_boxes,
+       l.waste_kgs, l.rejection_kgs, l.process_type
+FROM jb_work_inward_receipt r
+LEFT JOIN jb_materialout_header h ON h.id = r.header_id
+LEFT JOIN jb_work_inward_lines l ON l.inward_receipt_id = r.id
+WHERE r.receipt_date = TO_CHAR(CAST(:d AS date), 'YYYY-MM-DD')
+"""
+
+
+def fetch_jobwork(db: Session, day: date) -> dict:
+    def _run(label, sql):
+        try:
+            return [dict(r._mapping) for r in db.execute(text(sql), {"d": day})]
+        except Exception as exc:                               # noqa: BLE001
+            logger.error("Job work %s fetch failed for %s: %s", label, day, exc)
+            db.rollback()
+            return []
+
+    return {"out": _run("material out", JW_OUT_SQL), "in": _run("material in", JW_IN_SQL)}
+
+
+def aggregate_jobwork(data: dict) -> dict:
+    """Roll the line-level rows up to one row per challan / receipt.
+
+    A challan is keyed line by line — one line per box on a cold dispatch, so a
+    single day is 200 rows for two challans. Reporting those raw would fill the
+    whole mail with one party's boxes; the challan is the unit anyone works with.
+    """
+    out_h: dict[object, dict] = {}
+    in_h: dict[object, dict] = {}
+    parties: set[str] = set()
+
+    for r in data["out"]:
+        c = out_h.get(r["id"])
+        if c is None:
+            party = (r["to_party"] or "").strip() or "(No party named)"
+            parties.add(party)
+            c = out_h[r["id"]] = {
+                "challan_no": r["challan_no"] or "-",
+                "site": canon_factory(r["from_warehouse"]),
+                "party": party,
+                "status": r["status"] or "-",
+                "by": _who(r["created_by"]),
+                "kg": 0.0, "boxes": 0, "lines": 0,
+            }
+        if r["item_description"] is None and r["quantity_kgs"] is None:
+            continue                                   # header with no lines yet
+        c["lines"] += 1
+        c["kg"] += _f(r["quantity_kgs"])
+        c["boxes"] += int(_f(r["quantity_boxes"]))
+
+    for r in data["in"]:
+        c = in_h.get(r["id"])
+        if c is None:
+            party = (r["to_party"] or "").strip() or "(No party named)"
+            parties.add(party)
+            c = in_h[r["id"]] = {
+                "ir_number": r["ir_number"] or "-",
+                "challan_no": r["challan_no"] or "-",
+                "site": canon_factory(r["inward_warehouse"]),
+                "party": party,
+                "kind": (r["receipt_type"] or "-").title(),
+                "by": _who(r["created_by"]),
+                "sent_kg": 0.0, "fg_kg": 0.0, "waste_kg": 0.0, "rej_kg": 0.0,
+                "boxes": 0, "lines": 0,
+            }
+        if r["item_description"] is None and r["finished_goods_kgs"] is None:
+            continue
+        c["lines"] += 1
+        c["sent_kg"] += _f(r["sent_kgs"])
+        c["fg_kg"] += _f(r["finished_goods_kgs"])
+        c["waste_kg"] += _f(r["waste_kgs"])
+        c["rej_kg"] += _f(r["rejection_kgs"])
+        c["boxes"] += int(_f(r["finished_goods_boxes"]))
+
+    return {
+        "out_rows": sorted(out_h.values(), key=lambda x: -x["kg"]),
+        "in_rows": sorted(in_h.values(), key=lambda x: -x["fg_kg"]),
+        "out_challans": len(out_h),
+        "in_receipts": len(in_h),
+        "out_kg": sum(c["kg"] for c in out_h.values()),
+        "out_boxes": sum(c["boxes"] for c in out_h.values()),
+        "in_sent_kg": sum(c["sent_kg"] for c in in_h.values()),
+        "in_fg_kg": sum(c["fg_kg"] for c in in_h.values()),
+        "in_waste_kg": sum(c["waste_kg"] for c in in_h.values()),
+        "in_rej_kg": sum(c["rej_kg"] for c in in_h.values()),
+        "parties": sorted(parties),
+        "empty": not (out_h or in_h),
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  CUSTOMER RETURNS  (CR)
+# ═════════════════════════════════════════════════════════════════════════
+# The two companies keep separate tables, as everywhere else in IMS.
+#
+# MEASURE — the line's `net_weight` is the reported weight, not the sum of the
+# box rows. Where a CR has both (56 of them), they agree except when boxing is
+# still part-done: CR-20260719122215 declares 400 kg on its lines and has 80 of
+# its boxes scanned at 155 kg. The declared return is what came back; the box
+# total is how far the scanning has got. Reporting the box figure would show a
+# return shrinking as a data-entry job that has nothing to do with the goods.
+CR_HDR_SQL = """
+SELECT h.id, h.rtv_id, h.factory_unit, h.customer, h.status, h.created_by,
+       h.approved_by,
+       h.rtv_date::date     AS raised_on,
+       h.approved_at::date  AS approved_on,
+       COALESCE(ln.qty, 0)    AS qty,
+       COALESCE(ln.value, 0)  AS value,
+       COALESCE(ln.net_kg, 0) AS net_kg
+FROM {p}_rtv_header h
+LEFT JOIN LATERAL (
+    SELECT SUM(COALESCE(l.qty, 0)) AS qty,
+           SUM(COALESCE(l.value, 0)) AS value,
+           SUM(COALESCE(l.net_weight, 0)) AS net_kg
+    FROM {p}_rtv_lines l WHERE l.header_id = h.id
+) ln ON TRUE
+WHERE h.rtv_date::date = :d OR h.approved_at::date = :d
+"""
+
+CR_CAT_SQL = """
+SELECT l.item_category, l.sub_category, COUNT(*) AS lines,
+       SUM(COALESCE(l.qty, 0)) AS qty, SUM(COALESCE(l.value, 0)) AS value,
+       SUM(COALESCE(l.net_weight, 0)) AS net_kg
+FROM {p}_rtv_header h
+JOIN {p}_rtv_lines l ON l.header_id = h.id
+WHERE h.rtv_date::date = :d OR h.approved_at::date = :d
+GROUP BY 1, 2
+"""
+
+
+def fetch_cr(db: Session, day: date) -> dict:
+    headers, cats = [], []
+    for company, p in (("CFPL", "cfpl"), ("CDPL", "cdpl")):
+        try:
+            headers += [dict(r._mapping, company=company) for r in
+                        db.execute(text(CR_HDR_SQL.format(p=p)), {"d": day})]
+            cats += [dict(r._mapping, company=company) for r in
+                     db.execute(text(CR_CAT_SQL.format(p=p)), {"d": day})]
+        except Exception as exc:                               # noqa: BLE001
+            logger.error("CR fetch failed for %s (%s): %s", day, company, exc)
+            db.rollback()
+    return {"headers": headers, "categories": cats}
+
+
+def aggregate_cr(data: dict, day: date | None = None) -> dict:
+    rows: list[dict] = []
+    by_site = defaultdict(lambda: {"crs": 0, "kg": 0.0, "qty": 0.0, "value": 0.0})
+    by_status = defaultdict(int)
+    customers: set[str] = set()
+    approved = 0
+
+    for h in data["headers"]:
+        site = canon_factory(h["factory_unit"])
+        cust = (h["customer"] or "").strip() or "(No customer named)"
+        customers.add(cust)
+        kg, qty, val = _f(h["net_kg"]), _f(h["qty"]), _f(h["value"])
+        rows.append({
+            "cr_id": h["rtv_id"] or f"#{h['id']}",
+            "company": h["company"], "site": site, "customer": cust,
+            "status": h["status"] or "(blank)",
+            "by": _who(h["created_by"]),
+            "approver": _who(h["approved_by"]) if h["approved_by"] else "–",
+            "kg": kg, "qty": qty, "value": val,
+        })
+        b = by_site[site]
+        b["crs"] += 1; b["kg"] += kg; b["qty"] += qty; b["value"] += val
+        by_status[h["status"] or "(blank)"] += 1
+        approved += 1 if (day is not None and h["approved_on"] == day) else 0
+
+    cats = defaultdict(lambda: {"lines": 0, "kg": 0.0, "qty": 0.0, "value": 0.0})
+    for c in data["categories"]:
+        k = (canon_group_name(c["item_category"]), canon_group_name(c["sub_category"]))
+        v = cats[k]
+        v["lines"] += int(_f(c["lines"]))
+        v["kg"] += _f(c["net_kg"])
+        v["qty"] += _f(c["qty"])
+        v["value"] += _f(c["value"])
+
+    return {
+        "rows": sorted(rows, key=lambda r: -r["kg"]),
+        "by_site": dict(by_site),
+        "by_status": dict(by_status),
+        "by_category": dict(cats),
+        "customers": sorted(customers),
+        "total_crs": len(rows),
+        "total_kg": sum(r["kg"] for r in rows),
+        "total_qty": sum(r["qty"] for r in rows),
+        "total_value": sum(r["value"] for r in rows),
+        "approved": approved,
+        "empty": not rows,
+    }
+
+
 def fetch_and_aggregate(db: Session, day: date) -> dict:
-    """Both extra sections in one call, so callers stay simple."""
+    """All four extra sections in one call, so callers stay simple."""
     jc = aggregate_jobcards(fetch_jobcards(db, day), day)
     sm = aggregate_samples(fetch_samples(db, day))
-    return {"jobcards": jc, "samples": sm}
+    jw = aggregate_jobwork(fetch_jobwork(db, day))
+    cr = aggregate_cr(fetch_cr(db, day), day)
+    return {"jobcards": jc, "samples": sm, "jobwork": jw, "cr": cr}

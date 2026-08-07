@@ -27,6 +27,7 @@ from services.ims_service.daily_report import (
     canon_wh,
     ensure_log_table,
     fetch,
+    is_quiet,
     send_report,
 )
 from services.ims_service.daily_report_ops import fetch_and_aggregate as ops_data
@@ -97,11 +98,22 @@ def summary(day: str | None = Query(default=None), db: Session = Depends(get_db)
     agg = aggregate(fetch(db, d))
     ops = ops_data(db, d)
     jc, sm = ops["jobcards"], ops["samples"]
+    jw, cr = ops["jobwork"], ops["cr"]
     h = agg["head"]
     return {
         "day": str(d),
-        "empty": agg["empty"] and jc["empty"] and sm["empty"],
+        "empty": is_quiet(agg, ops),
         "gaps": compute_gaps(db, d, agg, ops, canon_site=canon_wh),
+        "jobwork": {"out_challans": jw["out_challans"], "out_kg": round(jw["out_kg"], 3),
+                    "out_boxes": jw["out_boxes"], "in_receipts": jw["in_receipts"],
+                    "in_fg_kg": round(jw["in_fg_kg"], 3),
+                    "in_waste_kg": round(jw["in_waste_kg"], 3),
+                    "in_rejection_kg": round(jw["in_rej_kg"], 3),
+                    "parties": jw["parties"]},
+        "cr": {"returns": cr["total_crs"], "kg": round(cr["total_kg"], 3),
+               "qty": round(cr["total_qty"], 3), "value": round(cr["total_value"], 2),
+               "approved_today": cr["approved"], "status": cr["by_status"],
+               "customers": cr["customers"]},
         "jobcards": {"active": jc["total_cards"], "users": jc["total_users"],
                      "fg_items": jc["total_fg"], "planned_kg": round(jc["total_kg"], 3),
                      "status": jc["status"], "loss": jc["loss"]},

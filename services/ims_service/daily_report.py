@@ -936,6 +936,60 @@ def ensure_log_table(db: Session) -> None:
     """))
     db.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_daily_report_log_day ON daily_report_log(business_day)"))
+
+    # ONE send per (day, kind, figures), enforced by the database rather than by
+    # the process — because the duplicate never came from this code being wrong,
+    # it came from this code running TWICE. More than one instance serves the API,
+    # each starts its own BackgroundScheduler, and both fire at 19:00 and at 10:30.
+    # `max_instances`/`coalesce` on the job only ever guarded one process.
+    #
+    # The recipients got two identical mails seconds apart, every single day, and
+    # the second one arrived byte-identical into the same thread — which is exactly
+    # what makes Gmail fold it away as quoted text.
+    #
+    # Scoped to the automated kinds only: a manual re-send is a person deliberately
+    # asking for the same report again, and must never be swallowed.
+    db.execute(text("""
+        DELETE FROM daily_report_log a USING daily_report_log b
+        WHERE a.status = 'sent' AND b.status = 'sent'
+          AND a.kind IN ('evening', 'revision', 'catchup')
+          AND b.kind = a.kind
+          AND a.business_day = b.business_day
+          AND a.fingerprint = b.fingerprint
+          AND a.id > b.id
+    """))
+    db.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_daily_report_sent_once
+        ON daily_report_log (business_day, kind, fingerprint)
+        WHERE status = 'sent' AND kind IN ('evening', 'revision', 'catchup')
+    """))
+    db.commit()
+
+
+def _claim_send(db: Session, day: date, kind: str, fp: str) -> int | None:
+    """Reserve this exact send, or return None if another process already has it.
+
+    The row is written as 'sent' BEFORE the mail goes out, so the claim and the
+    record are one atomic act — two processes cannot both pass. A send that then
+    fails is flipped to 'failed' by the caller, which frees the slot again (the
+    unique index only covers 'sent'), so a genuine failure is still retried and
+    still visible in the log.
+    """
+    row = db.execute(text("""
+        INSERT INTO daily_report_log (business_day, kind, fingerprint, recipients, status)
+        VALUES (:d, :k, :f, :r, 'sent')
+        ON CONFLICT DO NOTHING
+        RETURNING id
+    """), {"d": day, "k": kind, "f": fp,
+           "r": ", ".join(REPORT_TO + REPORT_CC)}).fetchone()
+    db.commit()
+    return row.id if row else None
+
+
+def _release_claim(db: Session, claim_id: int, error: str) -> None:
+    db.execute(text("""
+        UPDATE daily_report_log SET status = 'failed', error = :e WHERE id = :i
+    """), {"i": claim_id, "e": error[:1000]})
     db.commit()
 
 
@@ -999,6 +1053,19 @@ def send_report(day: date, *, kind: str, revised: bool = False,
             logger.info("Daily report %s: no activity in any section, nothing sent", day)
             return {"day": str(day), "status": "skipped_empty", "sent": False}
 
+        # Claim before rendering: whichever process gets the row owns this send, the
+        # other stops here. Automated kinds only — a manual re-send is never claimed.
+        claim_id = None
+        if kind in ("evening", "revision", "catchup"):
+            first_send = _last_sent(db, day) is None
+            claim_id = _claim_send(db, day, kind, fp)
+            if claim_id is None:
+                logger.info("Daily report %s (%s): an identical send is already "
+                            "recorded — skipping this duplicate", day, kind)
+                return {"day": str(day), "status": "skipped_duplicate", "sent": False}
+        else:
+            first_send = _last_sent(db, day) is None
+
         generated = now_ist()
         gaps = compute_gaps(db, day, agg, ops, canon_site=canon_wh)
         html = render_email(day, agg, ops, generated,
@@ -1007,17 +1074,24 @@ def send_report(day: date, *, kind: str, revised: bool = False,
         # The first send of a day owns the thread anchor; anything after it replies
         # into that same conversation.
         anchor = day_anchor(day)
-        first_send = _last_sent(db, day) is None
         to_list = to_override if to_override is not None else REPORT_TO
         cc_list = cc_override if cc_override is not None else REPORT_CC
-        _send_mail(
-            subject_override or day_subject(day), html, plain, to_list, cc_list,
-            day=day, revised=revised,
-            message_id=anchor if first_send else None,
-            in_reply_to=None if first_send else (thread_onto or anchor),
-            verbatim_subject=bool(subject_override),
-        )
-        _log(db, day, kind, "sent", fp)
+        try:
+            _send_mail(
+                subject_override or day_subject(day), html, plain, to_list, cc_list,
+                day=day, revised=revised,
+                message_id=anchor if first_send else None,
+                in_reply_to=None if first_send else (thread_onto or anchor),
+                verbatim_subject=bool(subject_override),
+            )
+        except Exception:
+            # The claim was written as 'sent' before the mail left. Hand it back so
+            # the day is still owed and the morning catch-up will retry it.
+            if claim_id is not None:
+                _release_claim(db, claim_id, "SMTP send failed")
+            raise
+        if claim_id is None:
+            _log(db, day, kind, "sent", fp)
         h = agg["head"]
         logger.info("Daily report %s (%s) sent to %d recipients — "
                     "inward %d, trf-out %d, trf-in %d",

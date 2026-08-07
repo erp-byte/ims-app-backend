@@ -321,6 +321,20 @@ def _build_boxes_html(boxes: list[dict]) -> str:
     return rows
 
 
+# WHY EVERY FOOTER HERE ENDS WITH ITS OWN ACTION + TIMESTAMP
+#     One customer return is one conversation: Created, the deputies' copies,
+#     Approved, Updated and the rest all restate the same header/lines/boxes
+#     tables. Gmail's trimmer folds content a later message shares with an earlier
+#     one in the thread behind the "···" button, as though it were a quotation. It
+#     is not a quotation — it is the return — and an approver who must expand "···"
+#     to see the figures cannot tell what changed from what did not, which is the
+#     whole reason the later mail was sent.
+#
+#     The trimmer matches from the END of a message, so each footer carries what
+#     that mail IS and when it was generated, to the second. That keeps the tail of
+#     every message in the thread distinct and stops the fold. Do NOT collapse
+#     these back to one constant string: the tables silently start hiding again and
+#     nothing looks wrong until somebody opens one.
 def _rtv_email_html(
     action: str,
     header: dict,
@@ -328,6 +342,7 @@ def _rtv_email_html(
     boxes: list[dict],
     extra_info: str = "",
     action_buttons: list[tuple[str, str, str]] | None = None,
+    footer_note: str = "",
 ) -> tuple[str, str]:
     """Return (html_body, plain_body) for an RTV notification email.
 
@@ -449,6 +464,8 @@ def _rtv_email_html(
     </td></tr>
     <tr><td style="background:#f8f9fa;padding:12px 24px;text-align:center;font-size:12px;color:#888;">
       Candor Foods &mdash; IMS Customer Returns Notification
+      <br>{escape(action)} &nbsp;&middot;&nbsp; {now_ist().strftime('%d %b %Y, %I:%M:%S %p')} IST
+      {f'&nbsp;&middot;&nbsp; {escape(footer_note)}' if footer_note else ''}
     </td></tr>
   </table>
 </body></html>"""
@@ -577,10 +594,15 @@ def notify_rtv_created(rtv_detail: dict) -> None:
                 ("Reject",  _build_rtv_action_url(rtv_id, addr, "reject"),  "#c0392b"),
                 ("Hold",    _build_rtv_action_url(rtv_id, addr, "hold"),    "#e67e22"),
             ]
+            # The approver copies are otherwise identical to one another, and an
+            # identical tail is exactly what Gmail folds away as quoted text. Naming
+            # the addressee both breaks that match and answers the question a deputy
+            # actually has on opening it: is this mine to action, or a copy?
             html_bh, plain_bh = _rtv_email_html(
                 action="Created", header=rtv_detail, lines=lines, boxes=boxes,
                 extra_info=_rtv_approver_note(approvers, i, bh_email),
                 action_buttons=action_buttons,
+                footer_note=f"approver copy for {addr}",
             )
             _send_email_background(
                 subject=subject, html_body=html_bh, plain_body=plain_bh,
@@ -597,6 +619,7 @@ def notify_rtv_created(rtv_detail: dict) -> None:
         html_cc, plain_cc = _rtv_email_html(
             action="Created", header=rtv_detail, lines=lines, boxes=boxes,
             action_buttons=None,
+            footer_note="notification copy — no action required",
         )
         _send_email_background(
             subject=subject, html_body=html_cc, plain_body=plain_cc,
@@ -1110,6 +1133,7 @@ def _rtv_updated_html(detail: dict, summary: dict) -> tuple[str, str]:
     </td></tr>
     <tr><td style="background:#f8f9fa;padding:12px 24px;text-align:center;font-size:12px;color:#888;">
       Candor Foods &mdash; IMS Customer Returns Notification
+      <br>Updated &nbsp;&middot;&nbsp; {now_ist().strftime('%d %b %Y, %I:%M:%S %p')} IST
     </td></tr>
   </table>
 </body></html>"""
@@ -1200,6 +1224,7 @@ def _jw_wrap(title: str, subtitle: str, body_html: str) -> str:
     <tr><td style="padding:20px 24px;">{body_html}</td></tr>
     <tr><td style="background:#f8f9fa;padding:12px 24px;text-align:center;font-size:12px;color:#888;">
       Candor Foods &mdash; IMS Job Work Notification
+      <br>{escape(title)} &nbsp;&middot;&nbsp; {now_ist().strftime('%d %b %Y, %I:%M:%S %p')} IST
     </td></tr>
   </table>
 </body></html>"""
@@ -2049,12 +2074,20 @@ def send_job_work_weekly_digest() -> None:
 
     db = SessionLocal()
     try:
+        # job_work_date is VARCHAR holding DD-MM-YYYY, so it must be parsed with an
+        # EXPLICIT format. `::timestamp` asks the server to guess via its datestyle
+        # setting, which raises on any day past the 12th ("31-07-2026" reads as
+        # month 31) — the whole digest was aborting into the except below, silently,
+        # every Monday there was an open challan dated after the 12th. Ordering has
+        # the same problem more quietly: a lexicographic sort on the raw string puts
+        # 01-12-2025 before 02-01-2026.
         open_jwos = db.execute(sa_text("""
             SELECT id, challan_no, to_party, sub_category, job_work_date, status,
-                   EXTRACT(DAY FROM NOW() - job_work_date::timestamp) as days_open
+                   EXTRACT(DAY FROM NOW()
+                           - to_date(NULLIF(job_work_date, ''), 'DD-MM-YYYY')) AS days_open
             FROM jb_materialout_header
             WHERE status IN ('sent', 'partially_received')
-            ORDER BY job_work_date ASC
+            ORDER BY to_date(NULLIF(job_work_date, ''), 'DD-MM-YYYY') ASC NULLS LAST
         """)).fetchall()
 
         status_counts = db.execute(sa_text("""

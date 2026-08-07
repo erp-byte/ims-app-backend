@@ -19,6 +19,21 @@ MAIL SIZE
     message", which would bury the last section. Detail tables in the mail are
     therefore capped per section, each capped table says how many rows it is
     hiding, and the full set lives on the hosted page.
+
+QUOTED-TEXT COLLAPSE — WHY THE FOOTER IS NOT A CONSTANT
+    Every mail for one business day threads into one conversation, and the revised
+    10:30 mail restates the same tables as the 19:00 one. Gmail's trimmer looks for
+    content a later message shares with an earlier one in the thread and folds it
+    behind the "···" button as if it were a quotation. It is not a quotation — it is
+    the report — and a reader who has to expand "···" to see the figures cannot tell
+    what was revised from what was unchanged, which is the entire purpose of the
+    revised send.
+
+    The trimmer matches from the END of the message, so the footer carries the send's
+    own identity (evening vs revised, and the generation time to the second). That
+    makes the tail of every message in the thread unique and stops the fold. Do NOT
+    "tidy" it back to a constant string: the tables silently start collapsing again,
+    and nothing about the mail looks wrong until someone opens one.
 """
 from __future__ import annotations
 
@@ -901,6 +916,8 @@ def render_email(day: date, agg, ops, generated: datetime, *,
                    font:11px Arial,Helvetica,sans-serif;color:{GREY};">
       Candor Foods — IMS automated daily report. Weights are net kg as recorded in IMS;
       count-keyed lines (packaging) are shown in their own unit.
+      <br>{'Revised send' if revised else 'Evening send'} &nbsp;·&nbsp;
+      generated {generated:%d %b %Y, %I:%M:%S %p} IST
     </td></tr>
   </table>
 </div>

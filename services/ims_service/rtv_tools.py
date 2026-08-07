@@ -1329,10 +1329,14 @@ def apply_rtv_email_action(
     header_id = row.id
     current_status = (row.status or "Pending")
 
-    # Validate the URL's bh_email matches the BH stored on the RTV record.
-    from shared.email_notifier import _lookup_business_head_email
-    rtv_bh_email = _lookup_business_head_email(row.business_head)
-    if not rtv_bh_email or rtv_bh_email.lower() != bh_email.lower():
+    # Validate the URL's address against everyone entitled to action this return:
+    # the BH stored on the record, plus the standing deputies who were sent their
+    # own buttons. Same helper the mail uses, so a link that was issued is a link
+    # that works — deriving the two lists separately is how a deputy ends up
+    # holding a button that 403s.
+    from shared.email_notifier import rtv_approver_emails
+    allowed = {a.lower() for a in rtv_approver_emails(row.business_head)}
+    if bh_email.lower() not in allowed:
         raise HTTPException(
             403, "This action link is not authorised for the recipient on file"
         )

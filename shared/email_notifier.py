@@ -70,6 +70,22 @@ RTV_CC_CONSTANT = [
     "sachin.more@candorfoods.in",
     "dipesh.sharma@ofbusiness.in",
     "yash@candorfoods.in",   # Yash Gawdi — mandatory CC on every customer-return mail
+    "rmpatil@candorfoods.in",  # R M Patil — mandatory CC on every customer-return mail
+]
+
+# Standing deputy approvers. A customer return has to be closed the day it is
+# raised, and one named Business Head is a single point of failure — travel, leave,
+# a phone left on charge, and the return sits Pending overnight. These two hold the
+# same Approve / Reject / Hold buttons as the CR's own BH, on every return rather
+# than only once someone declares the primary unavailable: there is no availability
+# signal to key off, and a deputy told after the fact cannot save the same day.
+#
+# Two people holding the buttons is safe because the transition is guarded — the
+# UPDATE in apply_rtv_email_action only fires on a Pending/On Hold row, so the first
+# click wins and the second is reported as already actioned.
+RTV_DEPUTY_APPROVERS = [
+    "satyendra@candorfoods.in",   # Satyendra Garg
+    "rmpatil@candorfoods.in",     # R M Patil
 ]
 
 # Warehouse (factory_unit) -> additional CC recipient, layered on top of the
@@ -471,18 +487,54 @@ def _rtv_email_html(
     return html, "\n".join(plain_lines)
 
 
+def _rtv_approver_note(approvers: list[str], me: int, bh_email: str | None) -> str:
+    """The banner above the buttons on an approver's copy.
+
+    It has to name the other approvers, or a deputy reads their copy as a mistake
+    and waits for the Business Head — which is the delay the deputy exists to
+    remove. It also has to say the first decision wins, so nobody holds back in
+    case someone else is mid-click.
+    """
+    others = [_name_for_email(a) or _derive_name_from_email(a)
+              for i, a in enumerate(approvers) if i != me]
+    if not others:
+        return "Please Approve / Reject / Hold this customer return using the buttons below."
+    who = others[0] if len(others) == 1 else ", ".join(others[:-1]) + " and " + others[-1]
+    role = ("You are the assigned Business Head."
+            if bh_email and approvers[me].strip().lower() == bh_email.strip().lower()
+            else "You are a standing deputy approver.")
+    return (f"Please Approve / Reject / Hold this customer return today. {role} "
+            f"{who} can also action it — whoever decides first is the decision.")
+
+
+def rtv_approver_emails(business_head: str | None) -> list[str]:
+    """Everyone who may action a return: its Business Head, then the deputies.
+
+    One list, used by BOTH the mail (who gets the buttons) and the click gate in
+    rtv_tools.apply_rtv_email_action (whose link is honoured). Deriving them from
+    the same place is what stops a deputy being sent a button that then 403s.
+    """
+    head = (_lookup_business_head_email(business_head) or "").strip()
+    out = [head] if head else []
+    for dep in RTV_DEPUTY_APPROVERS:
+        if dep.strip().lower() not in {a.lower() for a in out}:
+            out.append(dep)
+    return out
+
+
 def notify_rtv_created(rtv_detail: dict) -> None:
     """Send the 'Created' notification for a customer return as ONE conversation.
 
-    A single thread, never two disjoint mails:
-      * The assigned business head gets the email WITH the Approve / Reject / Hold
-        buttons (thread root). Only the business head receives the buttons.
+    A single thread, never disjoint mails:
+      * Every approver — the assigned business head and the standing deputies —
+        gets the email WITH the Approve / Reject / Hold buttons, each carrying a
+        link minted for their own address so the audit records who really decided.
+        The first of those copies is the thread root.
       * Everyone else (pooja + CC) gets the SAME email WITHOUT buttons, threaded
         under that root, so the later 'Approved' mail lands in the trail for all.
-    If the return has no recognised business head, a single button-less broadcast
-    goes to everyone.
     """
     rtv_id = rtv_detail.get("rtv_id", "")
+    approvers = rtv_approver_emails(rtv_detail.get("business_head"))
     bh_email = _lookup_business_head_email(rtv_detail.get("business_head"))
     thread_id = _rtv_thread_key(rtv_id)
     subject = _rtv_subject(rtv_id)
@@ -515,26 +567,33 @@ def notify_rtv_created(rtv_detail: dict) -> None:
             out.append(addr.strip())
         return out
 
-    if bh_email:
-        # 1) Business head — WITH action buttons. This message is the thread root.
-        action_buttons = [
-            ("Approve", _build_rtv_action_url(rtv_id, bh_email, "approve"), "#27ae60"),
-            ("Reject",  _build_rtv_action_url(rtv_id, bh_email, "reject"),  "#c0392b"),
-            ("Hold",    _build_rtv_action_url(rtv_id, bh_email, "hold"),    "#e67e22"),
-        ]
-        html_bh, plain_bh = _rtv_email_html(
-            action="Created", header=rtv_detail, lines=lines, boxes=boxes,
-            extra_info="Please Approve / Reject / Hold this customer return using the buttons below.",
-            action_buttons=action_buttons,
-        )
-        _send_email_background(
-            subject=subject, html_body=html_bh, plain_body=plain_bh,
-            to=[bh_email], message_id=thread_id,
-        )
+    if approvers:
+        # 1) One copy per approver, WITH action buttons. Threading is unchanged:
+        #    the first copy claims the thread root and the rest reply into it, so a
+        #    return is still exactly one conversation.
+        for i, addr in enumerate(approvers):
+            action_buttons = [
+                ("Approve", _build_rtv_action_url(rtv_id, addr, "approve"), "#27ae60"),
+                ("Reject",  _build_rtv_action_url(rtv_id, addr, "reject"),  "#c0392b"),
+                ("Hold",    _build_rtv_action_url(rtv_id, addr, "hold"),    "#e67e22"),
+            ]
+            html_bh, plain_bh = _rtv_email_html(
+                action="Created", header=rtv_detail, lines=lines, boxes=boxes,
+                extra_info=_rtv_approver_note(approvers, i, bh_email),
+                action_buttons=action_buttons,
+            )
+            _send_email_background(
+                subject=subject, html_body=html_bh, plain_body=plain_bh,
+                to=[addr],
+                message_id=thread_id if i == 0 else None,
+                in_reply_to=None if i == 0 else thread_id,
+            )
 
         # 2) Everyone else — NO buttons, threaded under the same conversation so
-        #    the later status mail appears in their trail too.
-        cc = _dedupe(cc_candidates, {bh_email.strip().lower(), RTV_NOTIFY_TO.strip().lower()})
+        #    the later status mail appears in their trail too. Approvers already
+        #    have their own copy; mailing them again here would just duplicate it.
+        cc = _dedupe(cc_candidates,
+                     {a.strip().lower() for a in approvers} | {RTV_NOTIFY_TO.strip().lower()})
         html_cc, plain_cc = _rtv_email_html(
             action="Created", header=rtv_detail, lines=lines, boxes=boxes,
             action_buttons=None,
@@ -544,7 +603,7 @@ def notify_rtv_created(rtv_detail: dict) -> None:
             to=[RTV_NOTIFY_TO], cc=cc, in_reply_to=thread_id,
         )
     else:
-        # No mapped business head — single button-less broadcast to everyone.
+        # No approver resolvable at all — single button-less broadcast to everyone.
         cc = _dedupe(cc_candidates, {RTV_NOTIFY_TO.strip().lower()})
         html, plain = _rtv_email_html(
             action="Created", header=rtv_detail, lines=lines, boxes=boxes,

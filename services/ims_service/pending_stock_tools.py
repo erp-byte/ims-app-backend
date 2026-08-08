@@ -131,6 +131,9 @@ def _find_in_bulk_entry(db: Session, box_id: str, transaction_no: str, lot_no: O
     Search order (per user spec May 2026): *_boxes_v2 first (current inward target),
     then legacy *_bulk_entry_boxes. Match on (box_id, transaction_no); if a table
     returns multiple rows, the one whose `lot_number` matches `lot_no` is chosen.
+
+    A supplied `lot_no` that matches no candidate yields (None, None) — never a
+    row from a different lot. See test_wrong_lot_never_guessed.py.
     Returns (table, row) or (None, None).
     """
     lot = (lot_no or "").strip().upper()
@@ -151,9 +154,141 @@ def _find_in_bulk_entry(db: Session, box_id: str, transaction_no: str, lot_no: O
         for table, r in candidates:
             if ((getattr(r, "lot_number", "") or "").strip().upper()) == lot:
                 return table, r
-    # No lot disambiguation possible — preserve original behaviour (first match,
-    # boxes_v2 before legacy). Warehouse box_ids rarely collide within a txn.
+        # Lot was specified and matched NOTHING. It is a constraint, not a hint:
+        # returning another lot's row books stock the operator never picked, and
+        # park_in_pending reads weight_kg from that row before the scanned box —
+        # so the wrong lot AND its weight both land on the transfer (a July 16 kg
+        # dispatch booked to March lot CF100326 at 10 kg). Same no-guess rule the
+        # cold path has always applied (_find_in_cold_stocks).
+        return None, None
+    # No lot to disambiguate with — first match (boxes_v2 before legacy).
     return candidates[0]
+
+
+# ── OWNERSHIP RULE (owner, 2026-08-06) ───────────────────────────────────
+# {cfpl,cdpl}_boxes_v2 / _articles_v2 / _bulk_entry_boxes / _bulk_entry_articles
+# record INWARD transactions — for cold and for warehouse alike. The transfer
+# module has NO right to write to them or remove rows from them. It reads them
+# to pick an item and its detail when a box is scanned, and that is all.
+# Transfer state belongs in the interunit tables: interunit_transfers_*,
+# pending_transfer_stock, interunit_transfer_in_*.
+#
+# The one table a transfer may deduct is *_cold_stocks, because that is a live
+# stock ledger — one row per box physically in the store — not an inward record.
+#
+# Breaking this rule is what erased 4,668 inward box rows (71,901 kg across 212
+# GRNs) and made TR-20260310175034 show 180 boxes of a 200-box receipt.
+_INWARD_SUFFIXES = ("_boxes_v2", "_articles_v2", "_bulk_entry_boxes",
+                    "_bulk_entry_articles", "_boxes", "_transactions_v2")
+# Company-prefixed only. The suffix alone would catch `interunit_transfer_boxes`
+# — the transfer module's OWN table — and lock it out of its own data.
+_INWARD_PREFIXES = ("cfpl_", "cdpl_")
+
+
+def _is_inward_table(table: Optional[str]) -> bool:
+    """Is this an inward record the transfer module must not touch?"""
+    t = (table or "").strip().lower()
+    return t.startswith(_INWARD_PREFIXES) and t.endswith(_INWARD_SUFFIXES)
+
+
+def _deducts_source(source_table: Optional[str]) -> bool:
+    """May a transfer remove a row from this table? Only a cold stock ledger."""
+    return bool(source_table) and source_table.endswith("_cold_stocks")
+
+
+def _refuse_inward_write(table: Optional[str], what: str, ref: str = "") -> bool:
+    """Log and refuse a write the transfer module is not entitled to make.
+
+    Returns True when the caller must skip. Kept loud rather than silent: a
+    refused write means some other part of the flow assumed it could edit
+    inward, and that assumption needs to surface rather than pass unnoticed.
+    """
+    if not _is_inward_table(table):
+        return False
+    logger.warning(
+        "INWARD_WRITE_REFUSED: transfer tried to %s %s (%s). Inward tables record "
+        "GRNs only — transfer state lives in the interunit tables.",
+        what, table, ref or "-",
+    )
+    return True
+
+
+def _delete_source_row(db: Session, source_table: Optional[str], row_id,
+                       *, box_id: Optional[str] = None) -> bool:
+    """Deduct a dispatched box from its source — cold only. Returns True if it did.
+
+    Every dispatch path goes through here so the rule lives in one place. Fails
+    closed: an unrecognised source table is left alone, because a stale row a
+    human can see beats stock that has silently ceased to exist.
+    """
+    if not _deducts_source(source_table):
+        logger.info(
+            "SOURCE_KEPT: %s is a reference record, not a stock ledger — box %s "
+            "stays put; the pending row is the transfer's copy",
+            source_table or "(none)", box_id or row_id,
+        )
+        return False
+    db.execute(text(f"DELETE FROM {source_table} WHERE id = :rid"), {"rid": row_id})
+    return True
+
+
+def _row_still_in_source(db: Session, source_table: Optional[str], pending_row) -> bool:
+    """Is this box still sitting in its source table?
+
+    Restore has to tell two eras apart. A transfer dispatched after warehouse
+    sources became reference-only never lost its inward row, so restoring would
+    duplicate it. One dispatched before genuinely is missing and must be put
+    back. Asking the table is the only reliable way to know which.
+    """
+    if not source_table or not _table_exists(db, source_table):
+        return False
+    try:
+        return bool(db.execute(
+            text(f"SELECT 1 FROM {source_table} WHERE box_id = :b "
+                 f"AND COALESCE(transaction_no,'') = COALESCE(:t,'') LIMIT 1"),
+            {"b": getattr(pending_row, "box_id", None),
+             "t": getattr(pending_row, "transaction_no", None)},
+        ).scalar())
+    except Exception as exc:                                   # noqa: BLE001
+        logger.warning("RESTORE_SOURCE: presence check failed on %s (%s) — "
+                       "treating as absent so the restore still runs", source_table, exc)
+        return False
+
+
+def _already_received(db, box_id: Optional[str], transfer_out_id) -> bool:
+    """Has this box already been received on THIS transfer?
+
+    The backfill parks boxes from `interunit_transfer_boxes`, which is the
+    dispatch record and never goes away. The receipt lives in a different table,
+    and deleting the pending row is all that marks a box as arrived — so a
+    transfer completed months ago looks, to the backfill, exactly like one that
+    was never received. That is how 1,960 rows came back In Transit weeks after
+    their GRN, 1,757 of them in a single run.
+
+    Scoped to the same transfer on purpose: box ids repeat across GRNs, so a
+    receipt somewhere else must not suppress a genuine park here.
+
+    Fails OPEN — if we cannot prove receipt, the box is parked. Wrongly claiming
+    receipt would silently drop stock out of the backfill, which is worse than
+    parking a row a human can see.
+    """
+    if not box_id or transfer_out_id is None:
+        return False
+    try:
+        return bool(db.execute(
+            text("""
+                SELECT 1 FROM interunit_transfer_in_boxes t
+                JOIN interunit_transfer_in_header ih ON ih.id = t.header_id
+                WHERE t.box_id = :bid AND ih.transfer_out_id = :toid
+                LIMIT 1
+            """),
+            {"bid": box_id, "toid": transfer_out_id},
+        ).fetchone())
+    except Exception as exc:                                   # noqa: BLE001
+        logger.warning("BACKFILL: receipt check failed for box %s on transfer %s (%s) "
+                       "— parking it rather than assuming received",
+                       box_id, transfer_out_id, exc)
+        return False
 
 
 def _company_from_table(table: str) -> str:
@@ -619,7 +754,9 @@ def _restore_box_to_source(
                 "spl_remarks": cd.get("spl_remarks"),
             },
         )
-    else:  # boxes_v2 / bulk_entry_boxes
+    elif _refuse_inward_write(source_table, "restore a box into", box_id):
+        return                            # inward is not ours to write to
+    else:
         db.execute(
             text(f"""
                 INSERT INTO {source_table}
@@ -796,10 +933,11 @@ def _swap_pending_row(
         # Literal swap path (cold-source → warehouse-dest only): deduct the
         # scanned box from source and restore the IMS placeholder back to source
         # (it was never really shipped).
-        db.execute(
-            text(f"DELETE FROM {new_source_table} WHERE box_id = :b AND transaction_no = :t"),
-            {"b": new_box_id, "t": pending_row.transaction_no},
-        )
+        if not _refuse_inward_write(new_source_table, "delete a swapped box from", new_box_id):
+            db.execute(
+                text(f"DELETE FROM {new_source_table} WHERE box_id = :b AND transaction_no = :t"),
+                {"b": new_box_id, "t": pending_row.transaction_no},
+            )
         _restore_box_to_source(
             db,
             source_table=pending_row.source_table,
@@ -1244,10 +1382,11 @@ def park_in_pending(
             },
         )
 
-        # Delete from source table (atomic with pending insert via outer transaction)
-        db.execute(
-            text(f"DELETE FROM {source_table} WHERE id = :rid"),
-            {"rid": getattr(source_row, "id")},
+        # Deduct from the source ONLY when the source is a stock ledger (cold).
+        # A warehouse dispatch leaves the inward row alone: pending_transfer_stock
+        # is the transfer's own copy, and inward stays the record of receipt.
+        _delete_source_row(
+            db, source_table, getattr(source_row, "id"), box_id=box_id,
         )
 
         # Disposition ledger — audit trail of why this box left source.
@@ -1896,8 +2035,10 @@ def unpick_to_pending(transfer_in_id: int, transfer_out_id: int, db: Session) ->
                 weight_kg = float(getattr(row, "weight_kg", 0) or weight_kg)
                 no_of_cartons = int(getattr(row, "no_of_cartons", 1) or 1)
 
-        # Delete from destination
-        if dest_table:
+        # Un-receive: pull the box back out of the destination. Only a cold
+        # ledger holds it — a warehouse receipt was never written to inward, so
+        # there is nothing there to remove.
+        if dest_table and not _refuse_inward_write(dest_table, "un-receive a box from", b.box_id):
             db.execute(
                 text(f"DELETE FROM {dest_table} WHERE box_id = :bid AND transaction_no = :tno"),
                 {"bid": b.box_id, "tno": b.transaction_no},
@@ -2042,8 +2183,24 @@ def restore_to_source(transfer_out_id: int, db: Session) -> int:
                     "spl_remarks": cold_json.get("spl_remarks"),
                 },
             )
+        elif _is_inward_table(src):
+            # Inward is a GRN record, not transfer's to edit. Cancelling a
+            # warehouse transfer therefore just drops the transfer's own copy.
+            # Rows deleted by the old behaviour are NOT rebuilt here — that is a
+            # one-off data repair, not something a cancel should quietly do.
+            still_there = _row_still_in_source(db, src, p)
+            db.execute(text("DELETE FROM pending_transfer_stock WHERE id = :id"), {"id": p.id})
+            restored += 1
+            logger.info(
+                "RESTORE_SOURCE: pending copy for box_id=%s dropped; %s left untouched "
+                "(inward row %s)", p.box_id, src,
+                "present" if still_there else "MISSING — needs the one-off repair",
+            )
+            continue
         else:
-            # Warehouse-source restore. The bulk_entry/boxes tables have FK constraints
+            # Warehouse-source restore for rows dispatched BEFORE the source stopped
+            # being deducted: those really are missing from inward and must be put
+            # back. The bulk_entry/boxes tables have FK constraints
             # on transaction_no → *_transactions(_v2). Legacy *_bulk_entry_boxes is being
             # phased out in favour of *_boxes_v2 and many legacy parents have been
             # cascade-deleted. Strategy:
@@ -2612,6 +2769,7 @@ def backfill_pending_from_existing_transfers(db: Session, dry_run: bool = False)
         "boxes_parked_from_warehouse": 0,
         "boxes_parked_without_source": 0,
         "boxes_skipped_already_parked": 0,
+        "boxes_skipped_already_received": 0,
         "boxes_with_missing_id": 0,
         "boxes_topped_up_by_lot": 0,
         "boxes_unallocatable": 0,
@@ -2663,6 +2821,12 @@ def backfill_pending_from_existing_transfers(db: Session, dry_run: bool = False)
             ).fetchone()
             if dup:
                 summary["boxes_skipped_already_parked"] += 1
+                continue
+            # Already RECEIVED on this transfer? Then the pending row is absent
+            # because the receipt consumed it, not because it was never parked.
+            # Without this the backfill resurrects completed transfers.
+            if _already_received(db, box_id, t.id):
+                summary["boxes_skipped_already_received"] += 1
                 continue
 
             # Find source row
@@ -2770,8 +2934,12 @@ def backfill_pending_from_existing_transfers(db: Session, dry_run: bool = False)
                 },
             )
 
-            # Delete source row (only if it actually exists — keeps idempotency)
-            if source_row is not None and getattr(source_row, "id", None) is not None and source_table:
+            # Deduct the source row only for a cold ledger, and only if it exists
+            # (keeps the backfill idempotent). Warehouse sources are references —
+            # backfilling a historical transfer must not delete inward rows that
+            # the original dispatch is no longer entitled to remove either.
+            if (source_row is not None and getattr(source_row, "id", None) is not None
+                    and _deducts_source(source_table)):
                 _w(
                     text(f"DELETE FROM {source_table} WHERE id = :rid"),
                     {"rid": source_row.id},

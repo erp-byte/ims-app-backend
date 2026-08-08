@@ -244,13 +244,13 @@ def create_request(data: RequestCreate, created_by: str, db: Session) -> dict:
         # Use frontend-provided net_weight if available; otherwise calculate
         frontend_net_weight = float(line.net_weight) if line.net_weight else 0.0
 
-        # If user provided net_weight directly, prefer it
-        if frontend_net_weight > 0:
-            net_weight = round(frontend_net_weight, 3)
-        elif line.material_type.upper() == "FG":
-            net_weight = round(unit_pack_size_val * pack_size_f * qty_i, 3)
-        else:
-            net_weight = round(pack_size_f * qty_i, 3)
+        # PM uses pack_size alone; FG and RM both need unit_pack_size.
+        # The old else-branch put RM on the PM rule and dropped it.
+        net_weight = line_net_weight(
+            line.material_type, pack_size_f, unit_pack_size_val, qty_i,
+            provided=frontend_net_weight,
+            item_category=getattr(line, "item_category", None),
+        )
 
         # Use frontend-provided total_weight if available; otherwise fallback to net_weight
         frontend_total_weight = float(line.total_weight) if line.total_weight else 0.0
@@ -707,10 +707,18 @@ _AVAILABLE_BOX_SQL_LEGACY = """
 
 
 def _auto_derive_warehouse_boxes(db: Session, from_site: str, lines: list) -> list:
-    """Server-side FIFO box picker for warehouse-source transfers when the
+    """DISCONNECTED 2026-08-07 — DO NOT CALL. Kept for reference only.
+
+    Server-side FIFO box picker for warehouse-source transfers when the
     frontend submitted no boxes. Returns a list of BoxCreate, sequentially
     numbered. Raises HTTPException(400) on ambiguity / insufficient stock so
-    the operator is prompted to scan/pick manually."""
+    the operator is prompted to scan/pick manually.
+
+    Unwired by owner decision: only a scan may choose a box. Picking the oldest
+    rows FIFO recorded boxes that were never the ones on the truck (a July 16 kg
+    lot booked to March lot CF100326 at 10 kg). Re-wiring this needs the owner's
+    say-so and would fail test_system_never_picks_boxes.py.
+    """
     derived: list = []
     used_box_ids: set = set()
     box_number_counter = 1
@@ -827,6 +835,127 @@ def _auto_derive_warehouse_boxes(db: Session, from_site: str, lines: list) -> li
 # how the doubled DCs above got written back after creation had already fixed them.
 
 
+# A weighed box is never exactly its nominal pack size. 0.5% (floor 0.25 kg)
+# absorbs scale wobble on a real consignment while still catching a wrong
+# pack size, which is always out by a whole multiple or close to it.
+PACK_SIZE_TOLERANCE_PCT = 0.005
+PACK_SIZE_TOLERANCE_MIN_KG = 0.25
+
+
+def line_net_weight(material_type, pack_size, unit_pack_size, qty,
+                    provided=None, item_category=None) -> float:
+    """Net kg for a transfer line, by the rule its material actually follows.
+
+        PM / packaging   pack_size x qty
+                         unit_pack_size is a per-box piece count, not a weight.
+        FG / RM          pack_size x unit_pack_size x qty
+                         pack_size counts retail packs per box.
+
+    `provided` is whatever the form sent and always wins — this only derives a
+    figure when none was supplied, which is every manually-keyed line, because
+    the transfer form omits net_weight from its payload entirely.
+
+    Replaces an `elif material == "FG"` / `else: pack_size * qty` pair that put
+    RM on the PM rule and dropped unit_pack_size from 261 live lines.
+    """
+    def _f(v):
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    given = _f(provided)
+    if given > 0:
+        return given
+    ps, ups, q = _f(pack_size), _f(unit_pack_size), _f(qty)
+    if ps <= 0 or q <= 0:
+        return 0.0
+    if is_countable_material(material_type, item_category) or ups <= 0:
+        return round(ps * q, 3)
+    return round(ps * ups * q, 3)
+
+
+def is_countable_material(material_type=None, item_category=None) -> bool:
+    """PM / packaging. Mirrors `isCountableItem` on the delivery challan."""
+    mt = str(material_type or "").strip().upper()
+    cat = str(item_category or "").strip().upper()
+    return mt == "PM" or cat == "PACKAGING"
+
+
+def pack_size_conflict(pack_size, qty, box_net, unit_pack_size=None,
+                       material_type=None, item_category=None) -> Optional[dict]:
+    """Report a line whose declared pack and whose scanned boxes disagree.
+
+    THERE ARE TWO RULES, AND THE MATERIAL TYPE PICKS ONE (owner, 2026-08-07):
+
+        PM / packaging   kg per box = pack_size
+                         unit_pack_size is a piece count and has nothing to do
+                         with the weight.
+        FG / RM          kg per box = pack_size x unit_pack_size
+                         pack_size is a COUNT of retail packs — a 100 g line
+                         carries 100 for a 10 kg box, a 500 g line carries 16
+                         for an 8 kg box.
+
+    Measured over 34,010 box lines: the PM rule holds on 8,329 of 8,483 PM lines
+    (98.2%), the FG/RM rule on 25,192 of 25,527 (98.7%). Applying either rule to
+    the other material is useless — the FG/RM formula explains just 1.9% of PM
+    lines. An earlier version of this function used one rule for everything and
+    reported 13,343 conflicts, almost all of them correct data.
+
+    Some FG/RM rows store unit_pack_size in grams, so that reading is tried too.
+
+    Deliberately does NOT choose between the declared and the scanned figure.
+    Which is physically true is not decidable from the data.
+
+    Returns None when the line is consistent or there is nothing to compare.
+    """
+    try:
+        ps = float(pack_size or 0)
+        q = float(qty or 0)
+        net = float(box_net or 0)
+        ups = float(unit_pack_size or 0)
+    except (TypeError, ValueError):
+        return None
+    if ps <= 0 or q <= 0 or net <= 0:
+        return None                      # weight-only line: nothing to reconcile
+
+    per_box = net / q
+    countable = is_countable_material(material_type, item_category)
+    # One tolerance for every material — it exists only to absorb scale rounding,
+    # not to excuse a wrong figure.
+    tol = max(per_box * PACK_SIZE_TOLERANCE_PCT, PACK_SIZE_TOLERANCE_MIN_KG)
+
+    if countable:
+        # PM: pack_size IS kg per box. unit_pack_size is a per-box piece count and
+        # takes no part in the weight, so it is not read here at all.
+        readings = [(ps, "PM: pack_size is kg per box")]
+    else:
+        readings = []
+        if ups > 0:
+            readings += [(ps * ups, "packs x unit pack (kg)"),
+                         (ps * ups / 1000.0, "packs x unit pack (grams)")]
+        # unit_pack_size 1 (or absent) means pack_size is already the box weight
+        readings.append((ps, "pack_size already kg per box"))
+
+    for implied_per_box, _ in readings:
+        if abs(implied_per_box - per_box) <= tol:
+            return None
+
+    best, label = min(readings, key=lambda r: abs(r[0] - per_box))
+    return {
+        "pack_size": ps,
+        "unit_pack_size": ups,
+        "qty": q,
+        "material": "PM" if countable else "FG/RM",
+        "reading": label,
+        "implied_per_box": round(best, 3),
+        "implied_kg": round(best * q, 3),
+        "actual_kg": round(net, 3),
+        "per_box_actual": round(per_box, 3),
+        "gap_kg": round(best * q - net, 3),
+    }
+
+
 def _boxes_authoritative(
     db: Session, header_id: int, from_site: str, payload_boxes: list, lines: list
 ) -> list:
@@ -875,6 +1004,23 @@ def _boxes_authoritative(
             "(dropped %d duplicate line(s))",
             header_id, k, keep.id, a["n"], a["net"], len(dup_ids),
         )
+        # The boxes have just overruled whatever the operator keyed. Say so —
+        # printing a Pack Size and a Net Wt that describe different consignments
+        # and logging neither is what let this run for months.
+        conflict = pack_size_conflict(keep.pack_size, a["n"], a["net"],
+                                      getattr(keep, "unit_pack_size", None),
+                                      getattr(keep, "rm_pm_fg_type", None),
+                                      getattr(keep, "item_category", None))
+        if conflict:
+            logger.warning(
+                "PACK_SIZE_CONFLICT: header=%s line=%s article=%r — %s packs x %s "
+                "(%s) implies %.3f kg per box, but the %d scanned boxes average "
+                "%.3f kg (%.3f kg total vs %.3f claimed).",
+                header_id, keep.id, k, conflict["pack_size"],
+                conflict["unit_pack_size"], conflict["reading"],
+                conflict["implied_per_box"], a["n"], conflict["per_box_actual"],
+                conflict["actual_kg"], conflict["implied_kg"],
+            )
 
     return db.execute(
         text("SELECT id, header_id, rm_pm_fg_type, item_category, sub_category, "
@@ -885,16 +1031,58 @@ def _boxes_authoritative(
     ).fetchall()
 
 
+def _synthesise_article_entry_boxes(lines: list) -> list:
+    """One BoxCreate per unit for a box-less (Article Entry) dispatch, labelled
+    ART-1..ART-N across the transfer.
+
+    Pure — reads NO table. Article Entry has no scan, so no real box identity
+    exists; inventing a label is honest, while borrowing a real box_id off the
+    stock sheet (the old FIFO auto-derive) recorded boxes that never shipped.
+
+    `transaction_no` is left blank on purpose. It is what makes park_in_pending
+    skip these rows instead of trying to deduct a source, so a synthetic box can
+    never move real stock. Weight is the line total split per unit.
+    """
+    boxes: list = []
+    n = 0
+    for line in lines:
+        article = (getattr(line, "item_desc_raw", "") or "").strip()
+        qty = int(getattr(line, "qty", 0) or 0)
+        if not article or qty <= 0:
+            continue
+        total_net = float(getattr(line, "net_weight", 0) or 0)
+        total_gross = float(getattr(line, "total_weight", 0) or 0) or total_net
+        per_net = round(total_net / qty, 3)
+        per_gross = round(total_gross / qty, 3)
+        for _ in range(qty):
+            n += 1
+            boxes.append(BoxCreate(
+                box_number=n,
+                box_id=f"ART-{n}",
+                article=article,
+                lot_number=(getattr(line, "lot_number", "") or "") or None,
+                batch_number=(getattr(line, "batch_number", "") or "") or None,
+                transaction_no="",
+                net_weight=str(per_net),
+                gross_weight=str(per_gross),
+            ))
+    return boxes
+
+
 def _uncovered_lines(db: Session, header_id: int, lines: list) -> list:
     """Lines whose stock is NOT parked via a box row — they must be parked box-less so
     manually-typed entries are never dropped. Coverage is read from the boxes table
     (transfer_line_id), which is exact after _boxes_authoritative reattached them —
     matching on lot text instead left box-covered lines "uncovered" and double-parked
     them as phantom units (the 102-row bug)."""
+    # Synthetic ART- rows are a box-wise *rendering* of an article-entry line, not
+    # evidence that real box stock was parked. Counting them as coverage would stop
+    # park_lines_in_pending and leave the transfer with no in-transit record at all.
     covered = {
         r[0] for r in db.execute(
             text("SELECT DISTINCT transfer_line_id FROM interunit_transfer_boxes "
-                 "WHERE header_id = :h AND transfer_line_id IS NOT NULL"),
+                 "WHERE header_id = :h AND transfer_line_id IS NOT NULL "
+                 "AND COALESCE(box_id, '') NOT LIKE 'ART-%'"),
             {"h": header_id},
         )
     }
@@ -966,12 +1154,12 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
 
         # Use frontend-provided net_weight if available; otherwise calculate
         frontend_net_weight = float(line.net_weight) if line.net_weight else 0.0
-        if frontend_net_weight > 0:
-            net_weight = round(frontend_net_weight, 3)
-        elif line.material_type.upper() == "FG":
-            net_weight = round(unit_pack_size_val * pack_size_f * qty_i, 3)
-        else:
-            net_weight = round(pack_size_f * qty_i, 3)
+        # PM uses pack_size alone; FG and RM both need unit_pack_size.
+        net_weight = line_net_weight(
+            line.material_type, pack_size_f, unit_pack_size_val, qty_i,
+            provided=frontend_net_weight,
+            item_category=getattr(line, "item_category", None),
+        )
 
         # Use frontend-provided total_weight if available; otherwise fallback to net_weight
         frontend_total_weight = float(line.total_weight) if line.total_weight else 0.0
@@ -1017,19 +1205,21 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
     # restore wrong-lot/excess rows). No scan-based block here — there is nothing real to
     # block against.
 
-    # Plan C: auto-derive boxes for warehouse-source transfers when the frontend
-    # didn't scan any. Best-effort — if the stock is not box-tracked (no matching
-    # boxes), ambiguous, or insufficient, we DO NOT block the save: the transfer
-    # falls through to line-level pending below so every transfer is still tracked.
+    # NO AUTO-PICK (owner, 2026-08-07). Only a scan may choose a box.
+    #
+    # This used to call _auto_derive_warehouse_boxes when the frontend sent no
+    # boxes (the Article Entry route), which read the real box tables and took the
+    # OLDEST rows FIFO. Those were never the boxes on the truck: 260 of 329
+    # (challan, GRN) groups are one contiguous run, 162 starting at box #1 — an
+    # allocator's fingerprint, not a person picking off a pallet. That is how a
+    # July 16 kg lot came to be booked against March lot CF100326 at 10 kg.
+    #
+    # The dispatch is still recorded BOX-WISE — qty 20 gives 20 rows — but the ids
+    # are generated (ART-1..ART-N), not taken off the stock sheet. Nothing is read
+    # from, or written to, any stock table. Do not re-wire the picker without the
+    # owner's decision — see test_system_never_picks_boxes.py.
     if (not data.boxes) and lines and not _is_cold_site(data.header.from_warehouse):
-        try:
-            data.boxes = _auto_derive_warehouse_boxes(db, data.header.from_warehouse, lines)
-        except HTTPException as e:
-            logger.info(
-                "TRANSFER: box auto-derive skipped (%s) — falling back to line-level pending",
-                getattr(e, "detail", e),
-            )
-            data.boxes = []
+        data.boxes = _synthesise_article_entry_boxes(lines)
 
     # Insert boxes (if provided)
     boxes = []
@@ -1588,12 +1778,12 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
 
         # Use frontend-provided net_weight if available; otherwise calculate
         frontend_net_weight = float(line.net_weight) if line.net_weight else 0.0
-        if frontend_net_weight > 0:
-            net_weight = round(frontend_net_weight, 3)
-        elif line.material_type.upper() == "FG" and unit_pack_size_val:
-            net_weight = round(unit_pack_size_val * pack_size_f * qty_i, 3)
-        else:
-            net_weight = round(pack_size_f * qty_i, 3)
+        # PM uses pack_size alone; FG and RM both need unit_pack_size.
+        net_weight = line_net_weight(
+            line.material_type, pack_size_f, unit_pack_size_val, qty_i,
+            provided=frontend_net_weight,
+            item_category=getattr(line, "item_category", None),
+        )
 
         # Use frontend-provided total_weight if available; otherwise fallback to net_weight
         frontend_total_weight = float(line.total_weight) if line.total_weight else 0.0
@@ -1639,19 +1829,21 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
     # restore wrong-lot/excess rows). No scan-based block here — there is nothing real to
     # block against.
 
-    # Plan C: auto-derive boxes for warehouse-source transfers when the frontend
-    # didn't scan any. Best-effort — if the stock is not box-tracked (no matching
-    # boxes), ambiguous, or insufficient, we DO NOT block the save: the transfer
-    # falls through to line-level pending below so every transfer is still tracked.
+    # NO AUTO-PICK (owner, 2026-08-07). Only a scan may choose a box.
+    #
+    # This used to call _auto_derive_warehouse_boxes when the frontend sent no
+    # boxes (the Article Entry route), which read the real box tables and took the
+    # OLDEST rows FIFO. Those were never the boxes on the truck: 260 of 329
+    # (challan, GRN) groups are one contiguous run, 162 starting at box #1 — an
+    # allocator's fingerprint, not a person picking off a pallet. That is how a
+    # July 16 kg lot came to be booked against March lot CF100326 at 10 kg.
+    #
+    # The dispatch is still recorded BOX-WISE — qty 20 gives 20 rows — but the ids
+    # are generated (ART-1..ART-N), not taken off the stock sheet. Nothing is read
+    # from, or written to, any stock table. Do not re-wire the picker without the
+    # owner's decision — see test_system_never_picks_boxes.py.
     if (not data.boxes) and lines and not _is_cold_site(data.header.from_warehouse):
-        try:
-            data.boxes = _auto_derive_warehouse_boxes(db, data.header.from_warehouse, lines)
-        except HTTPException as e:
-            logger.info(
-                "TRANSFER: box auto-derive skipped (%s) — falling back to line-level pending",
-                getattr(e, "detail", e),
-            )
-            data.boxes = []
+        data.boxes = _synthesise_article_entry_boxes(lines)
 
     # Insert boxes (if provided)
     boxes = []

@@ -113,6 +113,85 @@ class ColdTransferOutCreateResponse(BaseModel):
     boxes_parked: int
 
 
+def totals_by_line(box_rows) -> Dict[int, Dict[str, float]]:
+    """Fold (transfer_line_id, net, gross) box rows into per-line qty and weight.
+
+    The scanned boxes are the physical truth: they are what `park_in_pending`
+    moves and what the receiving site counts. The line is only the document view
+    of them, so it has to be derived from them rather than trusted alongside.
+
+    The cold form keeps `net_weight` as the PER-BOX weight and computes the line
+    total for display only, so the figure that reached the challan was one box.
+    TRANS202608061358 dispatched 750 boxes and printed 10.00 kg.
+
+    Keyed on transfer_line_id, not on the article name: a cold line is per
+    (article, lot), and `interunit_tools._boxes_authoritative` groups by article
+    alone — which is why it excludes cold sites rather than merging two lots
+    into one line.
+
+    A PM box carries its weight in gross only and a few legacy rows carry net
+    only, so each falls back to the other. A real box must never count as 0 kg.
+    """
+    totals: Dict[int, Dict[str, float]] = {}
+    for line_id, net, gross in box_rows:
+        if line_id is None:
+            continue                      # unlinked box: never invent a line for it
+        n, g = float(net or 0), float(gross or 0)
+        t = totals.setdefault(line_id, {"qty": 0, "net": 0.0, "gross": 0.0})
+        t["qty"] += 1
+        t["net"] += n or g
+        t["gross"] += g or n
+    return totals
+
+
+def _apply_box_totals(db: Session, header_id: int, box_assignments) -> None:
+    """Write the boxes' own qty and weight onto the lines they belong to.
+
+    Runs before `park_in_pending`, so the challan and the stock that physically
+    moves are the same consignment. Lines carrying no boxes are untouched — a
+    weight-only cold transfer has nothing to reconcile against and its typed
+    figures stand.
+    """
+    from services.ims_service.interunit_tools import pack_size_conflict
+
+    for line_id, t in totals_by_line(box_assignments).items():
+        prior = db.execute(
+            text("SELECT pack_size, unit_pack_size, qty, net_weight, "
+                 "rm_pm_fg_type, item_category "
+                 "FROM interunit_transfers_lines WHERE id = :id AND header_id = :h"),
+            {"id": line_id, "h": header_id},
+        ).fetchone()
+        db.execute(
+            text("""
+                UPDATE interunit_transfers_lines
+                   SET qty          = :qty,
+                       net_weight   = :net,
+                       total_weight = :gross,
+                       uom          = COALESCE(NULLIF(TRIM(uom), ''), 'BOX')
+                 WHERE id = :id AND header_id = :h
+            """),
+            {"qty": t["qty"], "net": round(t["net"], 3),
+             "gross": round(t["gross"], 3), "id": line_id, "h": header_id},
+        )
+        logger.info("COLD_BOXES_AUTHORITATIVE: header=%s line=%s qty=%s net=%.3f "
+                    "(was qty=%s net=%s)", header_id, line_id, t["qty"], t["net"],
+                    prior.qty if prior else "?", prior.net_weight if prior else "?")
+        conflict = pack_size_conflict(
+            prior.pack_size if prior else 0, t["qty"], t["net"],
+            prior.unit_pack_size if prior else None,
+            prior.rm_pm_fg_type if prior else None,
+            prior.item_category if prior else None)
+        if conflict:
+            logger.warning(
+                "PACK_SIZE_CONFLICT: header=%s line=%s — %s packs x %s (%s) implies "
+                "%.3f kg per box, but the %d scanned boxes average %.3f kg "
+                "(%.3f kg total vs %.3f claimed).",
+                header_id, line_id, conflict["pack_size"], conflict["unit_pack_size"],
+                conflict["reading"], conflict["implied_per_box"], t["qty"],
+                conflict["per_box_actual"], conflict["actual_kg"], conflict["implied_kg"],
+            )
+
+
 def _parse_trf_date(raw: Optional[str]):
     """Convert the form's DD-MM-YYYY (or ISO) stock-transfer date into a real date
     object. Inserting the raw 'DD-MM-YYYY' string lets Postgres misparse it under the
@@ -245,6 +324,7 @@ def create_cold_transfer_out(
 
     seen: set = set()
     box_idx = 0
+    box_assignments: List[tuple] = []      # (line_id, net, gross) — see totals_by_line
     for box in payload.boxes:
         key = ((box.box_id or "").strip(), (box.transaction_no or "").strip())
         if key in seen:
@@ -262,6 +342,7 @@ def create_cold_transfer_out(
             (box.lot_no or "").strip(),
         )
         line_id = line_id_by_key.get(line_key, fallback_line_id)
+        box_assignments.append((line_id, box.weight_kg, box.weight_kg))
         box_idx += 1
         db.execute(
             text("""
@@ -285,6 +366,8 @@ def create_cold_transfer_out(
                 "gross_weight": box.weight_kg,
             },
         )
+
+    _apply_box_totals(db, header_id, box_assignments)
 
     # Park into pending_transfer_stock + deduct cold_stocks (shared middleware).
     parked = park_in_pending(
@@ -470,6 +553,7 @@ def edit_cold_transfer_out(
 
     seen: set = set()
     box_idx = 0
+    box_assignments: List[tuple] = []      # (line_id, net, gross) — see totals_by_line
     for box in payload.boxes:
         key = ((box.box_id or "").strip(), (box.transaction_no or "").strip())
         if key in seen:
@@ -484,6 +568,7 @@ def edit_cold_transfer_out(
             (box.lot_no or "").strip(),
         )
         line_id = line_id_by_key.get(line_key, fallback_line_id)
+        box_assignments.append((line_id, box.weight_kg, box.weight_kg))
         box_idx += 1
         db.execute(
             text("""
@@ -507,6 +592,8 @@ def edit_cold_transfer_out(
                 "gross_weight": box.weight_kg,
             },
         )
+
+    _apply_box_totals(db, header_id, box_assignments)
 
     parked = park_in_pending(
         transfer_out_id=header_id,

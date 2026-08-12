@@ -1624,6 +1624,63 @@ def _resolve_box_line_numbers(articles: list, boxes: list) -> None:
         b.line_number = by_desc.get(b.article_description)
 
 
+def _backfill_read_line_numbers(articles: list, boxes: list) -> dict:
+    """Resolve a usable ``line_number`` on every article/box dict a read returns.
+
+    ``line_number`` is the box <-> article join key every consumer keys off, but a read can
+    hand back rows that have none: it is nullable on the ``*_v2`` tables (legacy insert
+    paths never set it — see the partial NULL-line index in the 2026-07-31 migration) and
+    the ``*_bulk_entry_*`` tables have no such column at all. Consumers then fill the gap
+    inconsistently — an article with no line becomes line ``idx + 1`` while its boxes
+    become line ``0`` — so nothing matches and the article renders its (correct)
+    box-derived totals next to an empty box list.
+
+    Resolution mirrors :func:`_assign_line_numbers` / :func:`_resolve_box_line_numbers` on
+    the write path: articles missing a line take the next free 1-based slot in row order,
+    and boxes missing one inherit their article's line by ``article_description`` — or the
+    sole article's line when the transaction has exactly one, since a box's description can
+    be blank or drifted. Boxes matching no article get their own lines numbered after the
+    real articles, so :func:`_surface_orphan_box_articles` still splits them out instead of
+    colliding with a real line.
+
+    Mutates ``articles`` and ``boxes`` in place. Returns the resulting
+    ``article_description -> line_number`` map so box aggregates fetched by a separate
+    query can be re-keyed the same way.
+    """
+    used = {a.get("line_number") for a in articles if a.get("line_number") is not None}
+    nxt = 1
+    for a in articles:
+        if a.get("line_number") is not None:
+            continue
+        while nxt in used:
+            nxt += 1
+        a["line_number"] = nxt
+        used.add(nxt)
+        nxt += 1
+
+    by_desc: dict = {}
+    for a in articles:
+        by_desc.setdefault(a.get("item_description"), a.get("line_number"))
+    sole_line = articles[0].get("line_number") if len(articles) == 1 else None
+
+    next_orphan = max(used) + 1 if used else 1
+    for b in boxes:
+        if b.get("line_number") is not None:
+            continue
+        desc = b.get("article_description")
+        line = by_desc.get(desc) if desc else None
+        if line is None:
+            line = sole_line
+        if line is None:
+            # No article row to attach to — give this description its own line past the
+            # real articles so it surfaces as its own orphan group rather than colliding.
+            line = next_orphan
+            by_desc[desc] = line
+            next_orphan += 1
+        b["line_number"] = line
+    return by_desc
+
+
 
 
 
@@ -2265,6 +2322,11 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
 
 
 
+    # Boxes join to their article by line_number, but legacy *_v2 rows can have it NULL and
+    # the *_bulk_entry_* tables have no such column — resolve it before anything below (or
+    # any UI consumer of this payload) keys off it, else the boxes render under no article.
+    _desc_to_line = _backfill_read_line_numbers(articles, boxes)
+
     # Item 1B: compute-on-read safety net. Boxes are the source of truth — overlay box-derived
     # aggregates onto existing article rows so the UI is correct even before the one-time backfill
     # runs. The sums come from a full grouped query, so they are correct regardless of the box
@@ -2277,16 +2339,29 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
         _sum_rows = db.execute(
             text(f"""
                 SELECT {_grp} AS art_key,
+                       article_description AS art_desc,
                        COUNT(*) AS cnt,
                        COALESCE(SUM(net_weight), 0) AS net,
                        COALESCE(SUM(gross_weight), 0) AS gross
                 FROM {_box_tbl}
                 WHERE transaction_no = :txno
-                GROUP BY {_grp}
+                GROUP BY {_grp}, article_description
             """),
             {"txno": transaction_no},
         ).fetchall()
-        _box_sums = {r.art_key: {"cnt": r.cnt, "net": r.net, "gross": r.gross} for r in _sum_rows}
+        # Re-key any NULL-line_number group onto the line its description just resolved to,
+        # so the overlay still finds it now that every article carries a real line. Groups
+        # are summed (not overwritten) because a resolved and an already-keyed group can
+        # land on the same line.
+        _box_sums: dict = {}
+        for r in _sum_rows:
+            _key = r.art_key if r.art_key is not None else _desc_to_line.get(r.art_desc)
+            if _key is None:
+                _key = r.art_desc
+            _slot = _box_sums.setdefault(_key, {"cnt": 0, "net": 0, "gross": 0})
+            _slot["cnt"] += r.cnt
+            _slot["net"] += r.net
+            _slot["gross"] += r.gross
         overlay_box_derived_aggregates(articles, _box_sums)
 
     # Synthesize articles from boxes if none exist
@@ -2707,9 +2782,12 @@ def update_inward(
             {"txno": transaction_no},
         ).fetchall()
         # Primary key = (line_number, box_number); legacy fallback = (article_description, box_number).
+        # The _bulk_entry_* box table has no line_number column at all, so there it is
+        # description-keyed only — reading r.line_number there would raise.
+        _v2_box = _is_v2_tables(tables)
         existing_box_by_line = {
             (r.line_number, r.box_number): dict(r._mapping) for r in existing_boxes if r.line_number is not None
-        }
+        } if _v2_box else {}
         existing_box_by_desc = {
             (r.article_description, r.box_number): dict(r._mapping) for r in existing_boxes
         }
@@ -2758,12 +2836,13 @@ def update_inward(
                         box_changes,
                     )
             else:
-                # New box — insert (no box_id yet, assigned on print)
+                # New box — insert (no box_id yet, assigned on print). line_number only
+                # exists on the _v2 tables; the _bulk_entry_* fallback omits the column.
                 db.execute(
                     text(
                         f"INSERT INTO {tables['box']} "
-                        f"(transaction_no, line_number, article_description, box_number, net_weight, gross_weight, lot_number, count) "
-                        f"VALUES (:transaction_no, :line_number, :article_description, :box_number, :net_weight, :gross_weight, :lot_number, :count)"
+                        f"(transaction_no, {'line_number, ' if _v2_box else ''}article_description, box_number, net_weight, gross_weight, lot_number, count) "
+                        f"VALUES (:transaction_no, {':line_number, ' if _v2_box else ''}:article_description, :box_number, :net_weight, :gross_weight, :lot_number, :count)"
                     ),
                     box_data,
                 )

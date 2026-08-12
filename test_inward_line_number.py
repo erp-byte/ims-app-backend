@@ -19,6 +19,7 @@ from services.ims_service.inward_models import (
 from services.ims_service.inward_tools import (
     _assign_line_numbers,
     _resolve_box_line_numbers,
+    _backfill_read_line_numbers,
     _is_v2_tables,
     _surface_orphan_box_articles,
     create_inward,
@@ -186,10 +187,96 @@ def test_surface_all_when_no_article_rows():
     print("PASS test_surface_all_when_no_article_rows")
 
 
+# ── read-time line_number backfill (boxes-not-loading regression) ───────────────
+# Reads can return rows with no line_number: it is nullable on *_v2 (legacy insert
+# paths) and absent entirely on *_bulk_entry_* . Consumers then filled the gap
+# inconsistently (article -> idx+1, box -> 0), so no box matched its article and the
+# UI showed correct box-derived totals above an empty box list.
+def test_backfill_bulk_entry_boxes_have_no_line_column():
+    # *_bulk_entry_boxes rows literally have no line_number key at all.
+    articles = [{"item_description": "indian green raisins"}]
+    boxes = [{"article_description": "indian green raisins", "box_number": n} for n in (1, 2, 3)]
+    _backfill_read_line_numbers(articles, boxes)
+    assert articles[0]["line_number"] == 1, articles[0]
+    assert [b["line_number"] for b in boxes] == [1, 1, 1], boxes
+    print("PASS test_backfill_bulk_entry_boxes_have_no_line_column")
+
+
+def test_backfill_null_line_numbers_on_v2():
+    articles = [{"item_description": "raisins", "line_number": None}]
+    boxes = [{"article_description": "raisins", "box_number": 1, "line_number": None}]
+    _backfill_read_line_numbers(articles, boxes)
+    assert articles[0]["line_number"] == 1
+    assert boxes[0]["line_number"] == 1
+    print("PASS test_backfill_null_line_numbers_on_v2")
+
+
+def test_backfill_matches_boxes_to_their_article_by_description():
+    articles = [{"item_description": "A"}, {"item_description": "B"}]
+    boxes = [
+        {"article_description": "B", "box_number": 1},
+        {"article_description": "A", "box_number": 1},
+    ]
+    _backfill_read_line_numbers(articles, boxes)
+    assert [a["line_number"] for a in articles] == [1, 2]
+    assert [b["line_number"] for b in boxes] == [2, 1], boxes
+    print("PASS test_backfill_matches_boxes_to_their_article_by_description")
+
+
+def test_backfill_preserves_supplied_lines():
+    articles = [{"item_description": "A", "line_number": None},
+                {"item_description": "B", "line_number": 1}]
+    boxes = [{"article_description": "B", "box_number": 1, "line_number": 1},
+             {"article_description": "A", "box_number": 1, "line_number": None}]
+    _backfill_read_line_numbers(articles, boxes)
+    # 1 is taken by B, so A takes the next free slot; supplied box lines are untouched.
+    assert [a["line_number"] for a in articles] == [2, 1], articles
+    assert [b["line_number"] for b in boxes] == [1, 2], boxes
+    print("PASS test_backfill_preserves_supplied_lines")
+
+
+def test_backfill_blank_box_description_falls_back_to_sole_article():
+    articles = [{"item_description": "raisins"}]
+    boxes = [{"article_description": "", "box_number": 1}]
+    _backfill_read_line_numbers(articles, boxes)
+    assert boxes[0]["line_number"] == 1, boxes
+    print("PASS test_backfill_blank_box_description_falls_back_to_sole_article")
+
+
+def test_backfill_orphan_boxes_get_lines_past_the_real_articles():
+    # >1 article, so no sole-article fallback: "ghost" matches no article row.
+    articles = [{"item_description": "A"}, {"item_description": "B"}]
+    boxes = [{"article_description": "ghost", "box_number": 1},
+             {"article_description": "ghost", "box_number": 2},
+             {"article_description": "A", "box_number": 1}]
+    _backfill_read_line_numbers(articles, boxes)
+    assert [b["line_number"] for b in boxes] == [3, 3, 1], boxes
+    # and they still surface as their own article group rather than colliding
+    orphans = _surface_orphan_box_articles("TR-1", articles, boxes)
+    assert [o["item_description"] for o in orphans] == ["ghost"], orphans
+    assert orphans[0]["quantity_units"] == 2, orphans
+    print("PASS test_backfill_orphan_boxes_get_lines_past_the_real_articles")
+
+
+def test_backfill_returns_desc_to_line_map_for_sum_rekeying():
+    articles = [{"item_description": "A"}, {"item_description": "B"}]
+    boxes = [{"article_description": "ghost", "box_number": 1}]
+    by_desc = _backfill_read_line_numbers(articles, boxes)
+    assert by_desc == {"A": 1, "B": 2, "ghost": 3}, by_desc
+    print("PASS test_backfill_returns_desc_to_line_map_for_sum_rekeying")
+
+
 ALL = [
     test_assign_line_numbers_same_name,
     test_assign_line_numbers_preserves_supplied,
     test_resolve_box_line_numbers_uses_supplied,
+    test_backfill_bulk_entry_boxes_have_no_line_column,
+    test_backfill_null_line_numbers_on_v2,
+    test_backfill_matches_boxes_to_their_article_by_description,
+    test_backfill_preserves_supplied_lines,
+    test_backfill_blank_box_description_falls_back_to_sole_article,
+    test_backfill_orphan_boxes_get_lines_past_the_real_articles,
+    test_backfill_returns_desc_to_line_map_for_sum_rekeying,
     test_is_v2_tables,
     test_create_inward_writes_both_same_name_articles,
     test_create_inward_boxes_keyed_by_line_number,

@@ -258,6 +258,39 @@ def test_backfill_orphan_boxes_get_lines_past_the_real_articles():
     print("PASS test_backfill_orphan_boxes_get_lines_past_the_real_articles")
 
 
+def test_backfill_treats_stored_zero_as_unset():
+    # The UI normalises a missing box line to 0 and posts it back; upsert_box /
+    # approve_inward only skip the column on `is None`, so 0 lands in the row and
+    # permanently un-matches the box from its 1-based article. Real lines start at 1.
+    articles = [{"item_description": "A", "line_number": 1},
+                {"item_description": "B", "line_number": 2}]
+    boxes = [{"article_description": "A", "box_number": 1, "line_number": 0},
+             {"article_description": "B", "box_number": 1, "line_number": 0}]
+    _backfill_read_line_numbers(articles, boxes)
+    assert [b["line_number"] for b in boxes] == [1, 2], boxes
+    print("PASS test_backfill_treats_stored_zero_as_unset")
+
+
+def test_backfill_zero_article_line_is_reassigned():
+    articles = [{"item_description": "A", "line_number": 0}]
+    boxes = [{"article_description": "A", "box_number": 1, "line_number": 0}]
+    _backfill_read_line_numbers(articles, boxes)
+    assert articles[0]["line_number"] == 1, articles
+    assert boxes[0]["line_number"] == 1, boxes
+    print("PASS test_backfill_zero_article_line_is_reassigned")
+
+
+def test_backfill_zero_boxes_still_surface_as_orphans_when_unmatched():
+    # 0-line boxes whose description matches no article must not collapse onto line 1.
+    articles = [{"item_description": "A"}, {"item_description": "B"}]
+    boxes = [{"article_description": "ghost", "box_number": 1, "line_number": 0}]
+    _backfill_read_line_numbers(articles, boxes)
+    assert boxes[0]["line_number"] == 3, boxes
+    orphans = _surface_orphan_box_articles("TR-1", articles, boxes)
+    assert [o["item_description"] for o in orphans] == ["ghost"], orphans
+    print("PASS test_backfill_zero_boxes_still_surface_as_orphans_when_unmatched")
+
+
 def test_backfill_returns_desc_to_line_map_for_sum_rekeying():
     articles = [{"item_description": "A"}, {"item_description": "B"}]
     boxes = [{"article_description": "ghost", "box_number": 1}]
@@ -276,6 +309,9 @@ ALL = [
     test_backfill_preserves_supplied_lines,
     test_backfill_blank_box_description_falls_back_to_sole_article,
     test_backfill_orphan_boxes_get_lines_past_the_real_articles,
+    test_backfill_treats_stored_zero_as_unset,
+    test_backfill_zero_article_line_is_reassigned,
+    test_backfill_zero_boxes_still_surface_as_orphans_when_unmatched,
     test_backfill_returns_desc_to_line_map_for_sum_rekeying,
     test_is_v2_tables,
     test_create_inward_writes_both_same_name_articles,

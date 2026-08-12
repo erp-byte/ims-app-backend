@@ -1643,14 +1643,21 @@ def _backfill_read_line_numbers(articles: list, boxes: list) -> dict:
     real articles, so :func:`_surface_orphan_box_articles` still splits them out instead of
     colliding with a real line.
 
+    A stored ``0`` counts as unset, not as a real line. Real lines are 1-based
+    (:func:`_assign_line_numbers` starts at 1 and skips falsy values), but the UI
+    normalises a missing line to ``0`` and sends it straight back — ``upsert_box`` and
+    ``approve_inward`` only skip the column on ``is None``, so that ``0`` gets written to
+    the row and permanently un-matches the box from its 1-based article. Treating it as
+    unset here mirrors the truthiness check the write-path helpers already use.
+
     Mutates ``articles`` and ``boxes`` in place. Returns the resulting
     ``article_description -> line_number`` map so box aggregates fetched by a separate
     query can be re-keyed the same way.
     """
-    used = {a.get("line_number") for a in articles if a.get("line_number") is not None}
+    used = {a.get("line_number") for a in articles if a.get("line_number")}
     nxt = 1
     for a in articles:
-        if a.get("line_number") is not None:
+        if a.get("line_number"):
             continue
         while nxt in used:
             nxt += 1
@@ -1665,7 +1672,7 @@ def _backfill_read_line_numbers(articles: list, boxes: list) -> dict:
 
     next_orphan = max(used) + 1 if used else 1
     for b in boxes:
-        if b.get("line_number") is not None:
+        if b.get("line_number"):
             continue
         desc = b.get("article_description")
         line = by_desc.get(desc) if desc else None
@@ -2349,13 +2356,15 @@ def get_inward(company: Company, transaction_no: str, db: Session, page: Optiona
             """),
             {"txno": transaction_no},
         ).fetchall()
-        # Re-key any NULL-line_number group onto the line its description just resolved to,
-        # so the overlay still finds it now that every article carries a real line. Groups
-        # are summed (not overwritten) because a resolved and an already-keyed group can
-        # land on the same line.
+        # Re-key any unset-line_number group (NULL, or the 0 the UI writes back) onto the
+        # line its description just resolved to, so the overlay still finds it now that
+        # every article carries a real line — otherwise the article keeps whatever stale
+        # quantity_units/net_weight it was created with. Groups are summed (not
+        # overwritten) because a resolved and an already-keyed group can land on the same
+        # line. `or None` folds the bulk_entry description key through unchanged.
         _box_sums: dict = {}
         for r in _sum_rows:
-            _key = r.art_key if r.art_key is not None else _desc_to_line.get(r.art_desc)
+            _key = (r.art_key or None) or _desc_to_line.get(r.art_desc)
             if _key is None:
                 _key = r.art_desc
             _slot = _box_sums.setdefault(_key, {"cnt": 0, "net": 0, "gross": 0})

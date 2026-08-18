@@ -20,7 +20,9 @@ from shared.scheduler import (
     auto_punch_out_and_revoke,
     daily_report_evening,
     daily_report_morning_revision,
-    job_work_weekly_digest,
+    stock_take_evening,
+    stock_take_morning_revision,
+    weekly_reports,
     rtv_email_poll_once,
 )
 from shared.email_reply_listener import shutdown as rtv_email_shutdown
@@ -28,6 +30,8 @@ from services.auth_service.server import router as auth_router
 from services.ims_service.server import router as ims_router
 from services.ims_service.inward_server import router as inward_router
 from services.ims_service.daily_report_server import router as daily_report_router
+from services.ims_service.stock_take_server import router as stock_take_router
+from services.ims_service.weekly_report_server import router as weekly_report_router
 from services.ims_service.interunit_server import router as interunit_router
 from services.ims_service.cold_storage_server import router as cold_storage_router
 from services.cold_storage_service.server import router as cold_storage_service_router
@@ -283,17 +287,39 @@ async def lifespan(app: FastAPI):
         coalesce=True,
         misfire_grace_time=3600,
     )
-    # Weekly job-work digest — Monday 9:00 AM IST. shared.scheduler has carried this
-    # job (and email_notifier its recipients) since the module was written, but it was
-    # never registered here, so it had never once run. A missing add_job is silent by
-    # construction: nothing logs, nothing errors, the mail simply never exists.
+    # Stock take report — 7:00 PM IST every day, same cut-off as the daily report.
+    # Sent even on days with no count: counting runs as a campaign (31 counting
+    # days in seven months), so silence is the normal state and a mail that only
+    # appears when someone counted is indistinguishable from one that failed.
     scheduler.add_job(
-        job_work_weekly_digest,
-        CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=IST),
-        id="job_work_weekly_digest",
+        stock_take_evening,
+        CronTrigger(hour=19, minute=0, timezone=IST),
+        id="stock_take_evening",
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=3600,   # a Monday-morning restart must not skip the week
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        stock_take_morning_revision,
+        CronTrigger(hour=10, minute=30, timezone=IST),
+        id="stock_take_morning_revision",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    # Weekly roll-ups — Monday 10:00 AM IST. One mail per established report
+    # stream, each to that report's own recipients.
+    #
+    # This REPLACES the Monday 09:00 job_work_weekly_digest, which is no longer
+    # registered: its job-work summary is now one of the four streams here, sent
+    # to a superset of its old recipients.
+    scheduler.add_job(
+        weekly_reports,
+        CronTrigger(day_of_week="mon", hour=10, minute=0, timezone=IST),
+        id="weekly_reports",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=7200,   # a Monday-morning restart must not skip the week
     )
     if settings.RTV_EMAIL_APPROVAL_ENABLED:
         scheduler.add_job(
@@ -314,6 +340,15 @@ async def lifespan(app: FastAPI):
     logger.info(
         "Daily inward/transfer report scheduled — 7:00 PM IST daily "
         "(Sunday only if there was activity), revision check 10:30 AM IST"
+    )
+    logger.info(
+        "Stock take report scheduled — 7:00 PM IST daily, revision check "
+        "10:30 AM IST"
+    )
+    logger.info(
+        "Weekly roll-ups scheduled — Monday 10:00 AM IST for 4 streams "
+        "(inward/transfer, stock take, customer returns, job work); "
+        "the 9:00 AM job-work digest is superseded and no longer registered"
     )
 
     # A missed 7 PM send (host asleep / mid-deploy) would otherwise be lost
@@ -380,6 +415,8 @@ app.include_router(auth_router)
 app.include_router(ims_router)
 app.include_router(inward_router)
 app.include_router(daily_report_router)
+app.include_router(stock_take_router)
+app.include_router(weekly_report_router)
 app.include_router(interunit_router)
 app.include_router(cold_storage_router)
 app.include_router(cold_storage_service_router)

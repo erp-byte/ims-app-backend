@@ -132,16 +132,60 @@ def auto_punch_out_and_revoke():
         db.close()
 
 
-def job_work_weekly_digest():
-    """Run every Monday at 9 AM IST — send weekly jobwork summary digest."""
-    if not claim_scheduled_run("job_work_weekly_digest", 3600):
+def weekly_reports():
+    """Run every Monday at 10 AM IST — the weekly roll-up of every report mail.
+
+    Four streams (inward/transfer, stock take, customer returns, job work), each
+    to the recipients of the daily mail it summarises. `run_weekly_reports`
+    isolates the streams from one another, so this only has to guard the firing.
+
+    REPLACES the Monday 09:00 `job_work_weekly_digest`. That job sent a narrower
+    job-work summary to a narrower list, and running both would put two job-work
+    weeklies in the same inbox an hour apart. `send_job_work_weekly_digest` is
+    left in email_notifier — it is still callable by hand — but nothing
+    schedules it any more.
+    """
+    if not claim_scheduled_run("weekly_reports", 3600):
         return
-    logger.info("Running weekly jobwork digest...")
+    logger.info("Running weekly report roll-ups...")
     try:
-        from shared.email_notifier import send_job_work_weekly_digest
-        send_job_work_weekly_digest()
+        from services.ims_service.weekly_report import run_weekly_reports
+        results = run_weekly_reports()
+        for r in results:
+            logger.info("Weekly report %s: %s", r.get("stream"), r.get("status"))
     except Exception as e:
-        logger.error(f"Weekly jobwork digest failed: {e}")
+        logger.error(f"Weekly reports failed: {e}")
+
+
+def stock_take_evening():
+    """Run at 7 PM IST — email the day's stock take report.
+
+    Sent every day, including days with no count: counting runs as a campaign,
+    and a mail that only arrives when someone counted cannot be told apart from
+    one that failed to send.
+    """
+    if not claim_scheduled_run("stock_take_evening", 3600):
+        return
+    logger.info("Running stock take report (evening)...")
+    try:
+        from services.ims_service.stock_take_report import run_evening_report
+        result = run_evening_report()
+        logger.info(f"Stock take report (evening): {result}")
+    except Exception as e:
+        logger.error(f"Stock take report (evening) failed: {e}")
+
+
+def stock_take_morning_revision():
+    """Run at 10:30 AM IST — re-send yesterday's stock take only if it changed."""
+    if not claim_scheduled_run("stock_take_morning_revision", 3600):
+        return
+    logger.info("Running stock take report (morning revision check)...")
+    try:
+        from services.ims_service.stock_take_report import run_morning_revision
+        result = run_morning_revision()
+        logger.info(f"Stock take report (morning revision): {result}")
+    except Exception as e:
+        logger.error(f"Stock take report (morning revision) failed: {e}")
 
 
 def rtv_email_poll_once():

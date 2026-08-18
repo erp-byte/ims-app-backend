@@ -743,6 +743,97 @@ def _section_cr(cr, cap, scap, tone=None, slim=False) -> str:
     return out
 
 
+# ── idle users ───────────────────────────────────────────────────────────
+# Graphite, not red. This block closes the report and names people who did
+# nothing, which is exactly the content that must not read as an accusation
+# before it has been read: someone is on leave, someone else has genuinely
+# stopped using the system, and the mail cannot tell them apart. The exception
+# panel at the top is the only thing here allowed to mean "wrong".
+IDLE = {"deep": "#3F4756", "mid": "#5A6474", "tint": "#EFF1F4", "name": "User activity"}
+
+
+def _idle_names(rows, tone) -> str:
+    """The occasional tier as flowing text rather than a table.
+
+    It is a roll-call, not a dataset — nineteen one-cell rows would take a third
+    of the mail to say what one wrapped paragraph says, and on a phone a table
+    that wide forces the client to scale the whole message down.
+    """
+    if not rows:
+        return ""
+    dot = f'<span style="color:{GREY};"> &middot; </span>'
+    # A dormant account has no last-active date at all, and "(Noned)" is how that
+    # reads if the suffix is printed unconditionally.
+    parts = dot.join(
+        f'<span style="white-space:nowrap;">{e(r["name"])}'
+        + (f'<span style="color:{GREY};font-weight:400;">'
+           f' ({r["days_since"]}d)</span>' if r.get("days_since") else "")
+        + '</span>'
+        for r in rows
+    )
+    return (f'<div style="padding:12px 14px;background:{tone["tint"]};'
+            f'border:1px solid {RULE};border-radius:8px;'
+            f'font:700 {FS_NOTE + 3}px/1.7 Arial,Helvetica,sans-serif;color:{INK};">'
+            f'{parts}</div>')
+
+
+def _section_idle(idle, cap, scap, tone=None, slim=False) -> str:
+    """Who took no action anywhere today — the block that closes the report."""
+    T, H, TI = _tone_helpers(tone, slim)
+    tone = tone or IDLE
+
+    if idle.get("unavailable"):
+        return flag("User activity could not be read for this day. The rest of the "
+                    "report is unaffected.")
+
+    dormant = idle.get("dormant", [])
+    out = TI([
+        ("Took no action", _n(idle["idle"]), f'of {idle["total"]} user accounts'),
+        ("Worked today", _n(idle["active_count"]), "keyed or approved something"),
+        ("Never used in 30 days", _n(len(dormant)), "accounts with no trace"),
+    ])
+
+    if idle.get("failed_sources"):
+        out += flag(f'Not every module could be checked: '
+                    f'{e(", ".join(idle["failed_sources"]))}. Someone who worked only '
+                    f'there may appear below as having done nothing.')
+
+    rows = [[r["name"], "+".join(r["logins"]), f'{r["last_active"]:%d %b}',
+             _n(r["days_since"]), _n(r["active_days"])] for r in idle["regular"]]
+    out += H("Regular users with no activity today")
+    out += T(["User", "Logins", "Last active", "Days idle", "Active days (30d)"],
+             rows, ["left", "left", "right", "right", "right"],
+             cap=scap, keep=[0, 2, 3],
+             note="Regular = worked on at least 3 of the last 30 business days. "
+                  "These are the people whose silence today is worth a question.",
+             empty="Every regular user did something today")
+
+    n_occ = len(idle["occasional"])
+    out += H(f"Occasional users with no activity today ({n_occ})")
+    out += (_idle_names(idle["occasional"], tone) if n_occ else
+            T(["User"], [], empty="No one else with recent activity was idle"))
+
+    out += H(f"Accounts with no activity at all in the last 30 days ({len(dormant)})")
+    out += (_idle_names(dormant, tone) if dormant else
+            T(["User"], [], empty="Every account has been used in the last 30 days"))
+
+    out += (f'<div style="font-size:{FS_NOTE}px;line-height:1.55;color:{GREY};'
+            f'margin:12px 2px 0;">'
+            f'<b>Who is on this list</b> &mdash; every active user account on the '
+            f'three systems: IMS (<i>users</i>), ERP (<i>auth_user</i>) and Stock '
+            f'Take (<i>stocktake_users</i>). One person holding logins on more than '
+            f'one system is a single row. Names typed as free text elsewhere &mdash; '
+            f'a job card assigned to a team leader, for instance &mdash; are not '
+            f'accounts and are not listed. Shared mailboxes and system logins '
+            f'(Stores A185, Quality, Printing, Admin) are excluded: their work still '
+            f'counts, but there is no one person to ask about them.<br>'
+            f'<b>Activity checked</b> &mdash; IMS: inward, bulk entry, transfers, job '
+            f'work, customer returns, stock take &nbsp;&middot;&nbsp; ERP: job cards, '
+            f'production plan, samples/NPD, material documents, x-ray, readings. '
+            f'An account is listed only when all of them recorded nothing.</div>')
+    return out
+
+
 def _inr(v) -> str:
     import re
     if v is None or float(v) == 0:
@@ -792,9 +883,39 @@ def _counts(agg, ops) -> dict[str, str]:
 # ═════════════════════════════════════════════════════════════════════════
 #  MAIL BODY
 # ═════════════════════════════════════════════════════════════════════════
+def _idle_wrapper(idle, cap, scap, slim: bool) -> str:
+    """The idle block in the same shell the five module sections use.
+
+    It is deliberately NOT a sixth tab in the jump-nav: the nav counts work that
+    happened, and a link labelled with the number of people who did nothing sits
+    in that row as if it were another kind of output.
+    """
+    if idle is None:
+        return ""
+    t = IDLE
+    n = idle.get("idle", 0)
+    return (
+        f'<a name="sec-idle"></a>'
+        f'<div id="sec-idle" style="margin:0 0 26px;">'
+        f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr>'
+        f'<td style="background:{t["deep"]};color:#fff;padding:18px 20px;'
+        f'border-radius:10px 10px 0 0;'
+        f'font:700 {FS_SECTION}px Arial,Helvetica,sans-serif;">No activity today'
+        f'<span style="float:right;font-weight:400;font-size:{FS_H3}px;opacity:.92;">'
+        f'{e(n)}</span></td></tr></table>'
+        f'<div style="border:3px solid {t["deep"]};border-top:0;'
+        f'border-radius:0 0 10px 10px;background:#fff;padding:20px 20px 24px;">'
+        f'{_section_idle(idle, cap, scap, t, slim)}</div>'
+        f'<div style="text-align:right;margin:7px 2px 0;">'
+        f'<a href="#top" style="font:12.5px Arial,Helvetica,sans-serif;color:{GREY};'
+        f'text-decoration:none;">&uarr; back to top</a></div></div>'
+    )
+
+
 def render_email(day: date, agg, ops, generated: datetime, *,
                  revised: bool = False, view_url: str | None = None,
-                 gaps: list[dict] | None = None, _cap: int | None = None) -> str:
+                 gaps: list[dict] | None = None, idle: dict | None = None,
+                 _cap: int | None = None) -> str:
     """The mail body.
 
     Re-renders with fewer detail rows if the result approaches Gmail's clip limit.
@@ -857,6 +978,9 @@ def render_email(day: date, agg, ops, generated: datetime, *,
                f'text-decoration:none;">&uarr; back to top</a></div>')
             + '</div>'
         )
+
+    # Last, as asked — the report says what happened, then who did none of it.
+    body += _idle_wrapper(idle, cap, None if cap is None else max(cap * 3, 12), True)
 
     rev = ""
     if revised:
@@ -925,7 +1049,7 @@ def render_email(day: date, agg, ops, generated: datetime, *,
 
     if len(html.encode("utf-8")) > MAIL_SAFE_BYTES and cap > MAIL_MIN_ROW_CAP:
         return render_email(day, agg, ops, generated, revised=revised,
-                            view_url=view_url, gaps=gaps,
+                            view_url=view_url, gaps=gaps, idle=idle,
                             _cap=max(MAIL_MIN_ROW_CAP, cap - 3))
     return html
 
@@ -934,22 +1058,30 @@ def render_email(day: date, agg, ops, generated: datetime, *,
 #  HOSTED PAGE  (real tabs + search + pagination; JS is fine here)
 # ═════════════════════════════════════════════════════════════════════════
 def render_page(day: date, agg, ops, generated: datetime, *, revised: bool = False,
-                gaps: list[dict] | None = None) -> str:
+                gaps: list[dict] | None = None, idle: dict | None = None) -> str:
     sections = build_sections(agg, ops, None)      # no cap — every row
     counts = _counts(agg, ops)
     gcount = gap_counts(gaps)
+
+    # The page has room for a real tab, where the mail does not, so the idle
+    # block gets one here and stays a trailing block there.
+    page_tabs = list(TABS) + ([("idle", "No activity")] if idle is not None else [])
+    if idle is not None:
+        sections["idle"] = _section_idle(idle, None, None, IDLE, False)
+        counts["idle"] = f'{idle.get("idle", 0)}'
+        gcount["idle"] = 0
 
     tabs = "".join(
         f'<button class="tab" data-t="{k}" onclick="show(\'{k}\')">{e(l)}'
         f'<span class="cnt">{e(counts[k])}</span>'
         + (f'<span class="warn">{gcount[k]}</span>' if gcount[k] else "")
-        + '</button>' for k, l in TABS
+        + '</button>' for k, l in page_tabs
     )
     panels = "".join(
         f'<section class="panel" id="p-{k}"><div class="tools">'
         f'<input class="find" type="search" placeholder="Filter {e(l).lower()}…" '
         f'oninput="filt(this,\'{k}\')" aria-label="Filter {e(l)}">'
-        f'</div>{sections[k]}</section>' for k, l in TABS
+        f'</div>{sections[k]}</section>' for k, l in page_tabs
     )
 
     return f"""<!DOCTYPE html>

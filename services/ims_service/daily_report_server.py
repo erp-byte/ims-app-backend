@@ -32,6 +32,7 @@ from services.ims_service.daily_report import (
 )
 from services.ims_service.daily_report_ops import fetch_and_aggregate as ops_data
 from services.ims_service.daily_report_gaps import compute_gaps
+from services.ims_service.daily_report_users import compute_idle
 from services.ims_service.daily_report_html import render_email, render_page
 
 logger = get_logger("daily_report_server")
@@ -74,7 +75,8 @@ def view(day: str | None = Query(default=None, description="YYYY-MM-DD, defaults
     agg = aggregate(fetch(db, d))
     ops = ops_data(db, d)
     gaps = compute_gaps(db, d, agg, ops, canon_site=canon_wh)
-    return HTMLResponse(render_page(d, agg, ops, now_ist(), gaps=gaps))
+    return HTMLResponse(render_page(d, agg, ops, now_ist(), gaps=gaps,
+                                    idle=compute_idle(db, d)))
 
 
 @router.get("/email-preview", response_class=HTMLResponse)
@@ -88,7 +90,8 @@ def email_preview(day: str | None = Query(default=None),
     gaps = compute_gaps(db, d, agg, ops, canon_site=canon_wh)
     from services.ims_service.daily_report import view_url
     return HTMLResponse(render_email(d, agg, ops, now_ist(), revised=revised,
-                                     view_url=view_url(d), gaps=gaps))
+                                     view_url=view_url(d), gaps=gaps,
+                                     idle=compute_idle(db, d)))
 
 
 @router.get("/summary")
@@ -131,7 +134,22 @@ def summary(day: str | None = Query(default=None), db: Session = Depends(get_db)
         "total_lines": agg["val_gap"]["lines"],
         "warehouses": sorted(agg["wh"].keys()),
         "users": sorted(agg["usr"].keys()),
+        "no_activity": _idle_json(compute_idle(db, d)),
     }
+
+
+def _idle_json(idle: dict) -> dict:
+    """The idle block flattened for JSON — dates as strings, no nested objects."""
+    def rows(key):
+        return [{"name": r["name"], "last_active": str(r["last_active"]),
+                 "days_since": r["days_since"], "active_days": r["active_days"]}
+                for r in idle[key]]
+    return {"roster": idle["total"], "idle": idle["idle"],
+            "active": idle["active_count"], "unavailable": idle["unavailable"],
+            "failed_sources": idle["failed_sources"],
+            "regular": rows("regular"), "occasional": rows("occasional"),
+            "worked_today": [{"name": a["name"], "modules": a["modules"],
+                              "systems": a["systems"]} for a in idle["active"]]}
 
 
 @router.post("/send")

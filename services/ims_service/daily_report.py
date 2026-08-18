@@ -1,8 +1,17 @@
-"""Daily Inward & Transfer report — 2-page PDF, emailed at 19:00 IST.
+"""Daily Inward & Transfer report — emailed at 19:00 IST.
 
 WHAT IT REPORTS
-    Page 1  headline totals, warehouse-wise, user-wise, transfer routes
-    Page 2  inward warehouse x category, transfers route x category
+    The mail body is the report: five module sections (inward, transfers,
+    customer returns, job cards, samples/NPD) under an exception panel, and a
+    closing block naming everyone who took NO action in IMS or ERP that day —
+    see `daily_report_users`. The optional 2-page PDF (`build_pdf`, off by
+    default, still served from /daily-report/preview) carries the inward and
+    transfer tables only.
+
+RELATED MAILS
+    `stock_take_report`  the day's physical count, 19:00 IST, its own recipients
+    `weekly_report`      Monday 10:00 IST roll-ups of this and three other
+                         report streams, each to that stream's own list
 
 ATTRIBUTION — "user" is whoever KEYED the entry (the logged-in IMS user), never
 the purchase head / business head / approval authority:
@@ -53,6 +62,7 @@ from shared.timezone import IST, now_ist
 from shared.mail_identity import Module, SubjectPolicy, stamp
 from services.ims_service.daily_report_ops import fetch_and_aggregate as ops_data
 from services.ims_service.daily_report_gaps import compute_gaps
+from services.ims_service.daily_report_users import compute_idle
 from services.ims_service.daily_report_html import render_email, render_page
 
 logger = get_logger("daily_report")
@@ -466,7 +476,17 @@ def aggregate(data: dict) -> dict:
     }
 
 
-def fingerprint(agg: dict, ops: dict | None = None) -> str:
+# Bumped whenever the fingerprint gains or loses a component. The morning job
+# decides "were there late entries?" by comparing today's signature to the one
+# stored at 19:00, and after a format change those two strings differ for a
+# reason that has nothing to do with the data. Without a version to detect that,
+# the first run after every such deploy mails everyone a report banner-headed
+# "REVISED — entries were recorded after the 7:00 PM cut-off", which is simply
+# untrue. v2 added the idle-user block.
+FP_VERSION = "v2"
+
+
+def fingerprint(agg: dict, ops: dict | None = None, idle: dict | None = None) -> str:
     """Stable signature of the reported figures.
 
     The morning job re-runs the day and compares this to what was sent at 19:00;
@@ -485,6 +505,7 @@ def fingerprint(agg: dict, ops: dict | None = None) -> str:
     """
     h = agg["head"]
     parts = [
+        FP_VERSION,
         f"i:{h['inw_txns']}:{h['inw_m'].kg:.2f}:{sorted(h['inw_m'].qty.items())}:{h['inw_val']:.2f}",
         f"o:{h['out_chl']}:{h['out_m'].kg:.2f}:{sorted(h['out_m'].qty.items())}",
         f"n:{h['in_grn']}:{h['in_m'].kg:.2f}:{sorted(h['in_m'].qty.items())}",
@@ -500,6 +521,17 @@ def fingerprint(agg: dict, ops: dict | None = None) -> str:
                      f"{jw['in_receipts']}:{jw['in_fg_kg']:.2f}:{jw['in_waste_kg']:.2f}")
         parts.append(f"c:{cr['total_crs']}:{cr['total_kg']:.2f}:{cr['total_value']:.2f}:"
                      f"{sorted(cr['by_status'].items())}")
+    if idle and not idle.get("unavailable"):
+        # WHO is idle, not just how many: if one person starts work after the
+        # cut-off and another is added to the roster, the counts can land back
+        # where they started while the named list has changed completely.
+        #
+        # Safe to fingerprint, unlike the exception panel, because every input
+        # is pinned to the business day — the roster window is [day-30, day], so
+        # re-running the same day tomorrow reads exactly the same rows.
+        names = ",".join(sorted(r["name"] for r in
+                                idle["regular"] + idle["occasional"]))
+        parts.append(f"u:{idle['idle']}:{idle['active_count']}:{idle['total']}:{names}")
     return "|".join(parts)
 
 
@@ -813,8 +845,30 @@ def _plain_gaps(gaps: list[dict]) -> list[str]:
     return out
 
 
+def _plain_idle(idle: dict | None) -> list[str]:
+    """The idle-user block as text, with the same two tiers as the HTML."""
+    if not idle or idle.get("unavailable"):
+        return ["NO ACTIVITY TODAY: user activity could not be read."]
+    out = [f"NO ACTIVITY TODAY - {idle['idle']} of {idle['total']} user accounts "
+           f"({idle['active_count']} worked)"]
+    if idle["regular"]:
+        out.append("  Regular users: " + ", ".join(
+            f"{r['name']} (last {r['last_active']:%d %b}, {r['days_since']}d)"
+            for r in idle["regular"]))
+    else:
+        out.append("  Regular users: every one of them did something today.")
+    if idle["occasional"]:
+        out.append("  Occasional users: " + ", ".join(
+            f"{r['name']} ({r['days_since']}d)" for r in idle["occasional"]))
+    if idle.get("dormant"):
+        out.append("  No activity at all in 30 days: " + ", ".join(
+            r["name"] for r in idle["dormant"]))
+    return out
+
+
 def _plain_summary(day: date, agg: dict, ops: dict, revised: bool,
-                   gaps: list[dict] | None = None) -> str:
+                   gaps: list[dict] | None = None,
+                   idle: dict | None = None) -> str:
     """Text alternative. Clients that refuse HTML still get the day's numbers."""
     h, vg = agg["head"], agg["val_gap"]
     jc, sm = ops["jobcards"], ops["samples"]
@@ -864,6 +918,7 @@ def _plain_summary(day: date, agg: dict, ops: dict, revised: bool,
         "", "SAMPLES / NPD",
         f"  {len(sm['requisitions'])} requisitions | {len(sm['actions'])} actions | "
         f"{len(sm['npd_jobcards'])} NPD job cards | {len(sm['customers'])} customers",
+        "", *_plain_idle(idle),
     ]
     url = view_url(day)
     if url:
@@ -1046,7 +1101,8 @@ def send_report(day: date, *, kind: str, revised: bool = False,
         ensure_log_table(db)
         agg = aggregate(fetch(db, day))
         ops = ops_data(db, day)
-        fp = fingerprint(agg, ops)
+        idle = compute_idle(db, day)
+        fp = fingerprint(agg, ops, idle)
 
         if skip_if_empty and is_quiet(agg, ops):
             _log(db, day, kind, "skipped_empty", fp)
@@ -1068,9 +1124,9 @@ def send_report(day: date, *, kind: str, revised: bool = False,
 
         generated = now_ist()
         gaps = compute_gaps(db, day, agg, ops, canon_site=canon_wh)
-        html = render_email(day, agg, ops, generated,
-                            revised=revised, view_url=view_url(day), gaps=gaps)
-        plain = _plain_summary(day, agg, ops, revised, gaps)
+        html = render_email(day, agg, ops, generated, revised=revised,
+                            view_url=view_url(day), gaps=gaps, idle=idle)
+        plain = _plain_summary(day, agg, ops, revised, gaps, idle)
         # The first send of a day owns the thread anchor; anything after it replies
         # into that same conversation.
         anchor = day_anchor(day)
@@ -1132,7 +1188,7 @@ def run_morning_revision() -> dict:
         prev = _last_sent(db, day)
         agg = aggregate(fetch(db, day))
         ops = ops_data(db, day)
-        fp = fingerprint(agg, ops)
+        fp = fingerprint(agg, ops, compute_idle(db, day))
 
         if prev is None:
             if is_quiet(agg, ops) and day.weekday() == 6:
@@ -1140,6 +1196,17 @@ def run_morning_revision() -> dict:
                 return {"day": str(day), "status": "skipped_empty", "sent": False}
             logger.warning("No evening report was sent for %s — sending catch-up now", day)
             return send_report(day, kind="catchup", db=db)
+
+        if not prev[0].startswith(f"{FP_VERSION}|"):
+            # The stored signature predates the current format, so the two are
+            # not comparable and a difference proves nothing. Saying nothing is
+            # the only honest option: claiming a revision would assert late
+            # entries that may not exist, and today's send re-anchors the day.
+            _log(db, day, "revision", "skipped_format_change", fp)
+            logger.info("Fingerprint format changed since %s was sent — "
+                        "cannot tell late entries from a format change, "
+                        "so no revision is sent", day)
+            return {"day": str(day), "status": "skipped_format_change", "sent": False}
 
         if prev[0] != fp:
             logger.info("Figures for %s changed after the 19:00 cut-off — sending revision", day)

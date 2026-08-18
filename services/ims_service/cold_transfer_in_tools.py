@@ -21,6 +21,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from shared.logger import get_logger
+
+logger = get_logger("ims.cold_transfer_in")
+
 
 # ── Cold-destination routing ────────────────────────────────────────────
 COLD_DESTINATIONS = {"savla d-39", "savla d-514", "rishi", "supreme", "eskimo"}
@@ -239,8 +243,24 @@ def finalize_cold_transfer_in(
     }
 
     hdr = db.execute(text(
-        "SELECT id, transfer_out_id, to_site FROM cold_transfer_in_headers WHERE id = :hid"
+        "SELECT id, transfer_out_id, to_site, status FROM cold_transfer_in_headers WHERE id = :hid"
     ), {"hid": header_id}).fetchone()
+
+    # A finished receipt is finished. The per-box guard in _process_box_loop catches a
+    # replay of the SAME payload, but the TX-In page re-runs Generate-QR before submit,
+    # so a re-click arrives carrying FRESH {epoch}-{n} box_ids that match neither the
+    # recorded boxes nor the cold_stocks UNIQUE (transaction_no, box_id) — and every one
+    # of them would be inserted again, doubling the header's boxes and the destination's
+    # cold stock. Refuse instead, with the reason, rather than silently duplicating.
+    if hdr and (hdr._mapping.get("status") or "").strip().lower() == "received":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cold receipt {header_id} is already fully received. "
+                "Re-finalizing would duplicate its boxes and cold stock. "
+                "Delete the receipt first if it needs to be redone."
+            ),
+        )
 
     if hdr:
         transfer_out_id = hdr._mapping["transfer_out_id"]
@@ -610,7 +630,27 @@ def _process_box_loop(
         )
 
     inserted = 0
+    # Boxes that consumed no real pending row — only these may claim a LINE- sentinel
+    # in the sweep below (a box that already deleted its own pending row must not
+    # also retire a sentinel, or one physical box would discharge two units).
+    unmatched = 0
     for b in boxes:
+        # Idempotency: finalize is documented as re-callable ("Idempotent on resume"),
+        # and the hdr-exists branch UPDATEs the header then falls straight through to
+        # this loop without clearing prior boxes. A bare INSERT therefore duplicated
+        # every box — and its <company>_cold_stocks row — on a second submit. The
+        # cold_stocks UNIQUE (transaction_no, box_id) is not a backstop here: the TX-In
+        # page regenerates fresh {epoch}-{n} ids before submit, so a replay carries new
+        # ids and slips past it. Skip anything this header already recorded.
+        if db.execute(text("""
+            SELECT 1 FROM cold_transfer_inboxes
+            WHERE header_id = :hid AND box_id = :bid
+              AND COALESCE(transaction_no, '') = COALESCE(:txn, '')
+            LIMIT 1
+        """), {"hid": header_id, "bid": b.box_id, "txn": b.transaction_no}).fetchone():
+            logger.info("COLD_IN: header=%s box=%s already recorded — skipping re-insert",
+                        header_id, b.box_id)
+            continue
         # Match the pending row by the PHYSICAL box identity (box_id + transaction_no) —
         # those uniquely identify a scanned box. lot_no is only a tiebreaker, NOT a hard
         # filter: the cold receive lets the user set a different cold lot per item, so the
@@ -721,6 +761,8 @@ def _process_box_loop(
                 text("DELETE FROM pending_transfer_stock WHERE id = :pid"),
                 {"pid": pending._mapping["id"]},
             )
+        else:
+            unmatched += 1
 
         inserted += 1
 
@@ -729,13 +771,54 @@ def _process_box_loop(
     # on Generate-QR click) but they still occupy `pending_transfer_stock`,
     # which would freeze the header at "Partially Received". Mirrors
     # pending_stock_tools.pick_from_pending Phase 1.
-    if inserted > 0 and transfer_out_id is not None:
-        db.execute(text("""
-            DELETE FROM pending_transfer_stock
-            WHERE transfer_out_id = :oid
-              AND status = 'In Transit'
-              AND COALESCE(box_id, '') LIKE 'LINE-%'
-        """), {"oid": transfer_out_id})
+    #
+    # BOUNDED to the boxes actually received. This used to clear every sentinel for
+    # the transfer the moment one box landed. For a warehouse->cold transfer that is
+    # catastrophic: warehouse sources have no per-box stock, so park_lines_in_pending
+    # is the ONLY parker and EVERY pending row is a sentinel — receiving 1 box of 100
+    # deleted all 100, _reconcile_statuses saw pending_remaining = 0 and stamped both
+    # headers 'Received', and the 99 unreceived units vanished from the in-transit
+    # ledger with no shortage record and no way to receive them.
+    #
+    # The interunit side already holds this invariant two ways: _claimed_pending_box_ids
+    # hands out "at most as many sentinels as that article has unclaimed boxes", and
+    # count_remaining_in_transit excludes LINE- rows from the completion gate. Match it
+    # here: a partial receipt retires a partial set and the shortfall stays on the bridge.
+    if unmatched > 0 and transfer_out_id is not None:
+        swept = 0
+        want: Dict[str, int] = {}
+        for b in boxes:
+            key = (b.item_description or "").strip().upper()
+            want[key] = want.get(key, 0) + 1
+        # Prefer sentinels of the same article, so a mixed consignment discharges the
+        # line the operator actually received against.
+        for article, n in want.items():
+            if swept >= unmatched:
+                break
+            res = db.execute(text("""
+                DELETE FROM pending_transfer_stock
+                WHERE id IN (
+                    SELECT id FROM pending_transfer_stock
+                    WHERE transfer_out_id = :oid AND status = 'In Transit'
+                      AND COALESCE(box_id, '') LIKE 'LINE-%'
+                      AND UPPER(TRIM(COALESCE(article, ''))) = :article
+                    ORDER BY id LIMIT :n
+                )
+            """), {"oid": transfer_out_id, "article": article,
+                   "n": min(n, unmatched - swept)})
+            swept += res.rowcount or 0
+        # Articles that matched no sentinel still consumed a unit of the consignment
+        # (blank/renamed article on the line) — take the remainder oldest-first.
+        if swept < unmatched:
+            db.execute(text("""
+                DELETE FROM pending_transfer_stock
+                WHERE id IN (
+                    SELECT id FROM pending_transfer_stock
+                    WHERE transfer_out_id = :oid AND status = 'In Transit'
+                      AND COALESCE(box_id, '') LIKE 'LINE-%'
+                    ORDER BY id LIMIT :n
+                )
+            """), {"oid": transfer_out_id, "n": unmatched - swept})
 
     return inserted
 

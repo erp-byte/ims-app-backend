@@ -432,8 +432,14 @@ def edit_cold_transfer_out_endpoint(
 @router.delete("/cold-transfer-out/{header_id}")
 def delete_cold_transfer_out_endpoint(
     header_id: int,
+    user_email: str = Query(..., description="Email of user performing delete"),
+    user_role: str = Query("", description="Role of user (admin/developer bypass allowlist)"),
     db: Session = Depends(get_db),
 ):
+    # Was completely unguarded while its sibling DELETE /transfers/{id} required the
+    # allowlist — and this one reverses receipts, restores every pending row to source
+    # and drops the header, lines and boxes. Same check, same shape as the sibling.
+    _check_delete_permission(user_email, user_role)
     return delete_cold_transfer_out(db, header_id)
 
 

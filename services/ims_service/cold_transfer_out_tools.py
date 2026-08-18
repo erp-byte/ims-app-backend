@@ -113,6 +113,102 @@ class ColdTransferOutCreateResponse(BaseModel):
     boxes_parked: int
 
 
+# Lot values that mean "this pile has no lot". The cold form posts a real null on
+# lines but the literal string 'N/A' on boxes for the same pile, so the two sides
+# have to be normalised to one thing before they can be compared.
+_NULLISH_LOT = {"", "N/A", "NA", "NONE", "NULL", "-"}
+
+
+def _line_key(item_desc: Optional[str], lot: Optional[str]) -> tuple:
+    """The identity of a transfer line: one row per (article, lot).
+
+    Every mapping in this module — `line_id_by_key`, the box→line lookup, and the
+    uncovered-qty reconciler — has to agree on this pair, or boxes silently
+    attach to the wrong line. They previously disagreed twice: the box lookup
+    compared case-sensitively while the reconciler upper-cased, and lot-less cold
+    stock arrives as null on lines but 'N/A' on boxes, so it never matched and
+    every such box fell through to `fallback_line_id`.
+    """
+    lot_norm = (lot or "").strip()
+    if lot_norm.upper() in _NULLISH_LOT:
+        lot_norm = ""
+    return ((item_desc or "").strip().upper(), lot_norm.upper())
+
+
+def _coalesce_lines(
+    lines: List["ColdOutLineInput"],
+    boxes: List["ColdOutBoxInput"],
+) -> List["ColdOutLineInput"]:
+    """Collapse posted lines to one row per (article, lot), with boxes authoritative.
+
+    `interunit_transfers_lines` carries one row per (article, lot) — the grain
+    `line_id_by_key` and `_apply_box_totals` both assume. A client that posts one
+    line PER BOX inserts N rows sharing a single key: the last wins the mapping,
+    the rest are orphaned, and `_apply_box_totals` (which only rewrites lines that
+    own boxes) leaves those orphans holding whatever qty the client stamped on
+    them, forever.
+
+    TRANS202608171318 shipped 100 boxes of 2 articles and listed Qty 198 — the 2
+    mapped lines were corrected to 60+40 by their boxes, and 98 orphan rows kept
+    the per-box `quantity_units` the cold form had written onto each. The same 98
+    then leaked into pending_transfer_stock as phantom 'LINE-' sentinels, because
+    the uncovered-qty reconciler below budgets real boxes against SUM(qty).
+
+    Two rules, enforced here so they hold for ANY caller — including older
+    frontend builds still posting per-box lines:
+      1. one line per key, qty and weights summed;
+      2. where boxes exist for a key, the BOX COUNT wins over the posted qty —
+         the same principle `_apply_box_totals` applies after insert. Enforcing it
+         *before* insert is what keeps the reconciler's arithmetic honest.
+    A key with no boxes keeps its typed qty: that is the weight-only / manually
+    entered cold row the 'never-drop manual entries' branch deliberately parks.
+    """
+    box_counts: Dict[tuple, int] = {}
+    for b in boxes:
+        bkey = _line_key(b.item_description, b.lot_no)
+        box_counts[bkey] = box_counts.get(bkey, 0) + 1
+
+    merged: Dict[tuple, "ColdOutLineInput"] = {}
+    order: List[tuple] = []
+    for line in lines:
+        key = _line_key(line.item_desc_raw, line.lot_number)
+        current = merged.get(key)
+        if current is None:
+            merged[key] = line.model_copy(deep=True)
+            order.append(key)
+            continue
+        current.qty = (current.qty or 0) + (line.qty or 0)
+        current.net_weight = (current.net_weight or 0) + (line.net_weight or 0)
+        current.total_weight = (current.total_weight or 0) + (line.total_weight or 0)
+        # Descriptors are per-article, so the first non-empty value stands in for
+        # the merged row rather than the last one overwriting it with a blank.
+        for attr in ("uom", "batch_number", "rm_pm_fg_type",
+                     "item_category", "sub_category"):
+            if not getattr(current, attr, None):
+                setattr(current, attr, getattr(line, attr, None))
+        for attr in ("pack_size", "unit_pack_size"):
+            if not getattr(current, attr, 0):
+                setattr(current, attr, getattr(line, attr, 0))
+
+    for key in order:
+        line = merged[key]
+        n_boxes = box_counts.get(key)
+        if n_boxes and float(line.qty or 0) != float(n_boxes):
+            logger.info(
+                "COLD_LINE_QTY_FROM_BOXES: %r lot=%r qty %s -> %s (scanned boxes win)",
+                line.item_desc_raw, line.lot_number, line.qty, n_boxes,
+            )
+            line.qty = float(n_boxes)
+
+    if len(order) < len(lines):
+        logger.warning(
+            "COLD_LINES_COALESCED: %d posted lines collapsed to %d (article, lot) "
+            "rows — caller is posting one line per box.",
+            len(lines), len(order),
+        )
+    return [merged[k] for k in order]
+
+
 def totals_by_line(box_rows) -> Dict[int, Dict[str, float]]:
     """Fold (transfer_line_id, net, gross) box rows into per-line qty and weight.
 
@@ -284,6 +380,9 @@ def create_cold_transfer_out(
                 lot_number=lot_no or None,
             ))
 
+    # One row per (article, lot), box count authoritative — see _coalesce_lines.
+    derived_lines = _coalesce_lines(derived_lines, payload.boxes)
+
     # Insert lines + remember (item, lot) → line_id so boxes can FK back.
     line_id_by_key: Dict[tuple, int] = {}
     for line in derived_lines:
@@ -315,10 +414,7 @@ def create_cold_transfer_out(
                 "batch_number": line.batch_number or "",
             },
         ).fetchone()
-        line_id_by_key[(
-            (line.item_desc_raw or "").strip(),
-            (line.lot_number or "").strip(),
-        )] = row.id
+        line_id_by_key[_line_key(line.item_desc_raw, line.lot_number)] = row.id
 
     fallback_line_id = next(iter(line_id_by_key.values()), None)
 
@@ -337,11 +433,9 @@ def create_cold_transfer_out(
                 ),
             )
         seen.add(key)
-        line_key = (
-            (box.item_description or "").strip(),
-            (box.lot_no or "").strip(),
+        line_id = line_id_by_key.get(
+            _line_key(box.item_description, box.lot_no), fallback_line_id
         )
-        line_id = line_id_by_key.get(line_key, fallback_line_id)
         box_assignments.append((line_id, box.weight_kg, box.weight_kg))
         box_idx += 1
         db.execute(
@@ -386,17 +480,17 @@ def create_cold_transfer_out(
     # no extra cold_stocks deduction beyond what the parked boxes already did).
     _covered: dict = {}
     for _b in payload.boxes:
-        _k = ((_b.item_description or "").strip().upper(), (_b.lot_no or "").strip())
+        _k = _line_key(_b.item_description, _b.lot_no)
         _covered[_k] = _covered.get(_k, 0) + 1
     _uncovered = []
     for _l in derived_lines:
-        _k = ((_l.item_desc_raw or "").strip().upper(), (_l.lot_number or "").strip())
+        _k = _line_key(_l.item_desc_raw, _l.lot_number)
         _qty = int(getattr(_l, "qty", 0) or 0)
         _take = min(_qty, _covered.get(_k, 0))
         _covered[_k] = _covered.get(_k, 0) - _take
         if _qty - _take > 0:
             _uncovered.append(SimpleNamespace(
-                id=line_id_by_key.get(((_l.item_desc_raw or "").strip(), (_l.lot_number or "").strip())),
+                id=line_id_by_key.get(_line_key(_l.item_desc_raw, _l.lot_number)),
                 item_desc_raw=_l.item_desc_raw, qty=_qty - _take,
                 net_weight=getattr(_l, "net_weight", 0) or 0,
                 total_weight=getattr(_l, "total_weight", 0) or 0,
@@ -514,6 +608,9 @@ def edit_cold_transfer_out(
                 lot_number=lot_no or None,
             ))
 
+    # One row per (article, lot), box count authoritative — see _coalesce_lines.
+    derived_lines = _coalesce_lines(derived_lines, payload.boxes)
+
     line_id_by_key: Dict[tuple, int] = {}
     for line in derived_lines:
         row = db.execute(
@@ -544,10 +641,7 @@ def edit_cold_transfer_out(
                 "batch_number": line.batch_number or "",
             },
         ).fetchone()
-        line_id_by_key[(
-            (line.item_desc_raw or "").strip(),
-            (line.lot_number or "").strip(),
-        )] = row.id
+        line_id_by_key[_line_key(line.item_desc_raw, line.lot_number)] = row.id
 
     fallback_line_id = next(iter(line_id_by_key.values()), None)
 
@@ -563,11 +657,9 @@ def edit_cold_transfer_out(
                 f"Duplicate box_id '{box.box_id}' for transaction '{box.transaction_no}'.",
             )
         seen.add(key)
-        line_key = (
-            (box.item_description or "").strip(),
-            (box.lot_no or "").strip(),
+        line_id = line_id_by_key.get(
+            _line_key(box.item_description, box.lot_no), fallback_line_id
         )
-        line_id = line_id_by_key.get(line_key, fallback_line_id)
         box_assignments.append((line_id, box.weight_kg, box.weight_kg))
         box_idx += 1
         db.execute(
@@ -609,17 +701,17 @@ def edit_cold_transfer_out(
     # Never-drop manual entries (mixed scan + manual) on edit too.
     _covered: dict = {}
     for _b in payload.boxes:
-        _k = ((_b.item_description or "").strip().upper(), (_b.lot_no or "").strip())
+        _k = _line_key(_b.item_description, _b.lot_no)
         _covered[_k] = _covered.get(_k, 0) + 1
     _uncovered = []
     for _l in derived_lines:
-        _k = ((_l.item_desc_raw or "").strip().upper(), (_l.lot_number or "").strip())
+        _k = _line_key(_l.item_desc_raw, _l.lot_number)
         _qty = int(getattr(_l, "qty", 0) or 0)
         _take = min(_qty, _covered.get(_k, 0))
         _covered[_k] = _covered.get(_k, 0) - _take
         if _qty - _take > 0:
             _uncovered.append(SimpleNamespace(
-                id=line_id_by_key.get(((_l.item_desc_raw or "").strip(), (_l.lot_number or "").strip())),
+                id=line_id_by_key.get(_line_key(_l.item_desc_raw, _l.lot_number)),
                 item_desc_raw=_l.item_desc_raw, qty=_qty - _take,
                 net_weight=getattr(_l, "net_weight", 0) or 0,
                 total_weight=getattr(_l, "total_weight", 0) or 0,

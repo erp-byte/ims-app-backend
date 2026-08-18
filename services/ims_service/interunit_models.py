@@ -312,6 +312,10 @@ class TransferListItem(TransferHeaderResponse):
     boxes_count: int = 0
     total_qty: int = 0
     pending_items: int = 0
+    # list_transfers aggregates this so both list pages can search by lot number
+    # (searchMatch(..., [... "lot_numbers_text"])). Undeclared, response_model
+    # silently dropped it from every response and that search always missed.
+    lot_numbers_text: str = ""
 
 
 class TransferListResponse(BaseModel):

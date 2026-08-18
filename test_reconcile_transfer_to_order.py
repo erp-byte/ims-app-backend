@@ -227,6 +227,110 @@ def test_backfill_dry_run_is_readonly_and_corrects():
     print("PASS test_backfill_dry_run_is_readonly_and_corrects")
 
 
+def _db_cold(ordered_rows, parked_rows, cold_by_table=None,
+             interunit_received=0, cold_received=0, box_rows=None):
+    """Like _db, but can answer the COLD receipt ledger and the dispatch's box rows.
+
+    The cold receive path writes cold_transfer_in_headers/cold_transfer_inboxes and
+    then DELETEs the interunit staging rows, so `interunit_received=0` alongside
+    `cold_received>0` is the real post-cold-receive shape.
+    """
+    cold_by_table = cold_by_table or {}
+    pulls = []
+    class DB:
+        pulls_log = pulls
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if "to_regclass" in sql: return Res(scalar="x")
+            if "FROM interunit_transfers_header WHERE id" in sql:
+                return Res(rows=[_hdr_row()])
+            if "cold_transfer_inboxes" in sql:
+                return Res(scalar=cold_received)
+            if "interunit_transfer_in_boxes" in sql:
+                return Res(scalar=interunit_received)
+            if "FROM interunit_transfer_boxes" in sql:          # dispatch box rows
+                return Res(rows=box_rows or [])
+            if "FROM interunit_transfers_lines" in sql:
+                return Res(rows=ordered_rows)
+            if "SELECT * FROM pending_transfer_stock" in sql:
+                return Res(rows=parked_rows)
+            for tbl, rows in cold_by_table.items():
+                if f"FROM {tbl}" in sql and "lot_no" in sql:
+                    pulls.append(tbl)
+                    return Res(rows=rows)
+            return Res()
+    return DB()
+
+
+def test_reconcile_skips_when_only_the_COLD_ledger_knows_about_the_receipt():
+    """The cold receive purges the interunit staging rows this guard used to read.
+
+    Seeing received=0, reconcile fell into the cold branch and pulled real
+    cold_stocks rows to close a shortfall the receipt itself had created."""
+    db = _db_cold(
+        [SimpleNamespace(lot_no="125320", item_description="DATES", ordered=100)],
+        [_prow("125320", i) for i in range(40)],          # 60 received, 40 still parked
+        cold_by_table={"cdpl_cold_stocks": [_coldrow("125320", i) for i in range(60)]},
+        interunit_received=0, cold_received=60,
+    )
+    rep = P.reconcile_transfer_to_order(1, db, dry_run=True)
+    assert rep.get("skipped_receiving_in_progress") is True, rep
+    assert rep["received"] == 60, rep
+    assert rep["allocated"] == 0, rep
+    assert db.pulls_log == [], f"must not touch cold_stocks, but read: {db.pulls_log}"
+    print("PASS test_reconcile_skips_when_only_the_COLD_ledger_knows_about_the_receipt")
+
+
+def test_reconcile_cold_uses_dispatch_box_rows_not_inflated_qty_sum():
+    """The 198-for-100-boxes shape: SUM(qty)=198 but 100 real boxes shipped.
+
+    Reading 198 as 'ordered' made reconcile pull 98 unrelated in-store rows out of
+    cold_stocks to close a shortfall that never existed."""
+    db = _db_cold(
+        [SimpleNamespace(lot_no="L1", item_description="DATES", ordered=120),
+         SimpleNamespace(lot_no="L2", item_description="DATES", ordered=78)],   # 198
+        [_prow("L1", i) for i in range(60)] + [_prow("L2", 100 + i) for i in range(40)],
+        cold_by_table={"cdpl_cold_stocks": [_coldrow("L1", i) for i in range(98)]},
+        box_rows=[SimpleNamespace(lot_no="L1", n=60), SimpleNamespace(lot_no="L2", n=40)],
+    )
+    rep = P.reconcile_transfer_to_order(1, db, dry_run=True)
+    assert rep["total_ordered"] == 100, f"box rows must win over SUM(qty): {rep}"
+    assert rep["pulled_ordered"] == 0, f"nothing to top up: {rep}"
+    assert rep["unallocated"] == 0, rep
+    assert db.pulls_log == [], f"must not touch cold_stocks, but read: {db.pulls_log}"
+    print("PASS test_reconcile_cold_uses_dispatch_box_rows_not_inflated_qty_sum")
+
+
+def test_reconcile_cold_keeps_typed_qty_for_a_lot_with_no_boxes():
+    """A weight-only / manually typed cold row has no box rows — its qty is all
+    there is, so it must NOT be zeroed out by the box-count override."""
+    db = _db_cold(
+        [SimpleNamespace(lot_no="L1", item_description="DATES", ordered=12)],
+        [],
+        cold_by_table={"cdpl_cold_stocks": [_coldrow("L1", i) for i in range(12)]},
+        box_rows=[],                                     # no scanned boxes at all
+    )
+    rep = P.reconcile_transfer_to_order(1, db, dry_run=True)
+    assert rep["total_ordered"] == 12, f"typed qty must stand: {rep}"
+    print("PASS test_reconcile_cold_keeps_typed_qty_for_a_lot_with_no_boxes")
+
+
+def test_received_box_count_sums_both_ledgers():
+    db = _db_cold([], [], interunit_received=3, cold_received=7)
+    assert P._received_box_count(db, 1) == 10
+
+
+def test_received_box_count_fails_closed_on_error():
+    """Guessing 0 would let the caller pull and DELETE cold stock."""
+    class DB:
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if "to_regclass" in sql: return Res(scalar="x")
+            raise RuntimeError("connection reset")
+    assert P._received_box_count(DB(), 1) >= 1, "must report receiving-in-progress"
+    print("PASS test_received_box_count_fails_closed_on_error")
+
+
 ALL = [
     test_find_available_cold_by_lot_returns_fifo_rows,
     test_find_available_cold_by_lot_zero_limit_is_noop,
@@ -239,6 +343,11 @@ ALL = [
     test_reconcile_warehouse_uses_box_count_not_qty_sum,
     test_in_transit_by_lot_groups_and_filters,
     test_backfill_dry_run_is_readonly_and_corrects,
+    test_reconcile_skips_when_only_the_COLD_ledger_knows_about_the_receipt,
+    test_reconcile_cold_uses_dispatch_box_rows_not_inflated_qty_sum,
+    test_reconcile_cold_keeps_typed_qty_for_a_lot_with_no_boxes,
+    test_received_box_count_sums_both_ledgers,
+    test_received_box_count_fails_closed_on_error,
 ]
 
 if __name__ == "__main__":

@@ -2912,10 +2912,107 @@ def finalize_transfer_in(header_id: int, data: FinalizeTransferIn, db: Session) 
     return result
 
 
+def _art_key(row) -> str:
+    """Article of a row, however that column happens to be named."""
+    return ((getattr(row, "article", None) or getattr(row, "item_description", None) or "")
+            .strip().lower())
+
+
+def _claimed_pending_box_ids(db: Session, header_id: int, transfer_out_id) -> set:
+    """The in-transit rows THIS GRN actually accounts for, matched box by box.
+
+    Counting was never evidence. `acked >= in_transit` compares a tally of boxes
+    that ARRIVED against a tally of boxes that DID NOT, so on GRN-20260411173112
+    it read 27 >= 2 and called a 29-box dispatch complete while two cartons were
+    still outstanding. Worse, it is self-triggering: a partial finalize picks the
+    acknowledged rows, the in-transit figure shrinks, and the comparison turns
+    true on its own. Across the live backlog that heuristic stood to post 633
+    box rows whose ids appear nowhere on their receipt.
+
+    A received box claims a parked row three ways, in descending order of certainty:
+
+      1. same box_id — the ordinary flow, where the sticker scanned is the one
+         dispatched.
+      2. through transfer_out_box_id -> interunit_transfer_boxes.box_id — the FK
+         survives where the received id does not (a relabel).
+      3. a LINE-<line>-<n> sentinel of the same article — the quantity-only flow.
+         park_lines_in_pending invents that id and the receive screen mints an
+         unrelated one, so the article is the ONLY link that exists.
+
+    (3) hands out at most as many sentinels as that article has unclaimed boxes,
+    so a partial receipt claims a partial set and the shortfall stays on the bridge.
+
+    Deliberately NOT claimed: two REAL ids that merely differ with no FK between
+    them. Matching those by article would be inventing an inventory identity —
+    that is STBR's job. Such a row stays In Transit, which is visible and
+    recoverable; silently posting it would not be.
+    """
+    grn = db.execute(
+        text("SELECT box_id, article, transfer_out_box_id "
+             "FROM interunit_transfer_in_boxes WHERE header_id = :hid"),
+        {"hid": header_id},
+    ).fetchall()
+    if not grn:
+        return set()
+    pending = db.execute(
+        text("SELECT box_id, article, item_description FROM pending_transfer_stock "
+             "WHERE transfer_out_id = :tid AND status = 'In Transit'"),
+        {"tid": transfer_out_id},
+    ).fetchall()
+    if not pending:
+        return set()
+    live = {p.box_id for p in pending if getattr(p, "box_id", None)}
+
+    dispatch: dict = {}
+    if any(getattr(g, "transfer_out_box_id", None) for g in grn):
+        dispatch = {r.id: r.box_id for r in db.execute(
+            text("SELECT id, box_id FROM interunit_transfer_boxes WHERE header_id = :tid"),
+            {"tid": transfer_out_id},
+        ).fetchall()}
+
+    claimed: set = set()
+    unclaimed: list = []
+    for g in grn:
+        bid = (getattr(g, "box_id", None) or "").strip()
+        if bid and bid in live:
+            claimed.add(bid)
+            continue
+        mapped = dispatch.get(getattr(g, "transfer_out_box_id", None))
+        if mapped and mapped in live:
+            claimed.add(mapped)
+            continue
+        unclaimed.append(g)
+    if not unclaimed:
+        return claimed
+
+    # Sorted so the allocation is deterministic across runs and re-runs.
+    sentinels: dict = {}
+    for p in sorted(pending, key=lambda r: (getattr(r, "box_id", None) or "")):
+        bid = getattr(p, "box_id", None) or ""
+        if bid in claimed or not bid.startswith("LINE-"):
+            continue
+        sentinels.setdefault(_art_key(p), []).append(bid)
+
+    need: dict = {}
+    for g in unclaimed:
+        need[_art_key(g)] = need.get(_art_key(g), 0) + 1
+    for article, count in need.items():
+        for bid in sentinels.get(article, [])[:count]:
+            claimed.add(bid)
+    return claimed
+
+
 def _autofinalize_if_complete(db: Session, header_id: int) -> bool:
-    """Auto-finalize a Pending transfer-in once its acknowledged boxes cover every box
-    still in transit for the dispatch. Fixes the 'acknowledged but never finalized' gap
-    that left a fully-received transfer stuck in the Pending modal as 'Partial (GRN raised)'.
+    """Auto-finalize a Pending transfer-in once its acknowledged boxes account for
+    every row still in transit for the dispatch. Fixes the 'acknowledged but never
+    finalized' gap that left a fully-received transfer stuck in the Pending modal as
+    'Partial (GRN raised)'.
+
+    Completeness is decided BOX BY BOX (see _claimed_pending_box_ids), not by
+    comparing counts. A GRN that leaves any in-transit row unclaimed stays Pending,
+    so the shortfall remains visible and receivable rather than being posted as
+    stock nobody received.
+
     Returns True if it finalized. Caller owns the surrounding transaction/commit."""
     h = db.execute(
         text("SELECT id, status, transfer_out_id FROM interunit_transfer_in_header WHERE id = :hid"),
@@ -2932,7 +3029,8 @@ def _autofinalize_if_complete(db: Session, header_id: int) -> bool:
              "WHERE transfer_out_id = :tid AND status = 'In Transit'"),
         {"tid": h.transfer_out_id},
     ).scalar() or 0
-    if acked > 0 and in_transit > 0 and acked >= in_transit:
+    claimed = _claimed_pending_box_ids(db, header_id, h.transfer_out_id) if in_transit else set()
+    if acked > 0 and in_transit > 0 and len(claimed) >= in_transit:
         # SAVEPOINT-isolate the finalize: it does multiple writes (header->Received,
         # pick_from_pending, transfer-out->Received). If any step fails, roll back ONLY
         # the finalize so the acknowledgement that triggered it still commits — never
@@ -2940,8 +3038,9 @@ def _autofinalize_if_complete(db: Session, header_id: int) -> bool:
         try:
             with db.begin_nested():
                 finalize_transfer_in(header_id, FinalizeTransferIn(), db)
-            logger.info("AUTO-FINALIZE: GRN header=%s transfer_out=%s (acked %s >= in_transit %s)",
-                        header_id, h.transfer_out_id, acked, in_transit)
+            logger.info("AUTO-FINALIZE: GRN header=%s transfer_out=%s "
+                        "(acked %s, claimed %s of %s in transit)",
+                        header_id, h.transfer_out_id, acked, len(claimed), in_transit)
             return True
         except Exception:
             logger.exception("AUTO-FINALIZE failed for GRN header=%s transfer_out=%s; "
@@ -2964,18 +3063,37 @@ def finalize_complete_pending_grns(db: Session, dry_run: bool = False) -> dict:
         WHERE tih.status = 'Pending'
         ORDER BY tih.id
     """)).fetchall()
-    summary = {"pending_grns_scanned": len(rows), "finalized": [], "skipped": []}
+    summary = {"pending_grns_scanned": len(rows), "finalized": [], "skipped": [], "failed": []}
     for r in rows:
-        complete = r.acked > 0 and r.in_transit > 0 and r.acked >= r.in_transit
+        # Completeness is decided box by box, never by comparing counts — see
+        # _claimed_pending_box_ids. The old `acked >= in_transit` test compared
+        # received boxes against un-received ones, so a 29-box dispatch with 27
+        # received and 2 missing read as complete. Sweeping the live backlog on
+        # that basis would have posted 633 box rows nobody ever scanned.
+        claimed = (_claimed_pending_box_ids(db, r.grn_id, r.transfer_out_id)
+                   if r.in_transit else set())
+        complete = r.acked > 0 and r.in_transit > 0 and len(claimed) >= r.in_transit
         rec = {"grn_id": r.grn_id, "transfer_out_id": r.transfer_out_id,
-               "grn_number": r.grn_number, "acked": int(r.acked), "in_transit": int(r.in_transit)}
-        if complete:
-            summary["finalized"].append(rec)
-            if not dry_run:
-                finalize_transfer_in(r.grn_id, FinalizeTransferIn(), db)
-                db.commit()
-        else:
+               "grn_number": r.grn_number, "acked": int(r.acked),
+               "in_transit": int(r.in_transit), "claimed": len(claimed)}
+        if not complete:
             summary["skipped"].append(rec)
+            continue
+        if dry_run:
+            summary["finalized"].append(rec)
+            continue
+        # Record the outcome, not the intention. Appending to `finalized` before
+        # the call meant an exception both aborted the sweep and left a summary
+        # claiming GRNs had been finalized when they had not.
+        try:
+            finalize_transfer_in(r.grn_id, FinalizeTransferIn(), db)
+            db.commit()
+            summary["finalized"].append(rec)
+        except Exception as e:  # noqa: BLE001 — one bad GRN must not strand the rest
+            db.rollback()
+            logger.exception("SWEEP: finalize failed for GRN %s (transfer_out=%s); "
+                             "left Pending, continuing", r.grn_number, r.transfer_out_id)
+            summary["failed"].append({**rec, "error": str(e)})
     return summary
 
 

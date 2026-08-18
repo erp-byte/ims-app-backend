@@ -256,7 +256,7 @@ def _row_still_in_source(db: Session, source_table: Optional[str], pending_row) 
 
 
 def _already_received(db, box_id: Optional[str], transfer_out_id) -> bool:
-    """Has this box already been received on THIS transfer?
+    """Has this box already been received on THIS transfer, by EITHER receipt path?
 
     The backfill parks boxes from `interunit_transfer_boxes`, which is the
     dispatch record and never goes away. The receipt lives in a different table,
@@ -264,6 +264,17 @@ def _already_received(db, box_id: Optional[str], transfer_out_id) -> bool:
     transfer completed months ago looks, to the backfill, exactly like one that
     was never received. That is how 1,960 rows came back In Transit weeks after
     their GRN, 1,757 of them in a single run.
+
+    There are TWO receipt ledgers and this used to know about only one. A cold
+    receive writes cold_transfer_in_headers + cold_transfer_inboxes and then, once
+    fully received, DELETEs the interunit staging rows this function was querying
+    (cold_transfer_in_tools.py:348-358, mirrored in delete_cold_transfer_in) —
+    cold_transfer_in_headers is deliberately the system of record from that point.
+    So every cold-received box looked unreceived here, and because the receipt
+    re-inserts the box under the SAME (box_id, transaction_no) at the destination
+    (cold_transfer_in_tools.py:685-702), _find_in_cold_stocks resolved to that
+    destination row and the caller DELETEd it — re-running the original incident
+    through the path the original fix never covered.
 
     Scoped to the same transfer on purpose: box ids repeat across GRNs, so a
     receipt somewhere else must not suppress a genuine park here.
@@ -274,14 +285,23 @@ def _already_received(db, box_id: Optional[str], transfer_out_id) -> bool:
     """
     if not box_id or transfer_out_id is None:
         return False
+    # Built conditionally rather than UNIONed blind: a missing cold table would
+    # raise, and the except below fails OPEN — which is the destructive direction.
+    ledgers = [
+        ("interunit_transfer_in_boxes", "interunit_transfer_in_header"),
+        ("cold_transfer_inboxes", "cold_transfer_in_headers"),
+    ]
+    parts = [
+        f"SELECT 1 FROM {box_tbl} b JOIN {hdr_tbl} h ON h.id = b.header_id "
+        f"WHERE b.box_id = :bid AND h.transfer_out_id = :toid"
+        for box_tbl, hdr_tbl in ledgers
+        if _table_exists(db, box_tbl) and _table_exists(db, hdr_tbl)
+    ]
+    if not parts:
+        return False
     try:
         return bool(db.execute(
-            text("""
-                SELECT 1 FROM interunit_transfer_in_boxes t
-                JOIN interunit_transfer_in_header ih ON ih.id = t.header_id
-                WHERE t.box_id = :bid AND ih.transfer_out_id = :toid
-                LIMIT 1
-            """),
+            text(" UNION ALL ".join(parts) + " LIMIT 1"),
             {"bid": box_id, "toid": transfer_out_id},
         ).fetchone())
     except Exception as exc:                                   # noqa: BLE001
@@ -289,6 +309,46 @@ def _already_received(db, box_id: Optional[str], transfer_out_id) -> bool:
                        "— parking it rather than assuming received",
                        box_id, transfer_out_id, exc)
         return False
+
+
+def _received_box_count(db, transfer_out_id) -> int:
+    """How many boxes of this transfer have been received, across BOTH ledgers.
+
+    Companion to `_already_received` — that one answers "was THIS box received",
+    this one answers "has receiving started at all". Both have to look in the
+    interunit AND the cold receipt tables, because a cold receive writes
+    cold_transfer_in_headers/cold_transfer_inboxes and then purges the interunit
+    staging rows (cold_transfer_in_tools.py:348-358).
+
+    Fails CLOSED — an unreadable ledger reports "receiving has started", which
+    makes the caller skip its top-up. The top-up deletes real cold_stocks rows,
+    so guessing 0 here is the destructive answer; guessing high only defers a
+    reconcile a human can re-run.
+    """
+    if transfer_out_id is None:
+        return 0
+    ledgers = [
+        ("interunit_transfer_in_boxes", "interunit_transfer_in_header"),
+        ("cold_transfer_inboxes", "cold_transfer_in_headers"),
+    ]
+    total = 0
+    for box_tbl, hdr_tbl in ledgers:
+        if not (_table_exists(db, box_tbl) and _table_exists(db, hdr_tbl)):
+            continue
+        try:
+            total += int(db.execute(
+                text(f"""SELECT COUNT(b.id) FROM {box_tbl} b
+                         JOIN {hdr_tbl} h ON h.id = b.header_id
+                         WHERE h.transfer_out_id = :tid"""),
+                {"tid": transfer_out_id},
+            ).scalar() or 0)
+        except Exception as exc:                               # noqa: BLE001
+            logger.warning(
+                "RECONCILE: receipt count failed on %s for transfer %s (%s) — "
+                "reporting receiving-in-progress so no stock is pulled",
+                box_tbl, transfer_out_id, exc)
+            return 1
+    return total
 
 
 def _company_from_table(table: str) -> str:
@@ -1689,13 +1749,15 @@ def reconcile_transfer_to_order(transfer_out_id: int, db: Session,
     # Topping up here would re-deduct already-received stock (double count), so skip the
     # by-lot fill for transfers whose receipt has begun. The receive path keeps its own
     # tables in sync via pick_from_pending; reconcile only owns the pre-receipt invariant.
-    received = db.execute(
-        text("""SELECT COUNT(tib.id)
-                FROM interunit_transfer_in_header tih
-                JOIN interunit_transfer_in_boxes tib ON tib.header_id = tih.id
-                WHERE tih.transfer_out_id = :tid"""),
-        {"tid": transfer_out_id},
-    ).scalar() or 0
+    #
+    # Must consult BOTH receipt ledgers. This counted only the interunit one, which the
+    # cold path DELETEs on completion (cold_transfer_in_tools.py:348-358) — so a
+    # cold-received transfer reported received=0, fell straight through to the cold
+    # branch below, saw parked < ordered because the receipt had consumed those pending
+    # rows, and "topped up" the difference by pulling unrelated in-store rows out of
+    # <company>_cold_stocks via _park_cold_row -> DELETE. Same blind-ledger root cause as
+    # _already_received; same consequence, one step further down the pipeline.
+    received = _received_box_count(db, transfer_out_id)
     if received:
         report["skipped_receiving_in_progress"] = True
         report["received"] = int(received)
@@ -1760,6 +1822,36 @@ def reconcile_transfer_to_order(transfer_out_id: int, db: Session,
         return report
 
     # COLD source: CORRECT pending to the order. The ORDER LOT is truth (no real scanning).
+    #
+    # ...but the ordered COUNT is the dispatch's own box rows, not SUM(qty). This is the
+    # same trap the warehouse branch above documents ("SUM(qty) is NOT the box count") and
+    # the cold branch used to walk straight into: cold dispatches written by the old form
+    # carry one line PER BOX, so SUM(qty) came to 2B-K (TRANS202608171318: 198 for 100
+    # boxes). Step 2 then read that as "198 ordered", saw 100 parked, and pulled 98
+    # unrelated in-store rows out of cold_stocks to close a shortfall that never existed.
+    # cold_transfer_out_tools._coalesce_lines stops new dispatches doing this; historical
+    # rows still carry the inflated qty, so the reconcile has to defend itself.
+    #
+    # Per lot, not per transfer: a lot with box rows is box-counted; a lot with none is a
+    # weight-only / manually typed cold row (the 'never-drop manual entries' path) whose
+    # typed qty is all there is, so it keeps SUM(qty).
+    boxes_by_lot = {
+        (r.lot_no or ""): int(r.n or 0)
+        for r in db.execute(
+            text("""SELECT COALESCE(lot_number, '') AS lot_no, COUNT(*) AS n
+                    FROM interunit_transfer_boxes WHERE header_id = :tid
+                    GROUP BY COALESCE(lot_number, '')"""),
+            {"tid": transfer_out_id},
+        ).fetchall()
+    }
+    for _lot, _n in boxes_by_lot.items():
+        if _n and _lot in ordered and ordered[_lot] != _n:
+            logger.info(
+                "RECONCILE(cold): tid=%s lot=%r ordered %s -> %s (dispatch box rows win "
+                "over SUM(qty))", transfer_out_id, _lot, ordered[_lot], _n)
+            ordered[_lot] = _n
+    report["total_ordered"] = total_ordered = sum(ordered.values())
+
     now = datetime.now()
     shortage = 0
 
@@ -1961,9 +2053,59 @@ def count_remaining_in_transit(transfer_out_id: int, db: Session) -> int:
 # ----------------------------------------------------------------------------
 #  unpick_to_pending — called from delete_transfer_in
 # ----------------------------------------------------------------------------
+def _ledger_source_for(db: Session, box_id: str, transaction_no: str):
+    """Where this box ACTUALLY came from, per the append-only disposition ledger.
+
+    Returns (source_table, from_company, source_row_id); all None when the box has
+    no un-reverted 'transfer_out_pending' row — i.e. it never left a real source.
+
+    park_in_pending writes this row at dispatch, carrying the source table it read
+    the box out of, that table's company, and a JSON snapshot of the row (including
+    its id). Unpick used to throw all of that away and re-derive source_table from
+    the DESTINATION company, which is wrong for any cross-company transfer.
+    """
+    try:
+        row = db.execute(
+            text("""
+                SELECT source_table, from_company, snapshot_data
+                FROM cold_stock_disposition
+                WHERE box_id = :bid AND transaction_no = :txn
+                  AND disposition_type = :dtype
+                  AND COALESCE(reverted, FALSE) = FALSE
+                ORDER BY id DESC LIMIT 1
+            """),
+            {"bid": box_id, "txn": transaction_no, "dtype": "transfer_out_pending"},
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — ledger is advisory; never break a re-open
+        return None, None, None
+    if not row or not getattr(row, "source_table", None):
+        return None, None, None
+    snap = getattr(row, "snapshot_data", None)
+    if isinstance(snap, str):
+        try:
+            snap = json.loads(snap)
+        except (TypeError, ValueError):
+            snap = None
+    row_id = (snap or {}).get("id") if isinstance(snap, dict) else None
+    return row.source_table, getattr(row, "from_company", None), row_id
+
+
 def unpick_to_pending(transfer_in_id: int, transfer_out_id: int, db: Session) -> int:
     """Reverse a Transfer In: delete the boxes from destination table and
-    re-insert them into pending_transfer_stock (status='In Transit'). Returns count restored."""
+    re-insert them into pending_transfer_stock (status='In Transit'). Returns count restored.
+
+    Source attribution comes from the disposition ledger, not from a guess. The old
+    code derived source_table from the destination company, so a cross-company cold
+    transfer was re-parked against the wrong ledger — and restore_to_source (cancel /
+    delete) INSERTs straight into whatever source_table says, with no presence check,
+    so the carton was recreated in the other company's cold_stocks.
+
+    A box with no ledger row never left a real source. When it also has no dispatch
+    box behind it, it is a quantity-only bookkeeping placeholder (park_lines_in_pending
+    writes those with EMPTY source/destination precisely so restore_to_source no-ops
+    them); re-parking it with a real table would let a later cancel INSERT stock that
+    never existed. Those keep their empty sentinels.
+    """
     transfer_out = db.execute(
         text("SELECT id, challan_no, from_site, to_site, created_by FROM interunit_transfers_header WHERE id = :tid"),
         {"tid": transfer_out_id},
@@ -1980,7 +2122,7 @@ def unpick_to_pending(transfer_in_id: int, transfer_out_id: int, db: Session) ->
     in_boxes = db.execute(
         text("""
             SELECT box_id, transaction_no, article, lot_number, batch_number,
-                   net_weight, gross_weight
+                   net_weight, gross_weight, transfer_out_box_id
             FROM interunit_transfer_in_boxes WHERE header_id = :hid
         """),
         {"hid": transfer_in_id},
@@ -2045,17 +2187,54 @@ def unpick_to_pending(transfer_in_id: int, transfer_out_id: int, db: Session) ->
             )
 
         # Re-insert into pending_transfer_stock
-        from_company = "cfpl"
-        to_company = "cfpl"
-        if dest_table and dest_table.startswith("cdpl"):
-            to_company = "cdpl"
-        source_table_guess = (
-            "cfpl_cold_stocks" if from_storage_type == "cold" and to_company == "cfpl"
-            else "cdpl_cold_stocks" if from_storage_type == "cold"
-            else "cfpl_bulk_entry_boxes" if to_company == "cfpl"
-            else "cdpl_bulk_entry_boxes"
-        )
-        destination_table_keep = dest_table or _destination_table(to_storage_type, to_company)
+        to_company = "cdpl" if (dest_table or "").startswith("cdpl") else "cfpl"
+
+        led_table, led_company, led_row_id = _ledger_source_for(db, b.box_id, b.transaction_no)
+        if led_table:
+            # The ledger knows. Trust it over any inference.
+            source_table = led_table
+            from_company = led_company or ("cdpl" if led_table.startswith("cdpl") else "cfpl")
+            source_row_id = led_row_id
+            destination_table_keep = dest_table or _destination_table(to_storage_type, to_company)
+        elif not getattr(b, "transfer_out_box_id", None) and not dest_table:
+            # No ledger row and no dispatched box behind it: a quantity-only line's
+            # tracking placeholder. Keep the empty sentinels park_lines_in_pending used,
+            # so restore_to_source skips it instead of inventing a source row.
+            source_table = ""
+            from_company = ""
+            source_row_id = None
+            destination_table_keep = ""
+            logger.info(
+                "UNPICK_PENDING: box_id=%s tno=%s has no disposition and no dispatch box "
+                "— re-parked as a tracking-only row (empty source/destination)",
+                b.box_id, b.transaction_no)
+        else:
+            # A real dispatched box whose ledger write failed or predates the ledger.
+            # Keep the historical guess rather than strand it, but say so: on cancel this
+            # decides which table restore_to_source writes into.
+            source_table = (
+                "cfpl_cold_stocks" if from_storage_type == "cold" and to_company == "cfpl"
+                else "cdpl_cold_stocks" if from_storage_type == "cold"
+                else "cfpl_bulk_entry_boxes" if to_company == "cfpl"
+                else "cdpl_bulk_entry_boxes"
+            )
+            from_company = "cdpl" if source_table.startswith("cdpl") else "cfpl"
+            source_row_id = None
+            destination_table_keep = dest_table or _destination_table(to_storage_type, to_company)
+            logger.warning(
+                "UNPICK_PENDING: no disposition row for box_id=%s tno=%s — source_table "
+                "GUESSED as %s. A cancel would restore the box there.",
+                b.box_id, b.transaction_no, source_table)
+
+        # A cold receipt writes a real destination row, so failing to find one means the
+        # box is not where the GRN says it is (already consumed, or moved by hand).
+        # Warehouse receipts never write one — interunit_transfer_in_boxes IS the final
+        # state — so only the cold case is worth reporting.
+        if to_storage_type == "cold" and not dest_table:
+            logger.warning(
+                "UNPICK_PENDING: box_id=%s tno=%s was NOT found in any cold destination "
+                "table; re-parking it as In Transit on the GRN's word alone",
+                b.box_id, b.transaction_no)
 
         db.execute(
             text("""
@@ -2074,7 +2253,7 @@ def unpick_to_pending(transfer_in_id: int, transfer_out_id: int, db: Session) ->
                      :box_id, :transaction_no,
                      :from_company, :to_company, :from_site, :to_site,
                      :from_storage_type, :to_storage_type,
-                     :source_table, NULL, :destination_table,
+                     :source_table, :source_row_id, :destination_table,
                      :item_description, :lot_no, :batch_number, :weight_kg, :no_of_cartons,
                      CAST(:cold_storage_data AS JSONB),
                      :gross_weight, :net_weight, :article,
@@ -2092,7 +2271,8 @@ def unpick_to_pending(transfer_in_id: int, transfer_out_id: int, db: Session) ->
                 "to_site": to_site,
                 "from_storage_type": from_storage_type,
                 "to_storage_type": to_storage_type,
-                "source_table": source_table_guess,
+                "source_table": source_table,
+                "source_row_id": source_row_id,
                 "destination_table": destination_table_keep,
                 "item_description": item_description,
                 "lot_no": lot_no,
@@ -2747,17 +2927,32 @@ def backfill_pending_from_existing_transfers(db: Session, dry_run: bool = False)
     if not _table_exists(db, "pending_transfer_stock"):
         return {"error": "pending_transfer_stock table missing"}
 
+    # A transfer is out of scope if EITHER receipt ledger says it was received.
+    # Checking only the interunit one let every cold-received transfer back in:
+    # the cold path purges the interunit staging rows on completion and keeps the
+    # out-header at 'Dispatch' until pending_remaining hits 0, so a partially
+    # cold-received transfer matched both the status filter and this NOT EXISTS.
+    received_gates = ["""
+        NOT EXISTS (
+            SELECT 1 FROM interunit_transfer_in_header ti
+            WHERE ti.transfer_out_id = h.id
+              AND LOWER(COALESCE(ti.status, '')) = 'received'
+        )"""]
+    if _table_exists(db, "cold_transfer_in_headers"):
+        received_gates.append("""
+        NOT EXISTS (
+            SELECT 1 FROM cold_transfer_in_headers ch
+            WHERE ch.transfer_out_id = h.id
+              AND LOWER(COALESCE(ch.status, '')) = 'received'
+        )""")
+
     candidates = db.execute(
-        text("""
+        text(f"""
             SELECT h.id, h.challan_no, h.from_site, h.to_site,
                    h.status, h.created_by, h.created_ts, h.stock_trf_date
             FROM interunit_transfers_header h
             WHERE LOWER(COALESCE(h.status, '')) IN ('dispatch', 'partial', 'completed', 'in transit')
-              AND NOT EXISTS (
-                SELECT 1 FROM interunit_transfer_in_header ti
-                WHERE ti.transfer_out_id = h.id
-                  AND LOWER(COALESCE(ti.status, '')) = 'received'
-              )
+              AND {' AND '.join(received_gates)}
             ORDER BY h.created_ts ASC
         """)
     ).fetchall()

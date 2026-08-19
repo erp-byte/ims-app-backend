@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from shared.database import get_db
@@ -24,6 +25,58 @@ from services.ims_service.tools import (
 )
 
 router = APIRouter(prefix="/auth", tags=["ims-auth"])
+
+_ADMIN_ROLES = ("admin", "developer")
+
+
+def _is_developer(db: Session, user_id) -> bool:
+    return bool(db.execute(
+        text("SELECT is_developer FROM users WHERE id = :uid"),
+        {"uid": user_id},
+    ).scalar())
+
+
+def _role_in(db: Session, user_id, company_code: str) -> str:
+    return (db.execute(
+        text("""SELECT role FROM user_company_roles
+                 WHERE user_id = :uid AND company_code = :cc"""),
+        {"uid": user_id, "cc": company_code},
+    ).scalar() or "").strip().lower()
+
+
+def _require_admin(db: Session, caller: dict, company_codes, granting_roles=()):
+    """The caller must actually be allowed to hand out this access.
+
+    `verify_token` proves only that SOMEONE is logged in — it returns just
+    {user_id, email} and carries no role. The two grant endpoints below took the
+    target `user_id` from the URL path and were guarded by nothing else, so any
+    authenticated user could POST their own id and award themselves the admin
+    role or every module permission: straight vertical privilege escalation, no
+    special tooling needed.
+
+    Rules:
+      * a developer may grant anything;
+      * otherwise the caller must be admin IN EVERY company being touched, so a
+        cfpl admin cannot quietly grant cdpl access;
+      * only a developer may hand out the 'developer' role, or an admin could
+        promote themselves out of these checks entirely.
+    """
+    caller_id = caller.get("user_id")
+    if caller_id is None:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if _is_developer(db, caller_id):
+        return
+    if any((r or "").strip().lower() == "developer" for r in granting_roles):
+        raise HTTPException(
+            status_code=403,
+            detail="Only a developer can grant the developer role",
+        )
+    for cc in company_codes:
+        if _role_in(db, caller_id, cc) not in _ADMIN_ROLES:
+            raise HTTPException(
+                status_code=403,
+                detail=f"You are not an administrator of {cc}",
+            )
 
 
 @router.post("/login")
@@ -175,6 +228,7 @@ def update_permissions_endpoint(
     user: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
+    _require_admin(db, user, [company_code])
     modules = [
         {"module_code": m.module_code, "permissions": m.permissions.model_dump()}
         for m in body.modules
@@ -202,4 +256,7 @@ def update_user_companies_roles_endpoint(
     db: Session = Depends(get_db),
 ):
     companies = [{"company_code": c.company_code, "role": c.role} for c in body.companies]
+    _require_admin(db, user,
+                   [c["company_code"] for c in companies],
+                   granting_roles=[c["role"] for c in companies])
     return update_user_company_roles(user_id, companies, db)

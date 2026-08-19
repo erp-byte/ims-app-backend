@@ -10,9 +10,16 @@ Background:
   never called -- so the GRN header stayed 'Pending', the transfer-OUT never became
   'Received', pending_transfer_stock rows were never picked, and the dispatch lingered in
   the Pending modal as "Partial (GRN raised)". This sweep finalizes every Pending GRN whose
-  acknowledged boxes already cover its in-transit set (acked >= in_transit > 0). It uses the
-  same finalize_transfer_in path as the UI, so picking + status transitions are identical.
-  GRNs that are NOT yet complete are listed and left untouched.
+  acknowledged boxes ACCOUNT FOR its in-transit set. It uses the same finalize_transfer_in
+  path as the UI, so picking + status transitions are identical. GRNs that are NOT yet
+  complete are listed and left untouched.
+
+  Completeness is decided box by box, never by comparing counts. The earlier
+  `acked >= in_transit` test compared boxes that ARRIVED against boxes that DID NOT: a
+  29-box dispatch with 27 received and 2 missing read as "complete". It was also
+  self-triggering, because a partial finalize shrinks the in-transit figure until the
+  comparison turns true on its own. Run against the 2026-08 backlog it would have posted
+  633 box rows whose ids appear nowhere on their receipt.
 """
 import sys
 from shared.database import SessionLocal
@@ -30,10 +37,16 @@ def main():
         for r in summary["finalized"]:
             print(f"  GRN {r['grn_id']} | {r['grn_number']} | transfer_out={r['transfer_out_id']} "
                   f"| acked={r['acked']} in_transit={r['in_transit']}")
+        if summary.get("failed"):
+            print(f"\nFAILED (still Pending, needs investigation): {len(summary['failed'])}")
+            for r in summary["failed"]:
+                print(f"  GRN {r['grn_id']} | {r['grn_number']} | transfer_out={r['transfer_out_id']} "
+                      f"| {r.get('error', '')}")
+
         print(f"\nIncomplete (left as Pending): {len(summary['skipped'])}")
         for r in summary["skipped"]:
             print(f"  GRN {r['grn_id']} | {r['grn_number']} | transfer_out={r['transfer_out_id']} "
-                  f"| acked={r['acked']} in_transit={r['in_transit']}")
+                  f"| acked={r['acked']} in_transit={r['in_transit']} claimed={r.get('claimed', '?')}")
         if not confirm:
             db.rollback()
             print("\n(DRY-RUN -- nothing written. Re-run with --confirm to finalize.)")

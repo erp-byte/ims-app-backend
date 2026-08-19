@@ -448,7 +448,13 @@ def list_rtvs(
                    (SELECT COUNT(*) FROM {tables['lines']} l WHERE l.header_id = h.id) AS items_count,
                    (SELECT COUNT(*) FROM {tables['boxes']} b WHERE b.header_id = h.id) AS boxes_count,
                    (SELECT COALESCE(SUM(l.qty), 0) FROM {tables['lines']} l WHERE l.header_id = h.id) AS total_qty,
-                   (SELECT COALESCE(SUM(b.net_weight), 0) FROM {tables['boxes']} b WHERE b.header_id = h.id) AS total_net_weight
+                   -- net wt: prefer weighed box total; fall back to line total (qty x pack)
+                   --         so a CR with no boxes yet does not render as 0 kg.
+                   COALESCE(
+                     NULLIF((SELECT SUM(b.net_weight) FROM {tables['boxes']} b WHERE b.header_id = h.id), 0),
+                     (SELECT SUM(l.net_weight) FROM {tables['lines']} l WHERE l.header_id = h.id),
+                     0
+                   ) AS total_net_weight
             FROM {tables['header']} h
             WHERE {where}
             ORDER BY h.{sort_by} {direction}

@@ -1883,7 +1883,7 @@ def get_material_in_detail(
 #  DELETE /job-work/material-in/{id}  — Delete an inward receipt
 # ════════════════════════════════════════════════════════════
 
-DELETE_ALLOWED_EMAILS = ["b.hrithik@candorfoods.in", "yash@candorfoods.in"]
+DELETE_ALLOWED_EMAILS = ["b.hrithik@candorfoods.in", "yash@candorfoods.in", "digamber.sawant@candorfoods.in"]
 
 @router.delete("/material-in/{ir_id}")
 def delete_material_in(

@@ -1123,7 +1123,7 @@ def list_inner_cold_transfers(
     }
 
 
-INNER_COLD_DELETE_ALLOWED_EMAILS = {"hrithik@candorfoods.in", "yash@candorfoods.in"}
+INNER_COLD_DELETE_ALLOWED_EMAILS = {"hrithik@candorfoods.in", "yash@candorfoods.in", "digamber.sawant@candorfoods.in"}
 
 
 @router.get("/inner-transfer/{challan_no}")

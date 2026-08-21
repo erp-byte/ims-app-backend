@@ -23,9 +23,11 @@ def _build_rtv_action_url(rtv_id: str, bh_email: str, action: str) -> str:
 
 RTV_NOTIFY_TO = "pooja.parkar@candorfoods.in"
 JOB_WORK_TO = "billing@candorfoods.in"
-JOB_WORK_CC = ["b.hrithik@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
-WEEKLY_DIGEST_TO = ["b.hrithik@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
-INWARD_DELETE_TO = "b.hrithik@candorfoods.in"
+JOB_WORK_CC = ["b.hrithik@candorfoods.in", "digamber.sawant@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
+WEEKLY_DIGEST_TO = ["b.hrithik@candorfoods.in", "digamber.sawant@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
+# A list, not a bare string, now that it is more than one person; _send_email_background
+# already takes `str | list[str]`.
+INWARD_DELETE_TO = ["b.hrithik@candorfoods.in", "digamber.sawant@candorfoods.in"]
 
 # Business Head -> email map for RTV notifications.
 # Keys are matched case-insensitively against the business_head value stored on the RTV.
@@ -65,6 +67,7 @@ SALES_POC_EMAILS = {
 RTV_CC_CONSTANT = [
     "sunil.jasoria@candorfoods.in",
     "b.hrithik@candorfoods.in",
+    "digamber.sawant@candorfoods.in",
     "billing@candorfoods.in",
     "satyendra@candorfoods.in",
     "sachin.more@candorfoods.in",
@@ -2261,7 +2264,7 @@ def notify_inward_deleted(
     created_by: str | None = None,
     items: list | None = None,
 ) -> None:
-    """Send notification to b.hrithik when an inward transaction is deleted."""
+    """Notify b.hrithik / digamber.sawant when an inward transaction is deleted."""
     deleted_at = now_ist().strftime("%d %b %Y, %I:%M %p")
     rows = [
         ("Transaction No", transaction_no),

@@ -96,6 +96,7 @@ def day_subject(day: date) -> str:
 # ── recipients ───────────────────────────────────────────────────────────
 REPORT_TO = [
     "b.hrithik@candorfoods.in",
+    "digamber.sawant@candorfoods.in",
     "yash@candorfoods.in",
     "sunil.jasoria@candorfoods.in",
     "stores@candorfoods.in",

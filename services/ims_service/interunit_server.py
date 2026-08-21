@@ -84,7 +84,7 @@ from services.ims_service.pending_stock_tools import (
 
 router = APIRouter(prefix="/interunit", tags=["interunit"])
 
-AUTHORIZED_DELETE_EMAILS = {"yash@candorfoods.in", "b.hrithik@candorfoods.in"}
+AUTHORIZED_DELETE_EMAILS = {"yash@candorfoods.in", "b.hrithik@candorfoods.in", "digamber.sawant@candorfoods.in"}
 ADMIN_ROLES = {"admin", "developer"}
 
 

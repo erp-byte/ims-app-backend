@@ -3520,7 +3520,7 @@ def get_transfer_in(transfer_in_id: int, db: Session) -> dict:
 
 # -- Edit transfer IN (privileged full-receipt edit) --
 
-TRANSFER_IN_EDIT_ALLOWED_EMAILS = {"b.hrithik@candorfoods.in"}
+TRANSFER_IN_EDIT_ALLOWED_EMAILS = {"b.hrithik@candorfoods.in", "digamber.sawant@candorfoods.in"}
 
 
 def get_transfer_in_by_transfer_out(transfer_out_id: int, db: Session) -> dict:
@@ -3718,7 +3718,7 @@ TRANSFER_IN_DELETE_ALLOWED_EMAILS = {"yash@candorfoods.in"}
 
 # Users allowed to re-open a Received transfer-in back to Pending (to correct a
 # lot number / raise a box issue, then re-finalize).
-TRANSFER_IN_REOPEN_ALLOWED_EMAILS = {"b.hrithik@candorfoods.in"}
+TRANSFER_IN_REOPEN_ALLOWED_EMAILS = {"b.hrithik@candorfoods.in", "digamber.sawant@candorfoods.in"}
 
 
 def reopen_transfer_in(transfer_out_id: int, user_email: str, db: Session) -> dict:

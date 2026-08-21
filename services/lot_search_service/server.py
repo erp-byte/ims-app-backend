@@ -12,7 +12,7 @@ from services.lot_search_service.tools import search_lot
 router = APIRouter(prefix="/lot-search", tags=["lot-search"])
 
 
-LOT_SEARCH_ALLOWED_EMAILS = {"yash@candorfoods.in", "b.hrithik@candorfoods.in"}
+LOT_SEARCH_ALLOWED_EMAILS = {"yash@candorfoods.in", "b.hrithik@candorfoods.in", "digamber.sawant@candorfoods.in"}
 
 
 def _require_allowed(email: Optional[str]) -> str:

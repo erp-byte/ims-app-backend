@@ -594,6 +594,10 @@ def _map_box_row(row) -> dict:
         "source_unit": getattr(row, "source_unit", None) or None,
         # From the parent line so the hover/DC can show piece Count for PM/packaging box transfers.
         "unit_pack_size": str(row.unit_pack_size) if getattr(row, "unit_pack_size", None) is not None else None,
+        # Packs in THIS box. Distinct from unit_pack_size, which is the line's
+        # packs-per-FULL-box: on a consignment ending in a part box the two differ, and
+        # only this one adds up to what was actually shipped.
+        "pack_count": str(row.pack_count) if getattr(row, "pack_count", None) is not None else None,
         "rm_pm_fg_type": getattr(row, "rm_pm_fg_type", None),
         "item_category": getattr(row, "item_category", None),
     }
@@ -627,6 +631,10 @@ def _fetch_boxes(db: Session, header_id: int) -> list:
                    itb.box_id, itb.article, itb.lot_number, itb.batch_number,
                    itb.transaction_no, itb.net_weight, itb.gross_weight,
                    itb.created_at, itb.updated_at,
+                   -- Packs actually inside THIS box, recorded at dispatch. NULL on every
+                   -- box written before this was persisted, which is why the challan
+                   -- falls back to the line's unit_pack_size rather than reading 0.
+                   NULLIF(itb.qr_data->>'pack_count','')::numeric AS pack_count,
                    l.unit_pack_size AS unit_pack_size,
                    l.rm_pm_fg_type AS rm_pm_fg_type,
                    l.item_category AS item_category,
@@ -1054,6 +1062,13 @@ def _synthesise_article_entry_boxes(lines: list) -> list:
         total_gross = float(getattr(line, "total_weight", 0) or 0) or total_net
         per_net = round(total_net / qty, 3)
         per_gross = round(total_gross / qty, 3)
+        # Packs inside each box this line becomes. unit_pack_size is packs-PER-BOX, so
+        # every unit of the line carries it: a line of qty 19 x 5,000 gives 19 boxes of
+        # 5,000. The direct-transfer form sends one line PER BOX (qty 1), so a part box
+        # arrives as its own line carrying its own count (1,600) and keeps it here —
+        # which is the only reason the true total survives _boxes_authoritative, whose
+        # `max(unit_pack_size)` collapses the article to the full-box figure.
+        packs = float(getattr(line, "unit_pack_size", 0) or 0) or None
         for _ in range(qty):
             n += 1
             boxes.append(BoxCreate(
@@ -1065,6 +1080,7 @@ def _synthesise_article_entry_boxes(lines: list) -> list:
                 transaction_no="",
                 net_weight=str(per_net),
                 gross_weight=str(per_gross),
+                pack_count=packs,
             ))
     return boxes
 
@@ -1256,19 +1272,28 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
             box_article_key = (box.article or "").strip().upper()
             matched_line_id = line_id_by_article.get(box_article_key, fallback_line_id)
 
+            # Per-box pack count rides in the EXISTING qr_data jsonb rather than a new
+            # column. qr_data already exists on every deployment and is unused (0
+            # populated rows across all 74k box rows), so this needs no ALTER and cannot
+            # fail a dispatch the way an ADD COLUMN would: _ensure_interunit_schema
+            # swallows its own errors and still marks itself done, so a DDL that never
+            # applied would take every INSERT here down with it.
+            _pack = getattr(box, "pack_count", None)
+            _qr = json.dumps({"pack_count": float(_pack)}) if _pack else None
+
             box_row = db.execute(
                 text("""
                     INSERT INTO interunit_transfer_boxes
                         (header_id, transfer_line_id, box_number, box_id, article,
                          lot_number, batch_number, transaction_no,
-                         net_weight, gross_weight)
+                         net_weight, gross_weight, qr_data)
                     VALUES
                         (:header_id, :transfer_line_id, :box_number, :box_id, :article,
                          :lot_number, :batch_number, :transaction_no,
-                         :net_weight, :gross_weight)
+                         :net_weight, :gross_weight, CAST(:qr_data AS JSONB))
                     RETURNING id, header_id, transfer_line_id, box_number, box_id,
                               article, lot_number, batch_number, transaction_no,
-                              net_weight, gross_weight, created_at, updated_at
+                              net_weight, gross_weight, qr_data, created_at, updated_at
                 """),
                 {
                     "header_id": header_id,
@@ -1281,6 +1306,7 @@ def create_transfer(data: TransferCreate, created_by: str, db: Session) -> dict:
                     "transaction_no": box.transaction_no or "",
                     "net_weight": float(box.net_weight),
                     "gross_weight": float(box.gross_weight),
+                    "qr_data": _qr,
                 },
             ).fetchone()
             boxes.append(box_row)
@@ -1880,19 +1906,28 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
             box_article_key = (box.article or "").strip().upper()
             matched_line_id = line_id_by_article.get(box_article_key, fallback_line_id)
 
+            # Per-box pack count rides in the EXISTING qr_data jsonb rather than a new
+            # column. qr_data already exists on every deployment and is unused (0
+            # populated rows across all 74k box rows), so this needs no ALTER and cannot
+            # fail a dispatch the way an ADD COLUMN would: _ensure_interunit_schema
+            # swallows its own errors and still marks itself done, so a DDL that never
+            # applied would take every INSERT here down with it.
+            _pack = getattr(box, "pack_count", None)
+            _qr = json.dumps({"pack_count": float(_pack)}) if _pack else None
+
             box_row = db.execute(
                 text("""
                     INSERT INTO interunit_transfer_boxes
                         (header_id, transfer_line_id, box_number, box_id, article,
                          lot_number, batch_number, transaction_no,
-                         net_weight, gross_weight)
+                         net_weight, gross_weight, qr_data)
                     VALUES
                         (:header_id, :transfer_line_id, :box_number, :box_id, :article,
                          :lot_number, :batch_number, :transaction_no,
-                         :net_weight, :gross_weight)
+                         :net_weight, :gross_weight, CAST(:qr_data AS JSONB))
                     RETURNING id, header_id, transfer_line_id, box_number, box_id,
                               article, lot_number, batch_number, transaction_no,
-                              net_weight, gross_weight, created_at, updated_at
+                              net_weight, gross_weight, qr_data, created_at, updated_at
                 """),
                 {
                     "header_id": header_id,
@@ -1905,6 +1940,7 @@ def update_transfer(transfer_id: int, data: TransferCreate, db: Session) -> dict
                     "transaction_no": box.transaction_no or "",
                     "net_weight": float(box.net_weight),
                     "gross_weight": float(box.gross_weight),
+                    "qr_data": _qr,
                 },
             ).fetchone()
             boxes.append(box_row)

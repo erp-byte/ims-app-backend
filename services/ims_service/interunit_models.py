@@ -233,6 +233,13 @@ class BoxCreate(BaseModel):
     transaction_no: Optional[str] = None
     net_weight: str = "0.00"
     gross_weight: str = "0.00"
+    # Packs (pouches / pieces) inside THIS box. Per-box because a consignment's last
+    # box is routinely a part box: TRANS202608261534 shipped 18 boxes of 5,000 and a
+    # 19th holding 1,600 — 91,600 packs, not the 95,000 that unit_pack_size x qty gives.
+    # It cannot be derived from weight: that 19th box weighed 6.18 kg, which at the
+    # full box's 19.54 kg / 5,000 implies 1,581, not the 1,600 actually counted.
+    # Optional, so every existing caller keeps working unchanged.
+    pack_count: Optional[float] = None
 
 
 class TransferCreate(BaseModel):

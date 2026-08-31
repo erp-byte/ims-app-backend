@@ -176,6 +176,8 @@ def _map_header_row(row) -> dict:
         "transporter_name": getattr(row, "transporter_name", None),
         "driver_name": getattr(row, "driver_name", None),
         "inward_manager": getattr(row, "inward_manager", None),
+        "location": getattr(row, "location", None),
+        "poc_contact": getattr(row, "poc_contact", None),
     }
 
 
@@ -295,17 +297,19 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
                  invoice_number, challan_no, dn_no, conversion,
                  sales_poc, sales_poc_email, business_head, remark,
                  vehicle_number, transporter_name, driver_name, inward_manager,
+                 location, poc_contact,
                  status, created_by, created_ts)
             VALUES
                 (:rtv_id, NOW(), :factory_unit, :customer,
                  :invoice_number, :challan_no, :dn_no, :conversion,
                  :sales_poc, :sales_poc_email, :business_head, :remark,
                  :vehicle_number, :transporter_name, :driver_name, :inward_manager,
+                 :location, :poc_contact,
                  'Pending', :created_by, NOW())
             RETURNING id, rtv_id, rtv_date, factory_unit, customer,
                       invoice_number, challan_no, dn_no, conversion,
                       sales_poc, sales_poc_email, business_head, remark, status, created_by, created_ts, updated_at,
-                      vehicle_number, transporter_name, driver_name, inward_manager
+                      vehicle_number, transporter_name, driver_name, inward_manager, location, poc_contact
         """),
         {
             "rtv_id": rtv_id,
@@ -323,6 +327,8 @@ def create_rtv(data: RTVCreate, created_by: str, db: Session) -> dict:
             "transporter_name": data.header.transporter_name,
             "driver_name": data.header.driver_name,
             "inward_manager": data.header.inward_manager,
+            "location": data.header.location,
+            "poc_contact": data.header.poc_contact,
             "created_by": created_by,
         },
     ).fetchone()
@@ -444,7 +450,7 @@ def list_rtvs(
             SELECT h.id, h.rtv_id, h.rtv_date, h.factory_unit, h.customer,
                    h.invoice_number, h.challan_no, h.dn_no, h.conversion,
                    h.sales_poc, h.sales_poc_email, h.business_head, h.remark, h.status, h.created_by, h.created_ts, h.updated_at,
-                   h.vehicle_number, h.transporter_name, h.driver_name, h.inward_manager,
+                   h.vehicle_number, h.transporter_name, h.driver_name, h.inward_manager, h.location, h.poc_contact,
                    (SELECT COUNT(*) FROM {tables['lines']} l WHERE l.header_id = h.id) AS items_count,
                    (SELECT COUNT(*) FROM {tables['boxes']} b WHERE b.header_id = h.id) AS boxes_count,
                    (SELECT COALESCE(SUM(l.qty), 0) FROM {tables['lines']} l WHERE l.header_id = h.id) AS total_qty,
@@ -489,7 +495,7 @@ def get_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
             SELECT id, rtv_id, rtv_date, factory_unit, customer,
                    invoice_number, challan_no, dn_no, conversion,
                    sales_poc, sales_poc_email, business_head, remark, status, created_by, created_ts, updated_at,
-                   vehicle_number, transporter_name, driver_name, inward_manager
+                   vehicle_number, transporter_name, driver_name, inward_manager, location, poc_contact
             FROM {tables['header']}
             WHERE id = :hid
         """),
@@ -533,6 +539,8 @@ def update_rtv(company: Company, rtv_id_int: int, data: RTVHeaderUpdate, db: Ses
         "transporter_name": data.transporter_name,
         "driver_name": data.driver_name,
         "inward_manager": data.inward_manager,
+        "location": data.location,
+        "poc_contact": data.poc_contact,
     }
 
     for col, val in field_map.items():
@@ -558,7 +566,7 @@ def update_rtv(company: Company, rtv_id_int: int, data: RTVHeaderUpdate, db: Ses
             RETURNING id, rtv_id, rtv_date, factory_unit, customer,
                       invoice_number, challan_no, dn_no, conversion,
                       sales_poc, sales_poc_email, business_head, remark, status, created_by, created_ts, updated_at,
-                      vehicle_number, transporter_name, driver_name, inward_manager
+                      vehicle_number, transporter_name, driver_name, inward_manager, location, poc_contact
         """),
         params,
     ).fetchone()
@@ -570,7 +578,10 @@ def delete_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
     tables = rtv_table_names(company)
 
     existing = db.execute(
-        text(f"SELECT id, rtv_id, business_head, created_by, factory_unit FROM {tables['header']} WHERE id = :hid"),
+        text(
+            f"SELECT id, rtv_id, business_head, created_by, factory_unit, location, poc_contact "
+            f"FROM {tables['header']} WHERE id = :hid"
+        ),
         {"hid": rtv_id_int},
     ).fetchone()
     if not existing:
@@ -604,6 +615,8 @@ def delete_rtv(company: Company, rtv_id_int: int, db: Session) -> dict:
         "business_head": existing.business_head,
         "created_by": existing.created_by,
         "factory_unit": existing.factory_unit,
+        "location": getattr(existing, "location", None),
+        "poc_contact": getattr(existing, "poc_contact", None),
         "lines_count": int(lines_count),
         "boxes_count": int(boxes_count),
     }
@@ -941,6 +954,22 @@ def _norm(v) -> str:
     return f"{f:g}" if f is not None else str(v).strip()
 
 
+# Free-text header fields that must NEVER go through _norm's numeric branch. A bare
+# phone number or a numeric location is float-parseable, and f"{f:g}" keeps only 6
+# significant digits -- f"{9876543210.0:g}" == "9.87654e+09" -- so correcting the last
+# digits of a POC number would compare EQUAL and vanish from the "What changed" summary
+# while still persisting to the DB. _norm itself must stay as-is: its numeric branch is
+# what stops qty/rate/value "85" vs "85.00" from false-positiving.
+_TEXT_DIFF_FIELDS = {"location", "poc_contact"}
+
+
+def _norm_field(field: str, v) -> str:
+    """Header-diff comparator; free-text fields bypass _norm's numeric coercion."""
+    if field in _TEXT_DIFF_FIELDS:
+        return "" if v is None else str(v).strip()
+    return _norm(v)
+
+
 def rtv_box_summary_and_short(detail: dict) -> tuple[dict, list]:
     """Per-article box summary (what was received) + short-weight breakdown.
 
@@ -1003,6 +1032,7 @@ _HEADER_DIFF_LABELS = {
     "business_head": "Business Head", "remark": "Remark", "conversion": "Conversion",
     "vehicle_number": "Vehicle Number", "transporter_name": "Transporter",
     "driver_name": "Driver", "inward_manager": "Inward Manager",
+    "location": "Location", "poc_contact": "POC Contact",
 }
 _LINE_DIFF_FIELDS = [
     ("qty", "Qty"), ("rate", "Rate"), ("value", "Value"), ("net_weight", "Net Wt"),
@@ -1023,7 +1053,7 @@ def save_rtv(company: Company, rtv_id_int: int, data, db: Session) -> tuple[dict
         if provided:
             update_rtv(company, rtv_id_int, data.header, db)
             for field, new_val in provided.items():
-                if _norm(old.get(field)) != _norm(new_val):
+                if _norm_field(field, old.get(field)) != _norm_field(field, new_val):
                     header_changes.append({
                         "field": field, "label": _HEADER_DIFF_LABELS.get(field, field),
                         "old": old.get(field), "new": new_val,
@@ -1487,7 +1517,8 @@ def export_rtv_records(
             SELECT
                 h.rtv_id, h.rtv_date, h.factory_unit, h.customer,
                 h.invoice_number, h.challan_no, h.dn_no, h.conversion,
-                h.sales_poc, h.business_head, h.remark, h.status, h.created_by, h.created_ts,
+                h.sales_poc, h.business_head, h.location, h.poc_contact,
+                h.remark, h.status, h.created_by, h.created_ts,
                 l.material_type, l.item_category, l.sub_category,
                 l.item_description, l.uom, l.qty, l.rate, l.value,
                 l.net_weight AS line_net_weight, l.carton_weight AS line_carton_weight,
@@ -1518,6 +1549,8 @@ def export_rtv_records(
             "Conversion": str(r.conversion) if r.conversion is not None else "",
             "Sales POC": r.sales_poc or "",
             "Business Head": r.business_head or "",
+            "Location": r.location or "",
+            "POC Contact": r.poc_contact or "",
             "Remark": r.remark or "",
             "Status": r.status or "",
             "Created By": r.created_by or "",

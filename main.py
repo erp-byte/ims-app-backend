@@ -184,10 +184,12 @@ def _run_startup_migrations():
         except Exception:
             db.rollback()
 
-        # RTV header columns (logistics fields + manual Sales POC email).
-        # Mirrors migrations/2026-06-09_rtv_header_logistics_fields.sql and
-        # migrations/2026-06-18_rtv_sales_poc_email.sql so the schema self-heals
-        # at boot and deploys are order-independent (no manual migrate step).
+        # RTV header columns (logistics fields, manual Sales POC email,
+        # location / POC contact).
+        # Mirrors migrations/2026-06-09_rtv_header_logistics_fields.sql,
+        # migrations/2026-06-18_rtv_sales_poc_email.sql and
+        # migrations/2026-08-29_rtv_header_location_poc_contact.sql so the schema
+        # self-heals at boot and deploys are order-independent (no manual migrate step).
         for _rtv_tbl in ("cfpl_rtv_header", "cdpl_rtv_header"):
             try:
                 db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS vehicle_number   varchar"))
@@ -195,6 +197,8 @@ def _run_startup_migrations():
                 db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS driver_name      varchar"))
                 db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS inward_manager   varchar"))
                 db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS sales_poc_email  varchar"))
+                db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS location         varchar"))
+                db.execute(text(f"ALTER TABLE {_rtv_tbl} ADD COLUMN IF NOT EXISTS poc_contact      varchar"))
                 db.commit()
             except Exception:
                 db.rollback()

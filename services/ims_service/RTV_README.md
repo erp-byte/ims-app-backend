@@ -58,6 +58,8 @@
 | `conversion`       | `string`          | No                 | Yes      | Default `"0"`. Stored as float in DB |
 | `sales_poc`        | `string`          | No                 | Yes      | Dropdown name, or free text          |
 | `sales_poc_email`  | `string`          | No                 | Yes      | Manual "Other" POC email; added to mail CC |
+| `poc_contact`      | `string`          | No                 | Yes      | Free-text POC contact detail (usually a phone). Not validated; display-only, never added to mail CC |
+| `location`         | `string`          | No                 | Yes      | Free text                            |
 | `remark`           | `string`          | No                 | Yes      |                                      |
 | `status`           | `string`          | Auto (`"Pending"`) | No       | `"Pending"` / `"Approved"`           |
 | `created_by`       | `string`          | Query param        | Yes      | Email of creator                     |
@@ -138,6 +140,8 @@ Create a new RTV with header and line items.
     "dn_no": "DN-001",
     "conversion": "1.5",
     "sales_poc": "John Doe",
+    "location": "Bhiwandi Gate 3",
+    "poc_contact": "9876543210",
     "remark": "Sample remark"
   },
   "lines": [
@@ -172,6 +176,8 @@ Create a new RTV with header and line items.
   "dn_no": "DN-001",
   "conversion": "1.5",
   "sales_poc": "John Doe",
+  "location": "Bhiwandi Gate 3",
+  "poc_contact": "9876543210",
   "remark": "Sample remark",
   "status": "Pending",
   "created_by": "user@example.com",
@@ -247,6 +253,8 @@ Paginated list with filters and sorting.
       "dn_no": "DN-001",
       "conversion": "1.5",
       "sales_poc": "John Doe",
+      "location": "Bhiwandi Gate 3",
+      "poc_contact": "9876543210",
       "remark": "Sample remark",
       "status": "Pending",
       "created_by": "user@example.com",
@@ -319,6 +327,8 @@ Update one or more header fields on an existing RTV.
   "dn_no": "DN-002",
   "conversion": "2.0",
   "sales_poc": "Jane Doe",
+  "location": "Bhiwandi Gate 3",
+  "poc_contact": "9876543210",
   "remark": "Updated remark",
   "status": "Pending"
 }
@@ -340,6 +350,8 @@ Update one or more header fields on an existing RTV.
   "dn_no": "DN-002",
   "conversion": "2.0",
   "sales_poc": "Jane Doe",
+  "location": "Bhiwandi Gate 3",
+  "poc_contact": "9876543210",
   "remark": "Updated remark",
   "status": "Pending",
   "created_by": "user@example.com",
@@ -555,6 +567,8 @@ Approve an RTV. Optionally update header fields, line fields, and upsert boxes i
     "dn_no": "DN-001",
     "conversion": "1.5",
     "sales_poc": "John Doe",
+    "location": "Bhiwandi Gate 3",
+    "poc_contact": "9876543210",
     "remark": "Approved with changes"
   },
   "lines": [

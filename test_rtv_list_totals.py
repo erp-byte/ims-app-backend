@@ -30,6 +30,7 @@ class ListDB:
                     sales_poc=None, business_head=None, remark=None, status="Pending",
                     created_by=None, created_ts=None, updated_at=None,
                     vehicle_number=None, transporter_name=None, driver_name=None, inward_manager=None,
+                    location=None, poc_contact=None,
                     items_count=1, boxes_count=100, total_qty=85, total_net_weight=850.0,
                 )]
         return R()

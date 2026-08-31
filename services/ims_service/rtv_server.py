@@ -120,7 +120,8 @@ def export_rtv_endpoint(
     headers = [
         "RTV ID", "RTV Date", "Factory Unit", "Customer",
         "Invoice Number", "Challan No", "DN No", "Conversion",
-        "Sales POC", "Business Head", "Remark", "Status", "Created By", "Created At",
+        "Sales POC", "Business Head", "Location", "POC Contact",
+        "Remark", "Status", "Created By", "Created At",
         "Material Type", "Item Category", "Sub Category",
         "Item Description", "UOM", "Qty", "Rate", "Value", "Line Net Weight", "Line Carton Weight",
         "Box ID", "Box Article", "Box Number", "Box UOM", "Box Conversion",
@@ -385,6 +386,8 @@ def delete_rtv_endpoint(
         lines_count=result.get("lines_count"),
         boxes_count=result.get("boxes_count"),
         factory_unit=result.get("factory_unit"),
+        location=result.get("location"),
+        poc_contact=result.get("poc_contact"),
     )
     return result
 

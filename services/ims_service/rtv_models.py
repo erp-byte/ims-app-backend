@@ -30,6 +30,8 @@ class RTVHeaderCreate(BaseModel):
     transporter_name: Optional[str] = None
     driver_name: Optional[str] = None
     inward_manager: Optional[str] = None
+    location: Optional[str] = None
+    poc_contact: Optional[str] = None
 
 
 class RTVLineCreate(BaseModel):
@@ -76,6 +78,8 @@ class RTVHeaderUpdate(BaseModel):
     transporter_name: Optional[str] = None
     driver_name: Optional[str] = None
     inward_manager: Optional[str] = None
+    location: Optional[str] = None
+    poc_contact: Optional[str] = None
 
 
 class RTVBoxUpsertRequest(BaseModel):
@@ -110,6 +114,8 @@ class RTVApprovalHeaderFields(BaseModel):
     sales_poc_email: Optional[str] = None
     business_head: Optional[str] = None
     remark: Optional[str] = None
+    location: Optional[str] = None
+    poc_contact: Optional[str] = None
 
 
 class RTVApprovalLineFields(BaseModel):
@@ -272,6 +278,8 @@ class RTVHeaderResponse(BaseModel):
     transporter_name: Optional[str] = None
     driver_name: Optional[str] = None
     inward_manager: Optional[str] = None
+    location: Optional[str] = None
+    poc_contact: Optional[str] = None
     status: str
     created_by: Optional[str] = None
     created_ts: Optional[datetime] = None

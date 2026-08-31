@@ -357,22 +357,31 @@ def _rtv_email_html(
         ("Return ID", header.get("rtv_id", "")),
         ("Return Date", fmt_ist(header.get("rtv_date")) or "-"),
         ("Factory Unit", header.get("factory_unit", "")),
+        ("Location", header.get("location", "") or "-"),
         ("Customer", header.get("customer", "")),
         ("Invoice Number", header.get("invoice_number", "") or "-"),
         ("Challan No", header.get("challan_no", "") or "-"),
         ("DN No", header.get("dn_no", "") or "-"),
         ("Sales POC", header.get("sales_poc", "") or "-"),
+        ("POC Contact", header.get("poc_contact", "") or "-"),
         ("Business Head", header.get("business_head", "") or "-"),
         ("Remark", header.get("remark", "") or "-"),
         ("Status", header.get("status", "")),
         ("Created By", _format_actor(header.get("created_by"))),
     ]
 
+    # Free-text, user-typed values: escape them for the HTML table so a stray "<" or
+    # "&" cannot corrupt the markup. Only these two are escaped -- the other rows are
+    # left byte-identical to keep this change scoped. The plain-text fallback below
+    # iterates the same list and deliberately uses the raw value.
+    _escape_in_html = {"Location", "POC Contact"}
+
     header_rows = ""
     for label, value in header_fields:
+        cell = escape(str(value)) if label in _escape_in_html else value
         header_rows += f"""<tr>
             <td style="padding:6px 10px;border:1px solid #e0e0e0;font-weight:bold;background:#f8f9fa;width:160px;">{label}</td>
-            <td style="padding:6px 10px;border:1px solid #e0e0e0;">{value}</td>
+            <td style="padding:6px 10px;border:1px solid #e0e0e0;">{cell}</td>
         </tr>"""
 
     lines_html = _build_lines_html(lines)
@@ -890,10 +899,13 @@ def notify_rtv_deleted(
     lines_count: int | None = None,
     boxes_count: int | None = None,
     factory_unit: str | None = None,
+    location: str | None = None,
+    poc_contact: str | None = None,
 ) -> None:
     """Send notification email when an RTV is deleted."""
     header = {"rtv_id": rtv_id, "status": "Deleted", "business_head": business_head,
-              "created_by": created_by, "factory_unit": factory_unit}
+              "created_by": created_by, "factory_unit": factory_unit,
+              "location": location, "poc_contact": poc_contact}
     removed = []
     if lines_count is not None:
         removed.append(f"{lines_count} line item{'s' if lines_count != 1 else ''}")
@@ -951,9 +963,11 @@ def notify_rtv_header_updated(rtv_detail: dict) -> None:
 
 _UPD_HEADER_FIELDS = [
     ("rtv_id", "Return ID"), ("rtv_date", "Return Date"),
-    ("factory_unit", "Factory Unit"), ("customer", "Customer"),
+    ("factory_unit", "Factory Unit"), ("location", "Location"),
+    ("customer", "Customer"),
     ("invoice_number", "Invoice Number"), ("challan_no", "Challan No"),
     ("dn_no", "DN No"), ("sales_poc", "Sales POC"),
+    ("poc_contact", "POC Contact"),
     ("business_head", "Business Head"), ("remark", "Remark"),
     ("status", "Status"), ("created_by", "Created By"),
 ]

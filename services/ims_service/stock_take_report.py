@@ -27,7 +27,7 @@ from shared.config_loader import settings
 from shared.database import SessionLocal
 from shared.logger import get_logger
 from shared.timezone import now_ist
-from shared.mail_identity import Module, SubjectPolicy, stamp
+from shared.mail_identity import Module, SubjectPolicy, deliverable, stamp
 from services.ims_service.report_delivery import Ledger
 from services.ims_service.stock_take import build
 from services.ims_service.stock_take_html import (
@@ -42,7 +42,6 @@ logger = get_logger("stock_take_report")
 REPORT_TO = [
     "yash@candorfoods.in",              # Yash Gawdi
     "sunil.jasoria@candorfoods.in",     # Sunil Jasoria
-    "b.hrithik@candorfoods.in",         # B Hrithik
     "digamber.sawant@candorfoods.in",   # Digamber Sawant
     "rmpatil@candorfoods.in",           # R M Patil
     "satyendra@candorfoods.in",         # Satyendra Garg
@@ -76,6 +75,7 @@ def _send_mail(subject: str, html_body: str, plain_body: str,
                revised: bool = False, message_id: str | None = None,
                in_reply_to: str | None = None) -> None:
     """Send synchronously and raise on failure — the caller records the outcome."""
+    to, cc = deliverable(to), deliverable(cc)
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = settings.SMTP_EMAIL

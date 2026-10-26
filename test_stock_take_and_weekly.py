@@ -13,7 +13,9 @@ from services.ims_service.stock_take import (
     _clean_name, aggregate, best_name, canon_floor, canon_group, canon_wh,
     fingerprint, in_scope, outstanding, roster_split, scope_warehouses, top_skus,
 )
+import services.ims_service.weekly_report as weekly_report
 from services.ims_service.weekly_report import internal_only, week_bounds
+from shared.mail_identity import deliverable
 
 DAY = date(2026, 8, 14)
 
@@ -158,16 +160,36 @@ def test_week_bounds_is_always_a_complete_week():
 
 
 def test_internal_only_allowlists_external_and_dedupes():
-    keep, dropped = internal_only([
-        "yash@candorfoods.in", "YASH@candorfoods.in", " b.hrithik@candorfoods.in ",
-        "dipesh.sharma@ofbusiness.in",          # cleared by name
-        "someone.else@ofbusiness.in",           # same domain, NOT cleared
-        "", None,
-    ])
-    assert keep == ["yash@candorfoods.in", "b.hrithik@candorfoods.in",
-                    "dipesh.sharma@ofbusiness.in"]
+    saved = weekly_report.EXTERNAL_ALLOWED
+    weekly_report.EXTERNAL_ALLOWED = {"partner@ofbusiness.in"}
+    try:
+        keep, dropped = internal_only([
+            "yash@candorfoods.in", "YASH@candorfoods.in", " digamber.sawant@candorfoods.in ",
+            "partner@ofbusiness.in",                # cleared by name
+            "someone.else@ofbusiness.in",           # same domain, NOT cleared
+            "", None,
+        ])
+    finally:
+        weekly_report.EXTERNAL_ALLOWED = saved
+    assert keep == ["yash@candorfoods.in", "digamber.sawant@candorfoods.in",
+                    "partner@ofbusiness.in"]
     # the allowlist is per address, never per domain
     assert dropped == ["someone.else@ofbusiness.in"]
+
+
+def test_no_external_address_is_cleared_today():
+    keep, dropped = internal_only(["yash@candorfoods.in", "dipesh.sharma@ofbusiness.in"])
+    assert keep == ["yash@candorfoods.in"]
+    assert dropped == ["dipesh.sharma@ofbusiness.in"]
+
+
+def test_suppressed_recipients_never_delivered():
+    # case and stray spaces must not let a blocked address through
+    assert deliverable([
+        "yash@candorfoods.in", " B.Hrithik@candorfoods.in ",
+        "dipesh.sharma@ofbusiness.in", "", None,
+    ]) == ["yash@candorfoods.in"]
+    assert deliverable(None) == []
 
 
 def test_warehouse_scope_keeps_the_two_primaries():

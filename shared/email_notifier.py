@@ -8,7 +8,7 @@ from urllib.parse import quote
 from shared.canonicalize import canonical_warehouse
 from shared.config_loader import settings
 from shared.logger import get_logger
-from shared.mail_identity import Module, SubjectPolicy, stamp
+from shared.mail_identity import Module, SubjectPolicy, deliverable, stamp
 from shared.timezone import now_ist, fmt_ist
 
 logger = get_logger("email.notifier")
@@ -23,14 +23,16 @@ def _build_rtv_action_url(rtv_id: str, bh_email: str, action: str) -> str:
 
 RTV_NOTIFY_TO = "pooja.parkar@candorfoods.in"
 JOB_WORK_TO = "billing@candorfoods.in"
-JOB_WORK_CC = ["b.hrithik@candorfoods.in", "digamber.sawant@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
-WEEKLY_DIGEST_TO = ["b.hrithik@candorfoods.in", "digamber.sawant@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
-# A list, not a bare string, now that it is more than one person; _send_email_background
-# already takes `str | list[str]`.
-INWARD_DELETE_TO = ["b.hrithik@candorfoods.in", "digamber.sawant@candorfoods.in"]
+JOB_WORK_CC = ["digamber.sawant@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
+WEEKLY_DIGEST_TO = ["digamber.sawant@candorfoods.in", "vaibhav.kumkar@candorfoods.in"]
+# Kept a list so adding a second person is a one-line change; _send_email_background
+# takes `str | list[str]`.
+INWARD_DELETE_TO = ["digamber.sawant@candorfoods.in"]
 
 # Business Head -> email map for RTV notifications.
 # Keys are matched case-insensitively against the business_head value stored on the RTV.
+# The return's own Business Head goes in TO; every OTHER head is CC'd on each
+# per-return mail (not on the weekly roll-up, which uses RTV_CC_CONSTANT only).
 BUSINESS_HEAD_EMAILS = {
     "Prashant Pal": "prashant.pal@candorfoods.in",
     "Ajay Bajaj": "ajay@candorfoods.in",
@@ -66,12 +68,10 @@ SALES_POC_EMAILS = {
 # Constant CCs added to every RTV notification.
 RTV_CC_CONSTANT = [
     "sunil.jasoria@candorfoods.in",
-    "b.hrithik@candorfoods.in",
     "digamber.sawant@candorfoods.in",
     "billing@candorfoods.in",
     "satyendra@candorfoods.in",
     "sachin.more@candorfoods.in",
-    "dipesh.sharma@ofbusiness.in",
     "yash@candorfoods.in",   # Yash Gawdi — mandatory CC on every customer-return mail
     "rmpatil@candorfoods.in",  # R M Patil — mandatory CC on every customer-return mail
 ]
@@ -167,8 +167,8 @@ def _build_rtv_cc(
     sales_poc_email: str | None = None,
     factory_unit: str | None = None,
 ) -> list[str]:
-    """Build CC list: selected Sales POC + constant CC + entry-maker(s) +
-    the warehouse-specific recipient for ``factory_unit``.
+    """Build CC list: selected Sales POC + constant CC + all business heads +
+    entry-maker(s) + the warehouse-specific recipient for ``factory_unit``.
 
     The business head goes in TO (not CC), so ``business_head`` is used only to
     EXCLUDE that address from CC (e.g. when the approver/rejecter is the BH).
@@ -184,6 +184,7 @@ def _build_rtv_cc(
     if sales_poc_email and sales_poc_email.strip():
         cc.append(sales_poc_email.strip())
     cc.extend(RTV_CC_CONSTANT)
+    cc.extend(BUSINESS_HEAD_EMAILS.values())
     for actor in actors:
         if actor:
             cc.append(actor)
@@ -247,14 +248,18 @@ def _send_email_background(
     """
     def _send():
         try:
-            to_list = [to] if isinstance(to, str) else list(to)
+            to_list = deliverable([to] if isinstance(to, str) else list(to))
+            cc_list = deliverable(cc)
+            if not to_list and not cc_list:
+                logger.warning(f"No deliverable recipients, not sent: {subject}")
+                return
 
             msg = EmailMessage()
             msg["Subject"] = subject
             msg["From"] = settings.SMTP_EMAIL
             msg["To"] = ", ".join(to_list)
-            if cc:
-                msg["Cc"] = ", ".join(cc)
+            if cc_list:
+                msg["Cc"] = ", ".join(cc_list)
             msg.set_content(plain_body)
             msg.add_alternative(html_body, subtype="html")
 
@@ -270,7 +275,7 @@ def _send_email_background(
                   entity_id=entity_id, event=event, event_label=event_label,
                   status=status, actor=actor, sender=settings.SMTP_EMAIL)
 
-            recipients = to_list + (cc or [])
+            recipients = to_list + cc_list
 
             with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
                 server.starttls()
@@ -570,8 +575,8 @@ def notify_rtv_created(rtv_detail: dict) -> None:
     lines = rtv_detail.get("lines", [])
     boxes = rtv_detail.get("boxes", [])
 
-    # CC = constant CC + selected/manual Sales POC + creator.
-    cc_candidates: list[str] = list(RTV_CC_CONSTANT)
+    # CC = constant CC + all business heads + selected/manual Sales POC + creator.
+    cc_candidates: list[str] = list(RTV_CC_CONSTANT) + list(BUSINESS_HEAD_EMAILS.values())
     poc_email = _lookup_sales_poc_email(rtv_detail.get("sales_poc"))
     if poc_email:
         cc_candidates.append(poc_email)
@@ -758,8 +763,8 @@ def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: st
     """Send a confirmation mail after an Approve / Reject / Hold action.
 
     Uses the same recipient pattern as notify_rtv_created (BH + pooja in TO,
-    constants + creator in CC) so everyone on the original Created mail sees
-    the outcome.
+    constants + all business heads + creator in CC) so everyone on the original
+    Created mail sees the outcome.
     """
     rtv_id = rtv_detail.get("rtv_id", "")
     html, plain = _rtv_email_html(
@@ -777,7 +782,7 @@ def notify_rtv_status_changed(rtv_detail: dict, new_status: str, actioned_by: st
     to_list.append(RTV_NOTIFY_TO)
 
     to_lower = {addr.strip().lower() for addr in to_list}
-    cc_candidates: list[str] = list(RTV_CC_CONSTANT)
+    cc_candidates: list[str] = list(RTV_CC_CONSTANT) + list(BUSINESS_HEAD_EMAILS.values())
     poc_email = _lookup_sales_poc_email(rtv_detail.get("sales_poc"))
     if poc_email:
         cc_candidates.append(poc_email)
@@ -2278,7 +2283,7 @@ def notify_inward_deleted(
     created_by: str | None = None,
     items: list | None = None,
 ) -> None:
-    """Notify b.hrithik / digamber.sawant when an inward transaction is deleted."""
+    """Notify INWARD_DELETE_TO when an inward transaction is deleted."""
     deleted_at = now_ist().strftime("%d %b %Y, %I:%M %p")
     rows = [
         ("Transaction No", transaction_no),

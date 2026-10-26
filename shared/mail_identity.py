@@ -59,6 +59,22 @@ BRAND = "Candor"
 # Test/staging sends get a visible marker so nobody acts on a rehearsal.
 MAIL_ENV = (os.getenv("MAIL_ENV") or "PROD").strip().upper()
 
+# Addresses that never receive an IMS notification, however the recipient list was
+# built — a fixed list, a Sales POC picked on the record, or the user who created /
+# approved / deleted it. Every sender filters through `deliverable` as its last step,
+# so a new list or a new actor field cannot quietly add them back. The OTP mail is
+# the one exception: it only ever goes to the person asking for their own code.
+SUPPRESSED_RECIPIENTS = frozenset({
+    "b.hrithik@candorfoods.in",
+    "dipesh.sharma@ofbusiness.in",
+})
+
+
+def deliverable(addrs) -> list[str]:
+    """`addrs` minus SUPPRESSED_RECIPIENTS (case- and space-insensitive), order kept."""
+    return [a for a in (addrs or [])
+            if a and a.strip().lower() not in SUPPRESSED_RECIPIENTS]
+
 
 class Module(str, Enum):
     """Each value is the List-Id label; see MODULES for the rest."""

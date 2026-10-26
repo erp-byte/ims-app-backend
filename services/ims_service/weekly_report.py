@@ -35,8 +35,7 @@ EXTERNAL RECIPIENTS
     Allowed, by name only. A weekly roll-up of every customer return is a wider
     disclosure than the single-return CC that earned someone their place on the
     RTV list, so an outside address has to be written into `EXTERNAL_ALLOWED`
-    here before it can receive one. `dipesh.sharma@ofbusiness.in` is on that
-    list at the business's explicit instruction.
+    here before it can receive one. No outside address is cleared at present.
 
     Anything outside candorfoods.in and not on that list is dropped and named in
     the log — so adding an external reader stays a decision someone makes on
@@ -55,7 +54,7 @@ from shared.config_loader import settings
 from shared.database import SessionLocal
 from shared.logger import get_logger
 from shared.timezone import now_ist
-from shared.mail_identity import Module, SubjectPolicy, stamp
+from shared.mail_identity import Module, SubjectPolicy, deliverable, stamp
 from services.ims_service.report_delivery import Ledger
 
 logger = get_logger("weekly_report")
@@ -65,9 +64,7 @@ INTERNAL_DOMAIN = "@candorfoods.in"
 # Outside addresses cleared to receive a weekly roll-up. Named individually
 # rather than by domain: this is the list that decides who outside the company
 # sees a whole week of returns at once, and it should be short enough to read.
-EXTERNAL_ALLOWED = {
-    "dipesh.sharma@ofbusiness.in",     # OfBusiness — on the standing RTV CC
-}
+EXTERNAL_ALLOWED: set[str] = set()
 
 WEEKLY_HOUR, WEEKLY_MIN = 10, 0        # Monday, IST
 
@@ -666,6 +663,7 @@ def view_url(key: str, start: date) -> str | None:
 # ═════════════════════════════════════════════════════════════════════════
 def _send_mail(subject: str, html_body: str, plain_body: str, to: list[str], *,
                key: str, start: date, message_id: str | None) -> None:
+    to = deliverable(to)
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = settings.SMTP_EMAIL

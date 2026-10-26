@@ -59,7 +59,7 @@ from shared.config_loader import settings
 from shared.database import SessionLocal
 from shared.logger import get_logger
 from shared.timezone import IST, now_ist
-from shared.mail_identity import Module, SubjectPolicy, stamp
+from shared.mail_identity import Module, SubjectPolicy, deliverable, stamp
 from services.ims_service.daily_report_ops import fetch_and_aggregate as ops_data
 from services.ims_service.daily_report_gaps import compute_gaps
 from services.ims_service.daily_report_users import compute_idle
@@ -95,7 +95,6 @@ def day_subject(day: date) -> str:
 
 # ── recipients ───────────────────────────────────────────────────────────
 REPORT_TO = [
-    "b.hrithik@candorfoods.in",
     "digamber.sawant@candorfoods.in",
     "yash@candorfoods.in",
     "sunil.jasoria@candorfoods.in",
@@ -938,6 +937,7 @@ def _send_mail(subject: str, html_body: str, plain_body: str,
     The report lives in the message body; the PDF is optional and off by default
     (it is still available on demand from /daily-report/preview).
     """
+    to, cc = deliverable(to), deliverable(cc)
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = settings.SMTP_EMAIL

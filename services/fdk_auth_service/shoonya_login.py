@@ -13,6 +13,7 @@ without importing the package __init__ (which pulls in psycopg2 via the token ma
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import Callable, Optional
 
@@ -35,13 +36,26 @@ def _totp_now(secret: str) -> str:
     return pyotp.TOTP(secret).now()
 
 
+def _snippet(text: str) -> str:
+    """First words of a non-JSON reply (HTML tags stripped) for the error message."""
+    plain = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text or "")).strip()
+    return plain[:120] if plain else "(empty body)"
+
+
 def _post(url: str, jdata: dict, jkey: Optional[str] = None) -> dict:
     """The broker's form convention: jData=<json>[&jKey=<session token>]."""
     payload = "jData=" + json.dumps(jdata)
     if jkey:
         payload += f"&jKey={jkey}"
     resp = requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
-    return json.loads(resp.text)
+    try:
+        return json.loads(resp.text)
+    except ValueError:
+        # A WAF block, a dead upstream (502/503) or a wrong URL answers with HTML
+        # or nothing; say so instead of leaking a JSON-decoder message.
+        raise RuntimeError(
+            f"HTTP {resp.status_code} non-JSON reply from the broker: {_snippet(resp.text)}"
+        ) from None
 
 
 def login(creds: dict) -> dict:

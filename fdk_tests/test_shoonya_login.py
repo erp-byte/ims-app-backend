@@ -96,6 +96,36 @@ def test_login_reports_the_brokers_error_message(monkeypatch):
     assert "Invalid Input : Wrong Password" in result["error"]
 
 
+class _HtmlResp:
+    """What a WAF, a dead upstream or a wrong URL sends back: not JSON."""
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text
+
+
+def test_login_reports_http_status_when_the_reply_is_not_json(monkeypatch):
+    monkeypatch.setattr(shoonya.requests, "post",
+                        lambda *a, **k: _HtmlResp(502, "<html><head><title>502 Bad Gateway"
+                                                       "</title></head><body>nginx</body></html>"))
+    monkeypatch.setattr(shoonya, "_totp_now", lambda secret: "123456")
+
+    result = shoonya.login(CREDS)
+
+    assert "access_token" not in result
+    assert "HTTP 502" in result["error"]
+    assert "Bad Gateway" in result["error"]
+    assert "Expecting value" not in result["error"]      # no raw JSON-decoder noise
+
+
+def test_validate_session_reports_http_status_when_the_reply_is_not_json(monkeypatch):
+    monkeypatch.setattr(shoonya.requests, "post", lambda *a, **k: _HtmlResp(503, ""))
+
+    ok, detail = shoonya.validate_session("FA12345", "sess-1")
+
+    assert ok is False
+    assert "HTTP 503" in detail and "empty" in detail.lower()
+
+
 def test_login_reports_network_failure_instead_of_raising(monkeypatch):
     def _boom(*a, **k):
         raise shoonya.requests.ConnectionError("dns down")

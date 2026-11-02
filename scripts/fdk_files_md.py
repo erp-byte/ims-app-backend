@@ -24,7 +24,6 @@ FDK_DIRS = [
 FDK_FILES = [
     "fdk_main.py",
     "fdk_requirements.txt",
-    "fdk_requirements_nodeps.txt",
     "fdk_env.example",
     "FDK_FILES.md",
     "scripts/fdk_files_md.py",
@@ -84,7 +83,7 @@ def render() -> str:
     lines = [
         "# FDK_FILES.md",
         "",
-        "Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyersdk), "
+        "Every file that belongs to fdk (the Shoonya volume spike detector merged from fyersdk), "
         "with the classes/functions each one defines. Regenerate with `python scripts/fdk_files_md.py`.",
         "",
         "## fdk files",

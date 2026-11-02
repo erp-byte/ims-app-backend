@@ -18,10 +18,18 @@ IST = ZoneInfo("Asia/Kolkata")
 # Market schedule
 MARKET_START_TIME = "09:13"
 MARKET_END_TIME = "16:00"
+# Trading closes before the supervisor stands down; ticks stop here.
+MARKET_CLOSE_TIME = "15:30"
 
 # Daily token wipe — clear stored credentials each evening so the next
 # 09:13 login is always a fresh full TOTP login (17:00 IST, after market close).
 DAILY_TOKEN_RESET_TIME = "17:00"
+
+# Shoonya market feed. Scrips are sent in batches rather than one request each,
+# with a short pause between batches, so start-up does not flood the gateway.
+FEED_EXCHANGE = "NSE"
+SUBSCRIBE_BATCH_SIZE = 100            # scrips per subscribe frame
+SUBSCRIBE_BATCH_DELAY = 0.1           # seconds between subscribe frames
 
 # Minimum gap between WebSocket rebuilds, so a hard-down socket cannot
 # spam reconnects and Telegram alerts every supervisor tick.
@@ -53,6 +61,9 @@ FDK_STARTUP_TIMEOUT = 120
 FDK_SELF_PING = _flag("FDK_SELF_PING")
 SELF_PING_INTERVAL = 420              # 7 min
 SUMMARY_SEND_TIME = "16:30"           # 4:30 PM IST
+
+# gspread waits forever by default: (connect, read) seconds for each Sheets call.
+SHEETS_TIMEOUT = (10, 30)
 
 # Google Sheets headers
 SHEET_HEADERS = ['Date', 'Time', 'Symbol', 'LTP', 'Volume_Spike',

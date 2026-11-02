@@ -409,6 +409,29 @@ def test_missing_env_is_contained(fresh_state, monkeypatch, posted):
         assert client.get("/fdk/health").json()["status"] == "unavailable"
 
 
+def test_health_shows_the_feed_and_shutdown_closes_it(fresh_state, monkeypatch, posted,
+                                                       fake_supabase, idle_orchestrator):
+    for key, value in FDK_ENV.items():
+        monkeypatch.setenv(key, value)
+    closed = []
+
+    class Dispatcher:
+        def status(self):
+            return {"connected": True, "acknowledged": 660, "requested": 660}
+
+        def close(self):
+            # Still running, the supervisor would see no feed and open a new one.
+            task = fdk_main.fdk_state.task
+            closed.append(task.cancelling() > 0 or task.done())
+
+    with TestClient(_make_app()) as client:
+        orchestrator = fdk_main.fdk_state.orchestrator
+        assert client.get("/fdk/health").json()["feed"]["connected"] is False
+        orchestrator._dispatcher = Dispatcher()
+        assert client.get("/fdk/health").json()["feed"]["acknowledged"] == 660
+    assert closed == [True]
+
+
 @pytest.mark.skipif(not (ROOT / ".env").exists(), reason="backend .env needed to import main")
 def test_backend_main_is_wired(fresh_state, monkeypatch):
     monkeypatch.setenv("FDK_ENABLED", "false")

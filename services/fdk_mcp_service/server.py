@@ -47,7 +47,7 @@ def build_mcp(orchestrator=None) -> FastMCP:
     mcp = FastMCP(
         "fyersdk",
         instructions=(
-            "News + Fyers volume spike detector tools. "
+            "News + Shoonya volume spike detector tools. "
             "Use fetch_news_headlines with any RSS URL (see list_news_feeds), "
             "fetch_article_content for full articles, and the get_* tools "
             "for detector status and volume spike summaries."

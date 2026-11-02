@@ -1,7 +1,7 @@
 """Unit tests for supervisor scheduler helpers.
 
 schedular.py is loaded via importlib file-load because its package __init__
-imports the orchestrator (-> fyers_apiv3, unavailable on Python 3.14).
+imports the orchestrator and everything behind it.
 """
 import importlib.util
 import pathlib

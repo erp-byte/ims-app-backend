@@ -1,5 +1,8 @@
 """Telegram message templates."""
+import html
 from shared.fdk_models import TradeAlert
+
+COVERAGE_NAMES_SHOWN = 20
 
 
 def trade_alert_message(alert: TradeAlert) -> str:
@@ -58,11 +61,42 @@ def restart_complete_message() -> str:
     return "<b>Restart Complete</b>\n\nAll detectors are back online."
 
 
-def monitoring_started_message(fyers_count: int, penny_count: int) -> str:
+def monitoring_started_message(shoonya_count: int, penny_count: int) -> str:
     return (
         f"<b>Monitoring Started</b>\n\n"
-        f"Fyers: {fyers_count} symbols\n"
+        f"Shoonya: {shoonya_count} symbols\n"
         f"Penny: {penny_count} symbols"
+    )
+
+
+def feed_coverage_warning_message(report: dict) -> str:
+    """report: from TickDispatcher.take_coverage_report; detectors are shoonya then penny."""
+    shoonya_missing, penny_missing = report["missing_by_detector"]
+    names = html.escape(", ".join(report["missing"][:COVERAGE_NAMES_SHOWN]))
+    more = len(report["missing"]) - COVERAGE_NAMES_SHOWN
+    return (
+        f"<b>Feed coverage warning</b>\n\n"
+        f"Shoonya acknowledged {report['acknowledged']} of {report['requested']} symbols.\n"
+        f"Not monitored: Shoonya {shoonya_missing}, Penny {penny_missing}.\n"
+        f"{names}{f' and {more} more (all named in the log)' if more > 0 else ''}"
+    )
+
+
+def feed_not_up_message(no_token: int) -> str:
+    detail = f"\n{no_token} symbols have no Shoonya token." if no_token else ""
+    return (
+        f"<b>Feed warning</b>\n\n"
+        f"The Shoonya feed is not up, so nothing is being detected. Still retrying.{detail}"
+    )
+
+
+def feed_rejected_message(reason: str, retrying: bool) -> str:
+    next_step = ("Logging in again." if retrying else
+                 "A fresh login was rejected too, so the feed stays off until this is "
+                 "fixed and you send /rst.")
+    return (
+        f"<b>Feed rejected</b>\n\n"
+        f"The Shoonya feed rejected the session: {html.escape(reason)}\n{next_step}"
     )
 
 
@@ -85,7 +119,7 @@ def summary_date_confirm_message(date_str: str, day_name: str) -> str:
 def websocket_rebuild_message() -> str:
     return (
         "<b>WebSocket Rebuild</b>\n\n"
-        "The Fyers feed stopped delivering ticks (dropped socket, exhausted "
+        "The Shoonya feed stopped delivering ticks (dropped socket, exhausted "
         "reconnects, or a subscription that never landed).\n"
         "Tearing it down and reconnecting now."
     )

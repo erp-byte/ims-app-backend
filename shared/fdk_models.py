@@ -23,8 +23,8 @@ class TradeAlert(BaseModel):
 
 
 class DetectorConfig(BaseModel):
-    """Per-detector configuration (fyers vs penny)."""
-    name: str                        # "fyers" or "penny"
+    """Per-detector configuration (shoonya vs penny)."""
+    name: str                        # "shoonya" or "penny"
     threshold: int
     google_sheet_id: str
     symbols: list[str]

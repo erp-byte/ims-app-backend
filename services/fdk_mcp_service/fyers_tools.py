@@ -7,7 +7,7 @@ from shared.fdk_logger import get_logger
 
 log = get_logger("mcp_fyers")
 
-VALID_DETECTORS = ("fyers", "penny")
+VALID_DETECTORS = ("shoonya", "penny")
 
 
 def _parse_date(date_str: str) -> datetime | None:
@@ -31,8 +31,8 @@ def register_fyers_tools(mcp, orchestrator) -> None:
 
     @mcp.tool()
     async def get_detector_status() -> dict:
-        """Current status of the Fyers and Penny volume spike detectors:
-        running state, hold mode, market hours."""
+        """Current status of the Shoonya and Penny volume spike detectors:
+        running state, the market feed, hold mode, market hours."""
         if orchestrator is None:
             return _unavailable()
         from services.fdk_supervisor_service.schedular import is_market_hours
@@ -45,6 +45,7 @@ def register_fyers_tools(mcp, orchestrator) -> None:
             "last_login_at": last_login.isoformat() if last_login else None,
             "last_auth_error": getattr(auth, "last_error", None),
             "on_hold": orchestrator.on_hold,
+            "feed": orchestrator.feed_status(),
             "fyers_running": orchestrator.fyers.is_running,
             "penny_running": orchestrator.penny.is_running,
             "market_hours": is_market_hours(),
@@ -53,14 +54,14 @@ def register_fyers_tools(mcp, orchestrator) -> None:
         }
 
     @mcp.tool()
-    async def get_volume_summary(detector: str = "fyers",
+    async def get_volume_summary(detector: str = "shoonya",
                                  date: str = "",
                                  days_back: int = 0) -> dict:
         """Top-15 volume spike summary (by trade count) from the alert sheet.
 
         Args:
-            detector: 'fyers' (large-cap, Rs 3 Cr threshold) or
-                'penny' (small-cap, Rs 52 Lakh threshold)
+            detector: 'shoonya' (large-cap, Rs 3 Cr threshold) or
+                'penny' (small-cap, Rs 50 Lakh threshold)
             date: Anchor date as DD-MM-YYYY (default: today IST)
             days_back: Include N days before the anchor date (0 = single day)
         """
@@ -75,7 +76,7 @@ def register_fyers_tools(mcp, orchestrator) -> None:
             if target is None:
                 return {"error": "Invalid date. Use DD-MM-YYYY."}
 
-        service = (orchestrator.fyers_summary if detector == "fyers"
+        service = (orchestrator.fyers_summary if detector == "shoonya"
                    else orchestrator.penny_summary)
         days_back = max(0, min(int(days_back), 31))
         label = {0: "Daily"}.get(days_back, f"{days_back + 1}-Day")
@@ -90,11 +91,11 @@ def register_fyers_tools(mcp, orchestrator) -> None:
         return {"detector": detector, "summary": msg}
 
     @mcp.tool()
-    async def list_monitored_symbols(detector: str = "fyers") -> dict:
+    async def list_monitored_symbols(detector: str = "shoonya") -> dict:
         """List active NSE symbols monitored by a detector.
 
         Args:
-            detector: 'fyers' (large-cap) or 'penny' (small-cap)
+            detector: 'shoonya' (large-cap) or 'penny' (small-cap)
         """
         if orchestrator is None:
             return _unavailable()
@@ -107,7 +108,7 @@ def register_fyers_tools(mcp, orchestrator) -> None:
 
     @mcp.tool()
     async def get_sector_mapping(symbol: str = "") -> dict:
-        """Get sector for an NSE symbol (e.g. 'NSE:TCS-EQ'), or counts of
+        """Get sector for an NSE symbol (e.g. 'TCS-EQ'), or counts of
         all sectors if no symbol given."""
         if orchestrator is None:
             return _unavailable()

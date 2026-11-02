@@ -1,13 +1,14 @@
 > **Merged into the Candor backend as `fdk`.** This is the original fyersdk design document with paths, env vars and routes rewritten to the merged layout (`services/fdk_*`, `shared/fdk_*`, `FDK_*` env vars, `/fdk/*` routes). `fdk_main.py` (fdk_lifespan() + fdk_mount(app), imported by the backend's `main.py`) replaces the standalone entry point; there is no fdk-only process. The authoritative file list is `FDK_FILES.md`.
 
-# Fyers Volume Spike Detector
+# Volume Spike Detector
 
 ## Project Overview
-Dual volume spike detector for NSE stocks. Monitors Fyers WebSocket ticks and alerts on large trades via Telegram + Google Sheets.
+Dual volume spike detector for NSE stocks. Monitors Shoonya WebSocket ticks and alerts on large trades via Telegram + Google Sheets.
 
-- **Fyers detector**: Rs 3 Cr threshold, 540 large-cap symbols
-- **Penny detector**: Rs 52 Lakh threshold, 209 small-cap symbols
-- Both share one Shoonya session (authenticated once; the Fyers login was removed)
+- **Shoonya detector** (`stock_symbols.detector = 'shoonya'`): Rs 3 Cr threshold, 539 large-cap symbols. The
+  class, env var and bot names (`FyersService`, `FDK_FYERS_*`) are still the old ones; only the name, no Fyers code
+- **Penny detector**: Rs 50 Lakh threshold, 257 small-cap symbols
+- Both share one Shoonya session and one Shoonya feed socket
 
 ## Architecture
 
@@ -28,7 +29,8 @@ Orchestrator (fdk_supervisor_service/ochestrator.py)
   -> FyersSummaryService (isolated fyers summary generation)
   -> PennySummaryService (isolated penny summary generation)
   -> Market-hour scheduling (09:13 - 16:00 IST)
-  -> Reactive auth refresh (only when Fyers rejects token)
+  -> Shoonya tick feed (TickDispatcher: one socket for both detectors)
+  -> Reactive auth refresh (only when Shoonya rejects token)
 ```
 
 ## Directory Structure
@@ -37,7 +39,6 @@ Orchestrator (fdk_supervisor_service/ochestrator.py)
 Candor backend — only the fdk-owned paths are shown (FDK_FILES.md is the authoritative list)
 ├── fdk_main.py                      # fdk_lifespan() + fdk_mount(app); imported by the backend's main.py
 ├── fdk_requirements.txt             # fdk deps, pulled in by requirements.txt via -r
-├── fdk_requirements_nodeps.txt      # fyers-apiv3, installed with pip --no-deps (see Dockerfile)
 ├── fdk_env.example                  # every FDK_* variable (values live in the backend's .env)
 ├── FDK_FILES.md                     # inventory: paths + functions (python scripts/fdk_files_md.py)
 ├── shared/                          # NOTE: the unprefixed shared/config_loader.py, constants.py, logger.py,
@@ -64,7 +65,7 @@ Candor backend — only the fdk-owned paths are shown (FDK_FILES.md is the autho
 │   │   ├── detector.py              # VolumeSpikeDetector (parameterized)
 │   │   ├── tick_handler.py          # parse_tick(message)
 │   │   ├── trade_analyzer.py        # analyze_trade() -> TradeAlert
-│   │   └── websocket_manager.py     # Fyers data_ws wrapper
+│   │   └── websocket_manager.py     # Shoonya feed: handshake, batched subscribe, tick merge, reconnect
 │   ├── fdk_supervisor_service/
 │   │   ├── ochestrator.py           # Manages services + scheduling
 │   │   ├── run_controller.py        # Thread mgmt for one detector
@@ -101,7 +102,6 @@ Candor backend — only the fdk-owned paths are shown (FDK_FILES.md is the autho
 
 | Variable | Purpose |
 |----------|---------|
-| `FDK_FYERS_CLIENT_ID` | Optional. Fyers app id read only by the dormant Fyers data socket (there is no Fyers login any more); leave empty |
 | `FDK_SHOONYA_USERNAME` | Shoonya user id (e.g. `FA12345`). The Shoonya OAuth login is the only login; with scheduling on the first login runs at 09:13 IST and `/rst` forces one at any time |
 | `FDK_SHOONYA_PASSWORD` | Shoonya login password (typed into Shoonya's own login page by the headless browser) |
 | `FDK_SHOONYA_TOTP_SECRET` | TOTP secret (Profile → Security → TOTP Setup) |
@@ -138,9 +138,9 @@ Every name carries the `FDK_` prefix; `fdk_env.example` is the authoritative lis
 
 ## Supabase Database
 
-All tables auto-created on startup. DSN: `FDK_SUPABASE_DSN` (the project's PostgreSQL connection string)
+All tables except `instruments` are auto-created on startup. DSN: `FDK_SUPABASE_DSN` (the project's PostgreSQL connection string)
 
-**Table: `shoonya_tokens`** (managed by TokenManager; a `fyers_tokens` table from the Fyers era may still exist and is no longer used)
+**Table: `shoonya_tokens`** (managed by TokenManager)
 ```sql
 CREATE TABLE IF NOT EXISTS shoonya_tokens (
     id            SERIAL PRIMARY KEY,
@@ -156,8 +156,9 @@ CREATE TABLE IF NOT EXISTS shoonya_tokens (
 CREATE TABLE IF NOT EXISTS stock_symbols (
     id       SERIAL PRIMARY KEY,
     symbol   TEXT NOT NULL,
-    detector TEXT NOT NULL,           -- 'fyers' or 'penny'
+    detector TEXT NOT NULL,           -- 'shoonya' or 'penny'
     active   BOOLEAN DEFAULT TRUE,
+    isin     TEXT REFERENCES instruments (isin),
     UNIQUE(symbol, detector)
 );
 CREATE INDEX IF NOT EXISTS idx_stock_symbols_detector ON stock_symbols (detector, active);
@@ -167,11 +168,27 @@ CREATE INDEX IF NOT EXISTS idx_stock_symbols_detector ON stock_symbols (detector
 ```sql
 CREATE TABLE IF NOT EXISTS sector_mappings (
     id     SERIAL PRIMARY KEY,
-    symbol TEXT UNIQUE NOT NULL,      -- 'NSE:TCS-EQ'
+    symbol TEXT UNIQUE NOT NULL,      -- 'TCS-EQ'
     sector TEXT NOT NULL              -- 'Information Technology'
 );
 CREATE INDEX IF NOT EXISTS idx_sector_mappings_symbol ON sector_mappings (symbol);
 ```
+
+**Table: `instruments`** (one row per company; NOT created or refreshed by this code. `SymbolManager.load_instrument_tokens`
+reads it, and a symbol with no row here is logged and not subscribed)
+```sql
+CREATE TABLE instruments (
+    isin           TEXT PRIMARY KEY,
+    company_name   TEXT NOT NULL,
+    series         TEXT NOT NULL,              -- EQ, BE, BZ
+    verified_on    DATE NOT NULL,
+    shoonya_symbol TEXT NOT NULL UNIQUE,       -- 'TCS-EQ'
+    shoonya_token  TEXT NOT NULL UNIQUE        -- subscribed as NSE|<token>
+);
+```
+Filled on 2026-11-02 from `https://api.shoonya.com/NSE_symbols.txt.zip`. Shoonya says to re-download that file each
+trading day and nothing does yet, so tokens and names (a series move changes the name) can go stale. The feed logs a
+warning when a snapshot's `ts` differs from the stored name.
 
 **Auto-seed:** On first run, if `stock_symbols` or `sector_mappings` are empty, `SymbolManager` seeds from `config/fdk_symbols.json` and `config/fdk_sectors.json`. After that, Supabase is the source of truth.
 
@@ -203,13 +220,48 @@ The orchestrator runs this ladder (`services/fdk_auth_service/shoonya_authentica
 4. **Exchange**: `POST NorenWClientAPI/GenAcsTok` with `{"code", "checksum": sha256(client_id + secret_code + code), "uid"}`
    → `access_token` (valid for the trading day, no refresh). Stored in `shoonya_tokens`, sent as
    `Authorization: Bearer` afterwards. A rejected code is reported on Telegram and the wait continues.
-5. **Then idle**: the tick feed is still the dormant Fyers socket (step 2 wires Shoonya's
-   `wss://api.shoonya.com/NorenWSAPI/`), so no "Monitoring Started" message; `/fdk/health` shows
-   `login_state: ok`, `login_method: cached|auto|manual` and `last_login_at`.
+5. **Then the feed**: see Tick Feed below. `/fdk/health` shows `login_state: ok`,
+   `login_method: cached|auto|manual` and `last_login_at`.
 
 No redirect URL has to be hosted: the code is read from the browser (step 2) or pasted (step 3).
 Timing: with `FDK_SCHEDULING_ENABLED=true` the first login runs at 09:13 IST; `/rst` forces one at
 any time; the 17:00 IST wipe clears `shoonya_tokens` so the next open is a fresh login.
+
+## Tick Feed (Shoonya WebSocket)
+
+`services/fdk_detector_service/websocket_manager.py`, from Shoonya's websocket-overview and subscribe-market-feed pages,
+checked against the vendor's NorenRestApiOAuth SDK (0.0.41). Not yet run against the live gateway.
+
+1. Open `wss://api.shoonya.com/NorenWSAPI/` (`websocket-client`; ping every 3 s with payload `{"t":"h"}`, as the SDK does).
+2. Send `{"t":"a","uid","actid","source":"API","accesstoken"}` and wait for the ack (`t: ak`, `s: OK`; matched
+   case-insensitively because the docs print `Ok` and the SDK compares `OK`). Anything else marks both detectors'
+   `token_expired`, and the supervisor re-authenticates at most once per `WS_REBUILD_COOLDOWN`.
+3. Subscribe every active symbol once, as `NSE|<token>`, in frames of `SUBSCRIBE_BATCH_SIZE` (100) scrips with
+   `SUBSCRIBE_BATCH_DELAY` (100 ms) between them, off the read thread.
+4. The gateway answers one `tk` full snapshot per scrip. After each subscribe round, on the first connect and on every
+   reconnect, the manager waits up to `ACK_WAIT` and reports any gap: every missing symbol goes to the log, and the login
+   bot gets a "Feed coverage warning" with per-detector counts and names, once per distinct gap. The feed carries on with
+   what it has. The changelog mentions a limit of 500 tokens per connection, and we subscribe 660; if that is enforced,
+   the order in `stock_symbols` (Shoonya symbols first, alphabetically) decides who is lost.
+5. After that, `tf` diffs carry only changed fields. `TickDispatcher` merges them per token on the read thread and queues
+   the merged tick (only when `v` changed) for a worker thread that runs the detectors. Detectors do no I/O on that thread:
+   alerts go on a per-detector queue, delivered to Sheets and Telegram by the detector's own `start()` thread, so a slow
+   or hung sheet write costs no ticks. Sheets calls have `SHEETS_TIMEOUT`.
+6. A `tk` is a baseline, not a trade: after a reconnect its jump from the last value is outage volume. `v` is cumulative, so
+   a tick lost to a full queue would make the next one look like one huge trade. The dispatcher therefore marks the next
+   delivered tick for that token as a `tk`, and the gap's volume is simply not evaluated.
+7. `SOCKET_TIMEOUT` bounds the dial, the handshake and a frame stuck half way (websocket-client's default is to wait
+   forever); an idle socket is unaffected. On a drop the manager reconnects with exponential backoff (1 s doubling to 30 s,
+   `RECONNECT_RETRY` tries) and replays steps 2-3. Only a socket that opened and stayed up `STABLE_CONNECTION_SECONDS` earns a
+   fresh budget. `needs_rebuild()` stays False during the retries, then turns True when they run out, the connect is
+   rejected, a socket gets no `tk` within `SOCKET_OPEN_TIMEOUT`, or `tf` ticks stop for `FEED_STALL_SECONDS` before the
+   15:30 IST close. The supervisor then rebuilds, at most once per `WS_REBUILD_COOLDOWN`.
+8. A rejected connect (`Not_Ok`) is a problem with the session, which REST may still accept. The supervisor sends
+   "Feed rejected", discards the stored session and logs in fresh. If the socket refuses that too, it says so and stays off
+   until `/rst` or the next day; `login_state` is `failed` and `last_auth_error` has the reason.
+9. Operator messages go once per change: "Monitoring Started" only once a socket has acknowledged scrips and again after
+   a recovery, one "feed is not up" or "WebSocket Rebuild" per outage. `/fdk/health` and the MCP `get_detector_status` tool
+   carry a `feed` block: connected, acknowledged, requested, no_token, seconds_since_tick, dropped.
 
 ## Telegram Commands
 
@@ -332,14 +384,14 @@ At 16:30 IST (SummaryScheduler checks every 30s):
 ## Key Design Decisions
 
 - **Shared token**: one ShoonyaAuthenticator, its session token passed to both services
-- **Shared WebSocket via TickDispatcher**: `FyersDataSocket` is a singleton — only one WS connection per process. `TickDispatcher` subscribes to all 749 symbols on one WebSocket and routes each tick to the correct detector(s) by symbol lookup
+- **Shared WebSocket via TickDispatcher**: Shoonya allows one connection per session. `TickDispatcher` subscribes each active symbol once on one WebSocket and routes each tick to the correct detector(s) by symbol lookup
 - **Isolated services**: `FyersService` and `PennyService` each own their detector, controller, sheets, and senders — no shared state
 - **Isolated summaries**: `FyersSummaryService` and `PennySummaryService` each own their `SummaryGenerator` — no shared state
 - **Webhook on all bots**: All 5 bots have webhooks set to `/fdk/webhook/telegram` — commands work from any bot chat
 - **Supabase not local JSON**: Token persists across deploys, INSERT-based audit trail
-- **Parameterized detector**: Single `VolumeSpikeDetector` class serves both fyers/penny via `DetectorConfig`
+- **Parameterized detector**: Single `VolumeSpikeDetector` class serves both shoonya/penny via `DetectorConfig`
 - **Chat restriction, not user restriction**: messages are handled only when they come from one of the five configured chats; any member of those chats can send the commands
-- **Reactive token refresh**: No timer/polling — detectors run until Fyers rejects the token, then orchestrator re-authenticates and restarts
+- **Reactive token refresh**: No timer/polling — detectors run until the Shoonya feed rejects the token, then orchestrator re-authenticates and restarts
 - **Telegram commands**: `/hld` stops everything (holidays), `/rst` re-authenticates and restarts
 - **IST everywhere**: All timestamps use `datetime.now(IST)` — works correctly regardless of server timezone
 
@@ -349,9 +401,7 @@ At 16:30 IST (SummaryScheduler checks every 30s):
   (python:3.11-slim, `uvicorn main:app`) hosts it; nothing fdk starts unless `FDK_ENABLED=true`, and only
   ONE backend instance should enable it (each enabled instance runs its own detector and re-points the
   Telegram webhooks to its `FDK_BASE_URL`).
-- Dependencies: `requirements.txt` pulls in `-r fdk_requirements.txt`; `fyers-apiv3` is installed separately
-  with `pip install --no-deps -r fdk_requirements_nodeps.txt` because its metadata pins an older `requests`.
-  A Render-native build command must run both installs, not just `pip install -r requirements.txt`.
+- Dependencies: `requirements.txt` pulls in `-r fdk_requirements.txt`.
 - Host: the Shoonya token exchange and API calls only work from the static IP whitelisted on the
   account, so fdk runs on the EC2 box (Elastic IP), not on App Runner. With no public HTTPS URL
   there, leave `FDK_BASE_URL` empty: the login bot is long-polled for commands and the pasted
@@ -363,6 +413,21 @@ At 16:30 IST (SummaryScheduler checks every 30s):
   keep-alive job. Hosts have run on UTC, so always use `datetime.now(IST)`, never a plain `datetime.now()`.
 
 ## Changelog
+
+### 2026-11-03 - Shoonya tick feed replaces the Fyers socket (step 2 of the broker switch)
+- `websocket_manager.py` rewritten on `websocket-client`; see Tick Feed. `fyers-apiv3`, `fdk_requirements_nodeps.txt`,
+  `aiohttp`, `aws-lambda-powertools`, the `setuptools` pin and `FDK_FYERS_CLIENT_ID` are gone. `TICK_FEED_WIRED` is
+  gone too: the supervisor now starts the feed after login.
+- `tick_handler.py` reads Shoonya's `lp` and `v`. `detector.py` treats `tk` as a baseline.
+- `SymbolManager.load_instrument_tokens()` joins `stock_symbols` to `instruments` on `isin`.
+- The database label is `shoonya` (the 2026-11-02 migration), so `load_symbols("shoonya")`, the MCP tools' `detector`
+  argument and the summary title now use it. `monitoring_started_message` says `Shoonya:`.
+- Independent review before deployment, fixed test-first: false alerts when ticks were dropped (a tick after a gap is now
+  a baseline); alert I/O moved off the tick path; no socket timeout, so a silent gateway hung the feed for good; dials that
+  never opened earned fresh retry budgets; false "Monitoring Started"; a socket rejection looped on the same token with a
+  "login successful" message a minute; missing symbols were never named; coverage was only checked on the first connect.
+- `actid` is the user id on every login path, as the vendor SDK sends. `/fdk/health` gained a `feed` block.
+- Summaries strip a leading `NSE:` from sheet rows, so rows from before the rename count with the new ones.
 
 ### 2026-11-02 - Browser login hardened; Telegram inbound locked to the configured chats
 - First EC2 run: the headless login resubmitted the TOTP against stale form elements ("stale element

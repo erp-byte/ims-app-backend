@@ -33,7 +33,7 @@ def should_rebuild_socket(needs_rebuild: bool, last_rebuild_ts: float | None,
     """True when an unhealthy WebSocket is due to be torn down and rebuilt.
 
     Pure and testable. The cooldown stops a socket that cannot come back up
-    (Fyers down, token dead) from rebuilding — and alerting — on every tick.
+    (Shoonya down, token dead) from rebuilding — and alerting — on every tick.
     """
     if not needs_rebuild:
         return False

@@ -13,11 +13,10 @@ log = get_logger("penny_service")
 class PennyService:
     """Encapsulates the penny detector lifecycle."""
 
-    def __init__(self, client_id: str, sheet_id: str,
+    def __init__(self, sheet_id: str,
                  google_credentials: dict,
                  trade_sender: TelegramSender,
                  summary_sender: TelegramSender):
-        self.client_id = client_id
         self.sheet_id = sheet_id
         self.google_credentials = google_credentials
         self.trade_sender = trade_sender
@@ -37,7 +36,7 @@ class PennyService:
         )
         sheets = GoogleSheetsManager(self.google_credentials, self.sheet_id)
         self._detector = VolumeSpikeDetector(
-            dc, access_token, self.client_id,
+            dc, access_token,
             sheets, self.trade_sender, self.summary_sender,
         )
         self._controller = RunController(self._detector)

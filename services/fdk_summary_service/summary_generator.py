@@ -12,7 +12,7 @@ log = get_logger("summary")
 
 
 class SummaryGenerator:
-    """Parameterized summary generator — one instance per detector (fyers/penny)."""
+    """Parameterized summary generator — one instance per detector (shoonya/penny)."""
 
     def __init__(self, name: str, google_credentials: dict | None,
                  sheet_id: str, summary_sender: TelegramSender):
@@ -100,7 +100,8 @@ class SummaryGenerator:
                 if date_val not in target_dates:
                     if not any(date_val.startswith(d) for d in target_dates):
                         continue
-                symbol = row[symbol_idx].strip()
+                # Rows written before the move to Shoonya names carry the NSE: prefix.
+                symbol = row[symbol_idx].strip().removeprefix("NSE:")
                 value_str = row[value_idx].strip()
                 if symbol and value_str:
                     records.append({

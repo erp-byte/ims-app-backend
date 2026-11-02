@@ -16,7 +16,7 @@ FDK_PORT=8000                      # unused inside the backend (uvicorn owns the
 # With scheduling on, the first login runs at 09:13 IST; send /rst on Telegram to force one.
 # Ladder: cached session -> headless-browser login (2 attempts) -> Telegram link, resent every
 # 5 min while the market is open (outside market hours the wait pauses until the next open).
-# The tick feed is still the dormant Fyers socket, so the orchestrator logs in and idles.
+# After login the orchestrator opens Shoonya's market feed for both detectors.
 FDK_SHOONYA_USERNAME=              # user id, e.g. FA12345
 FDK_SHOONYA_PASSWORD=
 FDK_SHOONYA_TOTP_SECRET=           # Profile -> Security -> TOTP Setup (base32)
@@ -26,10 +26,6 @@ FDK_SHOONYA_REDIRECT_URI=          # optional: redirect URL registered on the ac
 FDK_SHOONYA_AUTO_LOGIN=true        # drive the login page in headless Chrome first (2 attempts), then the Telegram link; false = link only
 FDK_CHROME_BINARY=                 # optional: chromium binary (default /usr/bin/chromium in the image)
 FDK_CHROMEDRIVER=                  # optional: chromedriver path (default /usr/bin/chromedriver in the image)
-
-# Fyers app id — optional; only the dormant Fyers data socket reads it (the Fyers login
-# was removed, so leave it empty)
-FDK_FYERS_CLIENT_ID=
 
 # Telegram — 5 bot+chat pairs (+ optional news bot for MCP). Inbound messages are handled only
 # when they come from one of these chat ids (long polling listens to the login chat alone).
@@ -58,5 +54,5 @@ FDK_GOOGLE_CLIENT_EMAIL=
 FDK_GOOGLE_CLIENT_ID=
 FDK_GOOGLE_CLIENT_X509_CERT_URL=
 
-# Supabase (fdk's own PostgreSQL — <broker>_tokens i.e. shoonya_tokens / fyers_tokens, stock_symbols, sector_mappings)
+# Supabase (fdk's own PostgreSQL — shoonya_tokens, stock_symbols, sector_mappings, instruments)
 FDK_SUPABASE_DSN=

@@ -101,6 +101,7 @@ async def fdk_health_check():
         "scheduling_enabled": orchestrator.config.scheduling_enabled,
         "fyers_running": orchestrator.fyers.is_running,
         "penny_running": orchestrator.penny.is_running,
+        "feed": orchestrator.feed_status(),
     }
 
 
@@ -127,7 +128,7 @@ def fdk_mount(app: FastAPI) -> None:
     except ImportError as exc:
         fdk_state.error = f"fdk dependencies missing: {exc}"
         log.error("fdk auth/webhook routes not mounted — %s "
-                  "(pip install -r requirements.txt && pip install --no-deps -r fdk_requirements_nodeps.txt)", exc)
+                  "(pip install -r requirements.txt)", exc)
     else:
         app.include_router(fdk_auth_router, prefix=FDK_ROUTE_PREFIX, tags=["fdk"])
     # Mounted last so it never shadows the routes above (as in the original main.py).
@@ -281,10 +282,15 @@ async def fdk_lifespan():
             # A login may be sleeping between retries in a worker thread; without
             # this the interpreter waits for it (up to minutes) before exiting.
             orchestrator.authenticator.cancel_auth()
-            orchestrator.fyers.stop()
-            orchestrator.penny.stop()
+        # First, or the supervisor would see the closed feed below and open a new one.
         if fdk_state.task is not None:
             fdk_state.task.cancel()
+        if orchestrator is not None:
+            try:
+                await asyncio.wait_for(orchestrator._stop_detectors(), timeout=25)
+                await asyncio.wait_for(orchestrator._close_dispatcher_async(), timeout=10)
+            except Exception as exc:
+                log.error("Stopping the detectors or the Shoonya feed failed: %s", exc)
         if fdk_state.poller_task is not None:
             fdk_state.poller_task.cancel()
         fdk_state.mcp_app = None

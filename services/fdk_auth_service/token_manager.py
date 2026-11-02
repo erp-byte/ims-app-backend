@@ -10,9 +10,9 @@ log = get_logger("token_manager")
 
 
 class TokenManager:
-    def __init__(self, config: AppConfig, table: str = "fyers_tokens"):
+    def __init__(self, config: AppConfig, table: str = "shoonya_tokens"):
         self.dsn = config.supabase.dsn
-        self.table = table   # one table per broker: fyers_tokens / shoonya_tokens
+        self.table = table
         self._ensure_table()
 
     def _get_conn(self):

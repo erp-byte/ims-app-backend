@@ -13,7 +13,7 @@ class FyersSummaryService:
     def __init__(self, google_credentials: dict | None,
                  sheet_id: str, summary_sender: TelegramSender):
         self.generator = SummaryGenerator(
-            "fyers", google_credentials, sheet_id, summary_sender,
+            "shoonya", google_credentials, sheet_id, summary_sender,
         )
 
     async def send_today(self) -> bool:

@@ -9,6 +9,7 @@ from services.fdk_auth_service.shoonya_authenticator import ShoonyaAuthenticator
 from services.fdk_auth_service.token_manager import TokenManager
 from services.fdk_telegram_service import TelegramSender
 from services.fdk_telegram_service.message_template import (
+    feed_coverage_warning_message, feed_not_up_message, feed_rejected_message,
     monitoring_started_message, websocket_rebuild_message,
 )
 from services.fdk_summary_service import SummaryScheduler
@@ -22,10 +23,14 @@ from .schedular import (
 
 log = get_logger("orchestrator")
 
-# Flipped by step 2 (the Shoonya tick feed). While False the orchestrator logs in
-# and idles: the data socket below is the dormant Fyers one, which cannot run on a
-# Shoonya session.
-TICK_FEED_WIRED = False
+# Seconds between passes of the supervisor loop.
+SUPERVISOR_POLL = 5
+
+# A rejection after this many tries, the last on a fresh login, needs a person.
+FEED_REJECTION_LIMIT = 2
+
+# Seconds the supervisor waits after an unexpected error in its loop.
+SUPERVISOR_ERROR_DELAY = 10
 
 # Seconds between retries of the start-up Supabase loads. Inside the backend there
 # is no process restart to recover from a transient DB error, so run() must.
@@ -43,7 +48,7 @@ class Orchestrator:
         self.penny_trade_sender = TelegramSender(config.telegram.penny_trade)
         self.penny_summary_sender = TelegramSender(config.telegram.penny_summary)
 
-        # Shoonya is the only login (the Fyers webhook/TOTP login was removed).
+        # Shoonya is the only broker: its login, and its feed (TickDispatcher) for the ticks.
         self.broker = ShoonyaAuthenticator.broker
         self.token_manager = TokenManager(config, table=f"{self.broker}_tokens")
         self.authenticator = ShoonyaAuthenticator(
@@ -53,12 +58,12 @@ class Orchestrator:
 
         # Isolated services — each manages its own detector + controller
         self.fyers = FyersService(
-            config.fyers_client_id, config.google.fyers_sheet_id,
+            config.google.fyers_sheet_id,
             config.google.credentials,
             self.fyers_trade_sender, self.fyers_summary_sender,
         )
         self.penny = PennyService(
-            config.fyers_client_id, config.google.penny_sheet_id,
+            config.google.penny_sheet_id,
             config.google.credentials,
             self.penny_trade_sender, self.penny_summary_sender,
         )
@@ -68,9 +73,14 @@ class Orchestrator:
         self._dispatcher: TickDispatcher | None = None
         self._summary_task: asyncio.Task | None = None
         self._last_ws_rebuild: float | None = None
+        self._feed_announced = False        # "Monitoring Started" sent for this feed
+        self._feed_down_noticed = False     # the operator knows it is down
+        self._feed_rejections = 0
+        self._feed_parked = False           # rejected repeatedly, waiting for /rst or tomorrow
+        self._last_coverage_gap: list[str] | None = None
         self._services_built = False
         self._last_reset_date: str | None = None
-        self._feed_notice_sent = False
+        self._instrument_tokens: dict[str, str] = {}
 
         # Isolated summary services
         self.fyers_summary = FyersSummaryService(
@@ -104,6 +114,11 @@ class Orchestrator:
         await self._close_dispatcher_async()
         log.info("Detectors on hold")
 
+    async def _stop_detectors(self):
+        """stop() can wait on a Sheets call in flight, and this loop is shared with the backend."""
+        await asyncio.to_thread(self.fyers.stop)
+        await asyncio.to_thread(self.penny.stop)
+
     def _login_wait_allowed(self) -> bool:
         """Keep the Telegram login link alive only while a login would be used (market hours)."""
         return (not self.config.scheduling_enabled) or is_market_hours()
@@ -135,25 +150,86 @@ class Orchestrator:
     def _any_token_expired(self) -> bool:
         return self.fyers.token_expired or self.penny.token_expired
 
+    def feed_status(self) -> dict:
+        """For /fdk/health and the MCP status tool: a dead feed must not look healthy."""
+        if self._dispatcher is None:
+            return {"connected": False, "acknowledged": 0, "requested": 0}
+        return self._dispatcher.status()
+
     def _close_dispatcher(self):
+        self._feed_announced = self._feed_down_noticed = False
         if self._dispatcher:
             self._dispatcher.close()
             self._dispatcher = None
 
     async def _close_dispatcher_async(self):
         """_close_dispatcher() with the (slow) socket close off the shared event loop."""
+        self._feed_announced = self._feed_down_noticed = False
         dispatcher, self._dispatcher = self._dispatcher, None
         if dispatcher:
             await asyncio.to_thread(dispatcher.close)
 
     def _connect_dispatcher(self):
-        """Create and connect a shared TickDispatcher for both detectors."""
+        """Create and connect the shared Shoonya feed for both detectors."""
         detectors = [d for d in (self.fyers.detector, self.penny.detector) if d]
+        username = self.config.shoonya.username
         token = self.authenticator.access_token
+        # Clears any earlier rejection: from here on the flag can only mean this socket.
+        self.fyers.update_token(token)
+        self.penny.update_token(token)
+        # actid is the user id on every login path, which is what the vendor SDK sends.
         self._dispatcher = TickDispatcher(
-            self.config.fyers_client_id, token, detectors
+            username, username, token, detectors, self._instrument_tokens,
         )
         self._dispatcher.connect()
+
+    async def _report_feed_state(self):
+        """Tell the operator once per change: up, down, or running with symbols missing."""
+        dispatcher = self._dispatcher
+        if dispatcher is None or self._any_token_expired():   # a rejection has its own message
+            return
+        if dispatcher.is_up():
+            self._feed_rejections = 0
+            self._feed_down_noticed = False
+            if not self._feed_announced:
+                self._feed_announced = True
+                await self.login_sender.send_async(
+                    monitoring_started_message(
+                        dispatcher.monitored(self.fyers.detector),
+                        dispatcher.monitored(self.penny.detector),
+                    )
+                )
+        elif not self._feed_announced and not self._feed_down_noticed:
+            self._feed_down_noticed = True
+            log.error("Shoonya feed is not up")
+            await self.login_sender.send_async(feed_not_up_message(len(dispatcher.no_token)))
+        report = dispatcher.take_coverage_report()
+        if report and report["missing"] != self._last_coverage_gap:
+            self._last_coverage_gap = report["missing"]
+            await self.login_sender.send_async(feed_coverage_warning_message(report))
+
+    async def _on_feed_rejected(self):
+        """The socket refused the session, which REST may still accept.
+
+        So the stored session is discarded and the next login is a fresh one. If the socket
+        refuses that too, logging in again cannot help: it stops and says so, rather
+        than reporting a successful login every minute with no data flowing.
+        """
+        reason = self._dispatcher.rejection_reason or "no reason given"
+        # If this write fails, the next pass starts over: a database blip is not a rejection.
+        await asyncio.to_thread(self.token_manager.clear_tokens)
+        self.authenticator.reset()
+        self._feed_rejections += 1
+        if self._feed_rejections >= FEED_REJECTION_LIMIT:
+            await self._stop_detectors()
+            await self._close_dispatcher_async()
+            self._feed_parked = True
+            self.authenticator.last_error = f"Shoonya feed rejected the session: {reason}"
+            log.error(f"{self.authenticator.last_error} — not retrying until /rst")
+            await self.login_sender.send_async(feed_rejected_message(reason, retrying=False))
+            return
+        await self.login_sender.send_async(feed_rejected_message(reason, retrying=True))
+        await self._re_authenticate()
 
     async def _daily_token_reset(self, today: str):
         """17:00 IST wipe — clear tokens + auth state so 09:13 is a fresh login.
@@ -163,13 +239,15 @@ class Orchestrator:
         the new token at the next open (via _services_built=False).
         """
         log.info("Daily 17:00 token reset — clearing credentials for a fresh login")
-        self.fyers.stop()
-        self.penny.stop()
+        await self._stop_detectors()
         await self._close_dispatcher_async()
         await asyncio.to_thread(self.token_manager.clear_tokens)
         self.authenticator.reset()
         self._services_built = False
         self._last_reset_date = today
+        self._feed_parked = False
+        self._feed_rejections = 0
+        self._last_coverage_gap = None
         await self.login_sender.send_async(
             "<b>Daily token reset</b>\nCredentials cleared at 17:00 IST. "
             "A fresh login will run automatically at 09:13 tomorrow."
@@ -178,9 +256,10 @@ class Orchestrator:
     async def _re_authenticate(self):
         """Stop detectors, get fresh token, update both services."""
         log.info(f"Token rejected by {self.broker} — re-authenticating...")
-        self.fyers.stop()
-        self.penny.stop()
+        await self._stop_detectors()
         await self._close_dispatcher_async()
+        if self.on_hold:                # /hld arrived during the close: no login now
+            return
 
         success = await self._authenticate_with_checks()
         if not success:
@@ -211,9 +290,11 @@ class Orchestrator:
         # Retried: a transient DB error here must not end the supervisor for good.
         while True:
             try:
-                fyers_symbols = await asyncio.to_thread(self.symbol_manager.load_symbols, "fyers")
+                shoonya_symbols = await asyncio.to_thread(self.symbol_manager.load_symbols, "shoonya")
                 penny_symbols = await asyncio.to_thread(self.symbol_manager.load_symbols, "penny")
                 sectors = await asyncio.to_thread(self.symbol_manager.load_sector_mapping)
+                self._instrument_tokens = await asyncio.to_thread(
+                    self.symbol_manager.load_instrument_tokens)
                 break
             except Exception as e:
                 log.error(f"Supabase symbol load failed, retrying in {SUPERVISOR_RETRY_DELAY}s: {e}")
@@ -233,23 +314,27 @@ class Orchestrator:
 
                 if self.restart_requested:
                     self.restart_requested = False
-                    self.fyers.stop()
-                    self.penny.stop()
+                    self._feed_parked = False
+                    self._feed_rejections = 0
+                    await self._stop_detectors()
                     await self._close_dispatcher_async()
                     await self._re_authenticate()
                     continue
 
                 if self.on_hold:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(SUPERVISOR_POLL)
                     continue
 
                 if self.config.scheduling_enabled and not is_market_hours():
-                    if self.fyers.is_running or self.penny.is_running:
+                    if self.fyers.is_running or self.penny.is_running or self._dispatcher:
                         log.info("Outside market hours, stopping detectors")
-                        self.fyers.stop()
-                        self.penny.stop()
+                        await self._stop_detectors()
                         await self._close_dispatcher_async()
                     await asyncio.sleep(60)
+                    continue
+
+                if self._feed_parked:
+                    await asyncio.sleep(SUPERVISOR_POLL)
                     continue
 
                 # Authenticate if we don't have a token yet
@@ -259,30 +344,20 @@ class Orchestrator:
                         # Auth was cancelled by /hld or /rst — loop back
                         continue
 
-                # Stay logged in — so /fdk/health, the webhook and the MCP tools
-                # report a real session — and idle until the Shoonya feed is wired.
-                if not TICK_FEED_WIRED:
-                    if not self._feed_notice_sent:
-                        log.warning(f"{self.broker}: authenticated, but the tick feed for "
-                                    "this broker is not wired yet — detectors stay idle")
-                        self._feed_notice_sent = True
-                    await asyncio.sleep(30)
-                    continue
-
                 # Build services once after first successful auth (rebuilt after
                 # each daily reset so they pick up the fresh token cleanly).
                 if not self._services_built:
                     token = self.authenticator.access_token
-                    await asyncio.to_thread(self.fyers.build, token, fyers_symbols, sectors)
+                    await asyncio.to_thread(self.fyers.build, token, shoonya_symbols, sectors)
                     await asyncio.to_thread(self.penny.build, token, penny_symbols, sectors)
                     self._services_built = True
 
-                if self._any_token_expired():
-                    await self._re_authenticate()
+                if self._dispatcher and self._any_token_expired():
+                    await self._on_feed_rejected()
                     continue
 
-                # Nothing in the SDK reports a socket that has died or given
-                # up reconnecting, so poll for it. Without this a drop stays
+                # Nothing reports a socket that has died or given up
+                # reconnecting, so poll for it. Without this a drop stays
                 # invisible and detection silently stops for the rest of the
                 # day while /health still reports healthy.
                 if self._dispatcher and should_rebuild_socket(
@@ -290,11 +365,13 @@ class Orchestrator:
                     self._last_ws_rebuild, time.monotonic(),
                 ):
                     log.error("WebSocket unhealthy — rebuilding dispatcher")
+                    was_up, noticed = self._feed_announced, self._feed_down_noticed
                     await self._close_dispatcher_async()
                     self._last_ws_rebuild = time.monotonic()
-                    await self.login_sender.send_async(
-                        websocket_rebuild_message()
-                    )
+                    # One alert per outage; recovering sends Monitoring Started again.
+                    self._feed_down_noticed = noticed or was_up
+                    if was_up:
+                        await self.login_sender.send_async(websocket_rebuild_message())
 
                 # /hld or /rst may have arrived while the awaits above were in flight —
                 # re-check before opening the socket or starting the detectors.
@@ -307,12 +384,8 @@ class Orchestrator:
                     # Kept off the event loop so the webhook, health check and
                     # summary scheduler stay responsive meanwhile.
                     await asyncio.to_thread(self._connect_dispatcher)
-                    await self.login_sender.send_async(
-                        monitoring_started_message(
-                            len(self.fyers.detector.config.symbols),
-                            len(self.penny.detector.config.symbols),
-                        )
-                    )
+
+                await self._report_feed_state()
 
                 if self.on_hold or self.restart_requested:
                     await self._close_dispatcher_async()
@@ -321,8 +394,8 @@ class Orchestrator:
                 self.fyers.start()
                 self.penny.start()
 
-                await asyncio.sleep(5)
+                await asyncio.sleep(SUPERVISOR_POLL)
 
             except Exception as e:
                 log.error(f"Supervisor error: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(SUPERVISOR_ERROR_DELAY)

@@ -1,4 +1,0 @@
-# fdk — installed separately, WITHOUT dependency resolution:
-#   pip install --no-deps -r fdk_requirements_nodeps.txt
-# (its runtime needs are listed in fdk_requirements.txt; see Dockerfile)
-fyers-apiv3>=3.0.0

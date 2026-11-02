@@ -1,4 +1,5 @@
-"""Volume Spike Detector -- parameterized for fyers and penny."""
+"""Volume Spike Detector -- parameterized for the shoonya and penny symbol lists."""
+import queue
 import time
 import threading
 from shared.fdk_models import DetectorConfig
@@ -11,21 +12,23 @@ from .trade_analyzer import analyze_trade
 
 log = get_logger("detector")
 
+ALERT_QUEUE_SIZE = 500        # alerts waiting for Sheets and Telegram before new ones are lost
+
 
 class VolumeSpikeDetector:
     def __init__(self, detector_config: DetectorConfig,
-                 access_token: str, client_id: str,
+                 access_token: str,
                  sheets_manager: GoogleSheetsManager,
                  trade_sender: TelegramSender,
                  summary_sender: TelegramSender):
         self.config = detector_config
         self.access_token = access_token
-        self.client_id = client_id
         self.sheets = sheets_manager
         self.trade_sender = trade_sender
         self.summary_sender = summary_sender
         self.stop_event = threading.Event()
-        self.token_expired = False  # set True when Fyers rejects the token
+        self._alerts: queue.Queue = queue.Queue(maxsize=ALERT_QUEUE_SIZE)
+        self.token_expired = False  # set True when the Shoonya feed rejects the token
 
         # Tick state
         self.previous_volumes: dict[str, float] = {}
@@ -51,6 +54,11 @@ class VolumeSpikeDetector:
         self.previous_volumes[symbol] = tick.vol_traded_today
         self.previous_ltp[symbol] = tick.ltp
 
+        # A snapshot arrives on subscribe and after every reconnect. It is a new
+        # baseline: its jump from the last value is outage volume, not one trade.
+        if tick.type == "tk":
+            return
+
         alert = analyze_trade(
             symbol, tick.ltp, tick.vol_traded_today,
             prev_vol, self.config.threshold
@@ -66,17 +74,40 @@ class VolumeSpikeDetector:
         self.trades_detected += 1
 
         log.info(f"[{self.config.name}] TRADE: {symbol} Rs{alert.trade_value_cr:.2f} Cr")
-        self.sheets.add_trade(alert)
-        self.trade_sender.send(trade_alert_message(alert))
+        # Sheets and Telegram are blocking HTTP, and every tick for every symbol comes
+        # through here, so they run on this detector's own thread (see start()).
+        try:
+            self._alerts.put_nowait(alert)
+        except queue.Full:
+            log.error(f"[{self.config.name}] Alert queue full, alert LOST: "
+                      f"{symbol} Rs{alert.trade_value_cr:.2f} Cr")
+
+    def _deliver(self, alert):
+        try:
+            self.sheets.add_trade(alert)
+            self.trade_sender.send(trade_alert_message(alert))
+        except Exception as e:
+            log.error(f"[{self.config.name}] Alert delivery failed for {alert.symbol}: {e}")
 
     def start(self):
-        """Block until stop_event is set. Ticks arrive via TickDispatcher."""
+        """Deliver alerts until stop_event is set. Ticks arrive via TickDispatcher."""
         log.info(f"[{self.config.name}] Monitoring started "
                  f"({len(self.config.symbols)} symbols, "
                  f"threshold Rs{self.config.threshold/10_000_000:.1f} Cr)")
 
         while not self.stop_event.is_set():
-            self.stop_event.wait(timeout=5)
+            try:
+                alert = self._alerts.get(timeout=1)
+            except queue.Empty:
+                continue
+            self._deliver(alert)
+
+        while True:                   # anything already detected still goes out
+            try:
+                alert = self._alerts.get_nowait()
+            except queue.Empty:
+                break
+            self._deliver(alert)
 
         log.info(f"[{self.config.name}] Monitoring stopped "
                  f"(ticks={self.total_ticks}, trades={self.trades_detected})")

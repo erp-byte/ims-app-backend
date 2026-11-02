@@ -115,10 +115,9 @@ def test_auto_login_can_be_switched_off(env):
     assert cfg.load_config().shoonya.auto_login is False
 
 
-def test_fyers_client_id_is_optional_for_the_dormant_data_socket(env):
-    assert cfg.load_config().fyers_client_id == ""
+def test_fyers_client_id_went_with_the_fyers_socket(env):
     env.setenv("FDK_FYERS_CLIENT_ID", "APP-100")
-    assert cfg.load_config().fyers_client_id == "APP-100"
+    assert not hasattr(cfg.load_config(), "fyers_client_id")
 
 
 def test_removed_variables_are_ignored(env):

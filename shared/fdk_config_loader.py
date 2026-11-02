@@ -66,9 +66,6 @@ class AppConfig:
     supabase: SupabaseConfig
     scheduling_enabled: bool = True
     port: int = 8000
-    # Fyers app id, read only by the dormant Fyers data socket (which cannot run
-    # without a Fyers login any more); optional, goes away with that socket.
-    fyers_client_id: str = ""
 
 
 def _required(key: str) -> str:
@@ -141,7 +138,6 @@ def load_config() -> AppConfig:
 
     return AppConfig(
         shoonya=_shoonya_config(),
-        fyers_client_id=os.getenv("FDK_FYERS_CLIENT_ID", "").strip(),
         telegram=TelegramConfig(
             login=_channel("FDK_LOGIN_BOT_TOKEN", "FDK_LOGIN_CHAT_ID"),
             fyers_trade=_channel("FDK_FYERS_TRADE_BOT_TOKEN", "FDK_FYERS_TRADE_CHAT_ID"),

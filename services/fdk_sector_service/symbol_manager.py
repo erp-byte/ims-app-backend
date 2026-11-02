@@ -101,6 +101,20 @@ class SymbolManager:
         log.info(f"Loaded {len(symbols)} symbols for '{detector}'")
         return symbols
 
+    def load_instrument_tokens(self) -> dict[str, str]:
+        """Map each active symbol to its Shoonya token, which the feed subscribes by."""
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT s.symbol, i.shoonya_token "
+                    "FROM stock_symbols s JOIN instruments i USING (isin) "
+                    "WHERE s.active = TRUE"
+                )
+                rows = cur.fetchall()
+        tokens = {row[0]: row[1] for row in rows}
+        log.info(f"Loaded {len(tokens)} instrument tokens")
+        return tokens
+
     def load_sector_mapping(self) -> dict[str, str]:
         """Load all sector mappings as a dict."""
         with self._get_conn() as conn:

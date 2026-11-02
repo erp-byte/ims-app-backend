@@ -37,7 +37,5 @@ reportlab>=4.2.0
 # Environment
 python-dotenv==1.0.1
 
-# fdk — Fyers Volume Spike Detector (see FDK_FILES.md). Remove this line to drop its deps.
-# fyers-apiv3 itself is NOT here: its metadata pins requests==2.31.0 (the backend needs
-# 2.32.3), so it is installed separately with --no-deps from fdk_requirements_nodeps.txt.
+# fdk — Shoonya volume spike detector (see FDK_FILES.md). Remove this line to drop its deps.
 -r fdk_requirements.txt

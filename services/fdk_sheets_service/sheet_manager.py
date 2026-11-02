@@ -3,7 +3,7 @@ import threading
 import gspread
 from google.oauth2.service_account import Credentials
 from shared.fdk_logger import get_logger
-from shared.fdk_constants import SHEET_HEADERS
+from shared.fdk_constants import SHEET_HEADERS, SHEETS_TIMEOUT
 from shared.fdk_models import TradeAlert
 from .row_builder import build_row, row_to_list
 
@@ -31,6 +31,7 @@ class GoogleSheetsManager:
                 self.credentials, scopes=scope
             )
             gc = gspread.authorize(creds)
+            gc.set_timeout(SHEETS_TIMEOUT)
             sheet = gc.open_by_key(self.sheet_id)
             self.worksheet = sheet.sheet1
             headers = self.worksheet.row_values(1)

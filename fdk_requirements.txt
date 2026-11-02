@@ -1,4 +1,4 @@
-# fdk — Fyers Volume Spike Detector (merged from fyersdk). Pulled in by requirements.txt via -r.
+# fdk — Shoonya volume spike detector (merged from fyersdk). Pulled in by requirements.txt via -r.
 # Packages the backend already pins (fastapi, uvicorn, requests, psycopg2-binary,
 # python-dotenv, pydantic) are deliberately not repeated here.
 gspread>=5.12.0
@@ -11,13 +11,5 @@ mcp>=1.10.0,<2.0.0
 feedparser>=6.0.11
 beautifulsoup4>=4.12.0
 
-# What fyers-apiv3 (fyersModel + FyersWebsocket.data_ws) actually imports at runtime.
-# fyers-apiv3 itself lives in fdk_requirements_nodeps.txt and is installed with
-# --no-deps: its metadata pins requests==2.31.0 (the backend needs 2.32.3) and a
-# bogus PyPI package named `asyncio`.
+# The Shoonya market feed (services/fdk_detector_service/websocket_manager.py).
 websocket-client>=1.6.1
-aiohttp>=3.9.3
-aws-lambda-powertools>=1.25.5
-# fyers_apiv3.FyersWebsocket.data_ws does `from pkg_resources import ...`; newer setuptools dropped
-# pkg_resources (verified gone at 84.x, present at 80.10.2), so stay on the 80.x line.
-setuptools>=68.0.0,<81

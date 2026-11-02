@@ -4,12 +4,6 @@ from datetime import datetime
 from typing import Optional
 
 
-class FyersToken(BaseModel):
-    access_token: str
-    timestamp: float
-    created_at: str
-
-
 class TickData(BaseModel):
     symbol: str
     ltp: float

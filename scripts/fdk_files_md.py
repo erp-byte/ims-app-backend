@@ -36,8 +36,6 @@ FDK_FILES = [
     "config/fdk_sectors.json",
     "config/fdk_symbols.json",
     "docs/fdk_CLAUDE.md",
-    "docs/superpowers/plans/fdk_2026-07-23-automated-fyers-login.md",
-    "docs/superpowers/specs/fdk_2026-07-23-automated-fyers-login-design.md",
 ]
 # Existing backend files that carry fdk-marked lines (grep for "fdk").
 TOUCH_POINTS = ["main.py", "requirements.txt", "Dockerfile"]

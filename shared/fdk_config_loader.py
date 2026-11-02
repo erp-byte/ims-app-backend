@@ -24,7 +24,7 @@ class ShoonyaConfig:
     vendor_code: str      # retail API users: "<username>_U"
     api_key: str          # Prism-generated API key
     imei: str = "abc1234"  # any fixed device identifier; the broker does not validate it
-    redirect_uri: str = ""  # unused by Shoonya's login; kept for parity with the Fyers block
+    redirect_uri: str = ""  # unused by Shoonya's login; accepted so an existing env line is harmless
 
 
 @dataclass

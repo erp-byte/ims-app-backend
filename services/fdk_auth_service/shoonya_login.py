@@ -8,7 +8,7 @@ no OAuth/redirect step: user id + password + TOTP + vendor code + API key + IMEI
 go straight to the broker and a day session token comes back.
 
 Standalone module (stdlib + requests + pyotp only) so tests can load it by path
-without importing the package __init__ (which pulls in fyers_apiv3).
+without importing the package __init__ (which pulls in psycopg2 via the token manager).
 """
 import hashlib
 import json

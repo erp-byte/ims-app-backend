@@ -141,7 +141,7 @@ def _register_telegram(config: AppConfig) -> None:
 
     if not BASE_URL:
         log.error("FDK_BASE_URL is not set — Telegram webhooks NOT registered; "
-                  "/hld /rst /snd /sdt and pasted auth codes will not reach this server")
+                  "/hld /rst /snd /sdt will not reach this server")
         return
     for channel in [
         config.telegram.login,

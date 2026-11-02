@@ -33,12 +33,11 @@ PENNY_TRADE_THRESHOLD = 5_000_000     # Rs 50 lakh (0.50 Cr)
 MIN_VOLUME_SPIKE = 1000
 
 # Timing
-TELEGRAM_AUTH_TIMEOUT = 300
-LOGIN_URL_RETRY_INTERVAL = 300        # 5 min
+LOGIN_URL_RETRY_INTERVAL = 300        # cooldown after an exhausted login cycle (5 min)
 TOKEN_VALIDITY_SECONDS = 28800        # 8 hours
 
-# Automated login (headless TOTP) retry policy
-AUTO_LOGIN_MAX_ATTEMPTS = 5           # attempts before manual-link fallback
+# Headless login retry policy
+AUTO_LOGIN_MAX_ATTEMPTS = 5           # attempts before reporting failure and cooling down
 AUTO_LOGIN_RETRY_DELAY = 60           # seconds between attempts
 
 # Integration into the Candor backend — every fdk route lives under this prefix

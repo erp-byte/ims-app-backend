@@ -1,5 +1,4 @@
 """Parse Telegram message commands."""
-import re
 from datetime import datetime
 
 
@@ -12,12 +11,6 @@ def parse_date(text: str) -> datetime | None:
         except ValueError:
             continue
     return None
-
-
-def extract_auth_code(text: str) -> str | None:
-    """Extract auth_code from a Fyers redirect URL."""
-    match = re.search(r"auth_code=([^&\s]+)", text)
-    return match.group(1) if match else None
 
 
 def parse_command(text: str) -> tuple[str | None, str]:

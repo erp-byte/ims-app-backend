@@ -1,7 +1,7 @@
 """Unit tests for the headless Shoonya login module (QuickAuth + UserDetails over HTTP).
 
-Loaded via importlib file-load so the package __init__ (which imports the Fyers
-authenticator -> fyers_apiv3) is bypassed. Only requests + pyotp are needed.
+Loaded via importlib file-load so the package __init__ (which pulls in psycopg2 via
+the token manager) is bypassed. Only requests + pyotp are needed.
 """
 import hashlib
 import importlib.util

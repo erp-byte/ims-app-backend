@@ -523,7 +523,6 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 
 ### services/fdk_telegram_service/command_parser.py
 - parse_date
-- extract_auth_code
 - parse_command
 
 ### services/fdk_telegram_service/message_template.py
@@ -579,7 +578,6 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 - get_logger
 
 ### shared/fdk_models.py
-- FyersToken
 - TickData
 - TradeAlert
 - DetectorConfig

@@ -55,9 +55,11 @@ def fresh_state(monkeypatch):
     monkeypatch.setattr(fdk_main, "FDK_SELF_PING", False)   # evaluated at import time
     fdk_main.fdk_state.__init__()
     fdk_auth_server._orchestrator = fdk_auth_server._login_sender = None
+    fdk_auth_server._pending_summary_date = False
     yield
     fdk_main.fdk_state.__init__()
     fdk_auth_server._orchestrator = fdk_auth_server._login_sender = None
+    fdk_auth_server._pending_summary_date = False
 
 
 @pytest.fixture

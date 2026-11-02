@@ -13,8 +13,7 @@ Dual volume spike detector for NSE stocks. Monitors Fyers WebSocket ticks and al
 
 ```
 fdk_main.py (fdk_lifespan() + fdk_mount(app); imported by the backend's main.py — not a standalone process)
-  GET  /fdk/health            -> detector status (disabled / unavailable / healthy / on_hold)
-  GET  /fdk/auth/callback     -> receives auth code via browser redirect (local dev)
+  GET  /fdk/health            -> status (disabled / unavailable / stopped + error / healthy / on_hold) + login_state
   POST /fdk/webhook/telegram  -> receives commands from Telegram
   *    /fdk/mcp               -> MCP endpoint (news + detector tools; /fdk/mcp-<FDK_MCP_PATH_SECRET> if set)
   lifespan (only when FDK_ENABLED=true; any failure is logged and the backend carries on):
@@ -81,6 +80,10 @@ Candor backend — only the fdk-owned paths are shown (FDK_FILES.md is the autho
 │   ├── fdk_sheets_service/
 │   │   ├── sheet_manager.py         # GoogleSheetsManager
 │   │   └── row_builder.py           # TradeAlert -> SheetRow
+│   ├── fdk_mcp_service/
+│   │   ├── server.py                # build_mcp(), served at /fdk/mcp (or /fdk/mcp-<secret>)
+│   │   ├── news_tools.py            # RSS/article tools + send_news_to_telegram
+│   │   └── fyers_tools.py           # get_detector_status, get_volume_summary, list_monitored_symbols, get_sector_mapping
 │   └── fdk_sector_service/
 │       ├── symbol_manager.py        # SymbolManager — Supabase CRUD for symbols + sectors
 │       └── sector_mapper.py         # get_sector(symbol), initialized from Supabase
@@ -206,7 +209,7 @@ Health API:    GET /fdk/health returns {"status": "on_hold", ...}
 ```
 
 ### `/rst` — Restart
-Stops detectors, re-authenticates with the active broker (works outside market hours too), and restarts everything.
+Stops detectors, re-authenticates with Shoonya (works outside market hours too), and restarts everything.
 
 ```
 User sends:    /rst

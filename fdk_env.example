@@ -1,0 +1,55 @@
+# fdk — Fyers Volume Spike Detector. Every variable fdk reads, all prefixed FDK_.
+# Copy the ones you need into .env (or the host's env). Enable on ONE backend
+# instance only: each enabled instance runs its own detector and re-points the
+# Telegram webhooks to FDK_BASE_URL.
+
+# Master switch and integration
+FDK_ENABLED=false
+FDK_BASE_URL=                      # public https URL of this backend (no trailing slash)
+FDK_SELF_PING=false                # opt-in 7-min self-ping thread (backend has its own keep-alive)
+FDK_SCHEDULING_ENABLED=true        # market-hour scheduling 09:13-16:00 IST
+FDK_MCP_PATH_SECRET=               # optional: serves MCP at /fdk/mcp-<secret> instead of /fdk/mcp
+FDK_PORT=8000                      # unused inside the backend (uvicorn owns the port); kept for parity
+
+# Shoonya — the only login (headless, no redirect step). With scheduling on, the first
+# login runs at 09:13 IST; send /rst on Telegram to force one. The tick feed is still the
+# dormant Fyers socket, so the orchestrator logs in and idles until step 2 wires Shoonya.
+FDK_SHOONYA_USERNAME=
+FDK_SHOONYA_PASSWORD=
+FDK_SHOONYA_TOTP_SECRET=
+FDK_SHOONYA_VENDORCODE=            # retail API users: <username>_U
+FDK_SHOONYA_API_KEY=               # Prism -> API section
+FDK_SHOONYA_IMEI=abc1234           # any fixed device identifier; the broker does not validate it
+FDK_SHOONYA_REDIRECT_URI=          # unused by Shoonya's login; kept for parity
+
+# Fyers app id — optional; only the dormant Fyers data socket reads it (the Fyers login
+# was removed, so leave it empty)
+FDK_FYERS_CLIENT_ID=
+
+# Telegram — 5 bot+chat pairs (+ optional news bot for MCP)
+FDK_LOGIN_BOT_TOKEN=
+FDK_LOGIN_CHAT_ID=
+FDK_FYERS_TRADE_BOT_TOKEN=
+FDK_FYERS_TRADE_CHAT_ID=
+FDK_FYERS_SUMMARY_BOT_TOKEN=
+FDK_FYERS_SUMMARY_CHAT_ID=
+FDK_PENNY_TRADE_BOT_TOKEN=
+FDK_PENNY_TRADE_CHAT_ID=
+FDK_PENNY_SUMMARY_BOT_TOKEN=
+FDK_PENNY_SUMMARY_CHAT_ID=
+FDK_NEWS_BOT_TOKEN=
+FDK_NEWS_CHAT_ID=
+
+# Google Sheets — either the JSON blob, or the individual service-account fields
+FDK_FYERS_GOOGLE_SHEETS_ID=
+FDK_PENNY_GOOGLE_SHEETS_ID=
+FDK_GOOGLE_CREDENTIALS_JSON=
+FDK_GOOGLE_PROJECT_ID=
+FDK_GOOGLE_PRIVATE_KEY_ID=
+FDK_GOOGLE_PRIVATE_KEY=
+FDK_GOOGLE_CLIENT_EMAIL=
+FDK_GOOGLE_CLIENT_ID=
+FDK_GOOGLE_CLIENT_X509_CERT_URL=
+
+# Supabase (fdk's own PostgreSQL — <broker>_tokens i.e. shoonya_tokens / fyers_tokens, stock_symbols, sector_mappings)
+FDK_SUPABASE_DSN=

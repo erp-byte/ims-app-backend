@@ -57,6 +57,10 @@ def test_login_state_tells_waiting_from_failing_from_ok(offline):
     auth.last_error = "Invalid Input : Wrong Password"
     assert orch.login_state() == "failed"
 
+    auth.awaiting_manual_login = True              # link sent, waiting for the pasted URL
+    assert orch.login_state() == "awaiting_manual_login"
+    auth.awaiting_manual_login = False
+
     auth.is_authenticated = True
     assert orch.login_state() == "ok"
 
@@ -68,9 +72,10 @@ def test_run_retries_the_initial_supabase_loads_until_they_succeed(offline, capl
     from services.fdk_supervisor_service import ochestrator as orch_mod
     from services.fdk_auth_service import shoonya_authenticator as sa
     offline.setattr(sa.shoonya_login, "validate_session", lambda user, tok: (False, "No token"))
-    offline.setattr(sa.shoonya_login, "login_with_retry",
-                    lambda creds, *a, **k: {"access_token": "sess-1", "account_id": "FA12345",
-                                            "user_name": "Test"})
+    offline.setattr(sa.shoonya_login, "auto_login_available", lambda: True)
+    offline.setattr(sa.shoonya_login, "auto_login_code", lambda *a, **k: {"code": "C1"})
+    offline.setattr(sa.shoonya_login, "exchange_code",
+                    lambda *a, **k: {"access_token": "sess-1", "account_id": "FA12345"})
     offline.setattr(orch_mod, "SUPERVISOR_RETRY_DELAY", 0.01)
     orch = _orchestrator()
     calls = {"n": 0}
@@ -105,9 +110,10 @@ def test_run_retries_the_initial_supabase_loads_until_they_succeed(offline, capl
 def test_shoonya_logs_in_then_idles_without_touching_the_fyers_feed(offline, caplog):
     from services.fdk_auth_service import shoonya_authenticator as sa
     offline.setattr(sa.shoonya_login, "validate_session", lambda user, tok: (False, "No token"))
-    offline.setattr(sa.shoonya_login, "login_with_retry",
-                    lambda creds, *a, **k: {"access_token": "sess-1", "account_id": "FA12345",
-                                            "user_name": "Test"})
+    offline.setattr(sa.shoonya_login, "auto_login_available", lambda: True)
+    offline.setattr(sa.shoonya_login, "auto_login_code", lambda *a, **k: {"code": "C1"})
+    offline.setattr(sa.shoonya_login, "exchange_code",
+                    lambda *a, **k: {"access_token": "sess-1", "account_id": "FA12345"})
     orch = _orchestrator()
     touched = []
     offline.setattr(orch.fyers, "build", lambda *a, **k: touched.append("fyers.build"))

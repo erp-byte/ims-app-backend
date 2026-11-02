@@ -28,8 +28,8 @@ FDK_ENV = {
     "FDK_SHOONYA_USERNAME": "FA12345",
     "FDK_SHOONYA_PASSWORD": "Pass@123",
     "FDK_SHOONYA_TOTP_SECRET": "JBSWY3DPEHPK3PXP",
-    "FDK_SHOONYA_VENDORCODE": "FA12345_U",
-    "FDK_SHOONYA_API_KEY": "k" * 64,
+    "FDK_SHOONYA_CLIENT_ID": "FA12345_U",
+    "FDK_SHOONYA_SECRET_CODE": "s" * 64,
     "FDK_LOGIN_BOT_TOKEN": "tok-login", "FDK_LOGIN_CHAT_ID": "1",
     "FDK_FYERS_TRADE_BOT_TOKEN": "tok-ft", "FDK_FYERS_TRADE_CHAT_ID": "2",
     "FDK_FYERS_SUMMARY_BOT_TOKEN": "tok-fs", "FDK_FYERS_SUMMARY_CHAT_ID": "3",
@@ -72,7 +72,8 @@ def posted(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(requests, "post", _post)
-    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse())
+    # getUpdates (polling mode) answers "no updates"; everything else is a plain OK
+    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse({"ok": True, "result": []}))
     return calls
 
 
@@ -147,11 +148,12 @@ def test_enabled_builds_registers_and_serves(fresh_state, monkeypatch, posted,
         assert state.orchestrator is not None
         assert state.task is not None and not state.task.done()
 
-        # Telegram: webhook on all 5 bots, command menu on the login bot
+        # Telegram: webhook on all 5 bots, command menu on the login bot; no poller
         webhooks = [kw["json"]["url"] for url, kw in posted if url.endswith("/setWebhook")]
         assert webhooks == ["http://fdk.test/fdk/webhook/telegram"] * 5
         assert sum(1 for url, _ in posted if url.endswith("/setMyCommands")) == 1
         assert any("tok-login" in url for url, _ in posted if url.endswith("/setMyCommands"))
+        assert state.poller_task is None
 
         health = client.get("/fdk/health").json()
         assert health["status"] == "healthy"
@@ -159,10 +161,22 @@ def test_enabled_builds_registers_and_serves(fresh_state, monkeypatch, posted,
         assert health["broker"] == "shoonya"
         assert health["authenticated"] is False
         assert health["last_login_at"] is None
+        assert health["login_method"] is None
+        assert health["telegram_mode"] == "webhook"
         # no login attempted yet (the run loop is idled in this test)
         assert health["login_state"] in ("waiting_for_market_hours", "in_progress")
         assert isinstance(health["market_hours"], bool)
         assert health["scheduling_enabled"] is True
+
+        # A pasted login URL is ignored unless the authenticator is waiting for one...
+        pasted = {"message": {"text": "https://trade.shoonya.com/?code=abc123"}}
+        assert client.post("/fdk/webhook/telegram", json=pasted).json() == {"status": "ok"}
+        # ...and handed to it when it is
+        state.orchestrator.authenticator.awaiting_manual_login = True
+        assert client.post("/fdk/webhook/telegram", json=pasted).json() == {"status": "code_received"}
+        assert state.orchestrator.authenticator._pending_code == "abc123"
+        assert client.get("/fdk/health").json()["login_state"] == "awaiting_manual_login"
+        state.orchestrator.authenticator.awaiting_manual_login = False
 
         # Telegram command path -> orchestrator
         resp = client.post("/fdk/webhook/telegram", json={"message": {"text": "/hld holiday"}})
@@ -189,6 +203,24 @@ def test_enabled_builds_registers_and_serves(fresh_state, monkeypatch, posted,
     # Shutdown must also cancel a login that may be sleeping in a worker thread,
     # otherwise the interpreter waits for it (up to ~5 min) before exiting.
     assert fdk_main.fdk_state.orchestrator.authenticator._cancel_event.is_set()
+
+
+def test_polling_mode_when_no_public_url(fresh_state, monkeypatch, posted,
+                                         fake_supabase, idle_orchestrator):
+    for key, value in FDK_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(fdk_main, "BASE_URL", "")            # no HTTPS host -> long polling
+
+    with TestClient(_make_app()) as client:
+        state = fdk_main.fdk_state
+        assert state.orchestrator is not None
+        assert state.poller_task is not None and not state.poller_task.done()
+        assert not [u for u, _ in posted if u.endswith("/setWebhook")]
+        assert any(u.endswith("/bottok-login/deleteWebhook") for u, _ in posted)
+        assert sum(1 for u, _ in posted if u.endswith("/setMyCommands")) == 1
+        assert client.get("/fdk/health").json()["telegram_mode"] == "polling"
+
+    assert fdk_main.fdk_state.poller_task.cancelled() or fdk_main.fdk_state.poller_task.done()
 
 
 def test_startup_failure_is_contained(fresh_state, monkeypatch, posted):

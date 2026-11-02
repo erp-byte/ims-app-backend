@@ -4,6 +4,9 @@
 gspread>=5.12.0
 google-auth>=2.23.0
 pyotp>=2.9.0
+# Shoonya's only documented unattended login drives its OAuth page in headless Chrome
+# (FDK_SHOONYA_AUTO_LOGIN); the Dockerfile installs chromium + chromium-driver for it.
+selenium>=4.15.0
 mcp>=1.10.0,<2.0.0
 feedparser>=6.0.11
 beautifulsoup4>=4.12.0

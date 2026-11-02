@@ -110,6 +110,8 @@ class Orchestrator:
         auth = self.authenticator
         if auth.is_authenticated:
             return "ok"
+        if getattr(auth, "awaiting_manual_login", False):
+            return "awaiting_manual_login"       # link sent on Telegram, waiting for the pasted URL
         if getattr(auth, "last_error", None):
             return "failed"
         if self.config.scheduling_enabled and not is_market_hours():

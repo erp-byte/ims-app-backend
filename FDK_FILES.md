@@ -28,6 +28,7 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 - fdk_mount
 - _build_detector
 - _register_telegram
+- _start_telegram_poller
 - _log_supervisor_exit
 - _build_mcp
 - fdk_lifespan
@@ -67,12 +68,14 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 
 ### fdk_tests/test_fdk_config_loader.py
 - env
-- test_shoonya_is_the_only_login
-- test_shoonya_imei_can_be_overridden
-- test_shoonya_credentials_are_required
+- test_shoonya_oauth_inputs_are_loaded
+- test_legacy_names_are_accepted_as_fallbacks
+- test_client_id_defaults_to_username_with_the_retail_suffix
+- test_secret_code_is_required
 - test_blank_shoonya_credentials_are_rejected
+- test_auto_login_can_be_switched_off
 - test_fyers_client_id_is_optional_for_the_dormant_data_socket
-- test_removed_fyers_login_variables_are_ignored
+- test_removed_variables_are_ignored
 
 ### fdk_tests/test_fdk_integration.py
 - fresh_state
@@ -86,6 +89,7 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 - test_fdk_logger_is_namespaced
 - test_disabled_is_inert
 - test_enabled_builds_registers_and_serves
+- test_polling_mode_when_no_public_url
 - test_startup_failure_is_contained
 - test_startup_failure_is_contained._down
 - test_supervisor_failure_is_read_from_the_task
@@ -139,40 +143,67 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 - FakeSender.send_async
 - _config
 - _auth
-- _auth._login_with_retry
-- test_rejects_a_malformed_totp_secret_at_construction
-- test_rejects_an_empty_totp_secret_at_construction
-- test_reuses_a_cached_token_that_the_broker_still_accepts
-- test_logs_in_fresh_when_the_cached_token_is_rejected
-- test_failed_login_notifies_telegram_and_returns_false
-- test_cancel_cuts_the_post_failure_cooldown_short
-- test_cancel_cuts_the_post_failure_cooldown_short.run
+- _auth._auto
+- _auth._exchange
+- test_rejects_a_malformed_or_empty_totp_secret_at_construction
+- test_reuses_a_cached_session_that_the_broker_still_accepts
+- test_automated_login_exchanges_the_captured_code
+- test_falls_back_to_the_manual_link_when_the_browser_login_fails
+- test_falls_back_to_the_manual_link_when_the_browser_login_fails.run
+- test_manual_link_is_used_directly_when_auto_login_is_off
+- test_manual_link_is_used_directly_when_auto_login_is_off.run
+- test_manual_link_is_used_directly_when_no_browser_is_installed
+- test_manual_link_is_used_directly_when_no_browser_is_installed.run
+- test_manual_link_is_resent_while_waiting
+- test_manual_link_is_resent_while_waiting.run
+- test_bad_pasted_code_is_reported_and_the_wait_continues
+- test_bad_pasted_code_is_reported_and_the_wait_continues.run
+- test_cancel_cuts_the_manual_wait_short
+- test_cancel_cuts_the_manual_wait_short.run
 - test_reset_clears_the_session_so_the_next_login_is_fresh
 - test_reset_cancel_allows_a_new_attempt_after_cancel
 
 ### fdk_tests/test_shoonya_login.py
 - _load
-- _FakeResp
-- _FakeResp.__init__
-- _FakeResp.json
+- _JsonResp
+- _JsonResp.__init__
+- _HtmlResp
+- _HtmlResp.__init__
 - _parse_form
-- test_login_posts_hashed_credentials_and_returns_session
-- test_login_posts_hashed_credentials_and_returns_session._post
-- test_login_reports_the_brokers_error_message
-- test_login_reports_network_failure_instead_of_raising
-- test_login_reports_network_failure_instead_of_raising._boom
-- test_totp_code_is_six_digits_from_the_secret
-- test_login_with_a_malformed_totp_secret_reports_an_error_instead_of_raising
-- test_validate_session_sends_the_token_as_jkey
-- test_validate_session_sends_the_token_as_jkey._post
+- test_oauth_login_url_carries_the_client_id
+- test_extract_code_from_a_pasted_redirect_url
+- test_checksum_is_sha256_of_client_id_secret_and_code
+- test_exchange_code_posts_gen_acs_tok_and_returns_the_session
+- test_exchange_code_posts_gen_acs_tok_and_returns_the_session._post
+- test_exchange_code_reports_the_brokers_error_message
+- test_exchange_code_reports_http_status_when_the_reply_is_not_json
+- test_exchange_code_reports_network_failure_instead_of_raising
+- test_exchange_code_reports_network_failure_instead_of_raising._boom
+- test_validate_session_uses_the_bearer_header
+- test_validate_session_uses_the_bearer_header._post
 - test_validate_session_rejects_an_expired_token
-- test_validate_session_treats_network_errors_as_invalid
-- test_validate_session_treats_network_errors_as_invalid._boom
-- test_login_with_retry_retries_until_success
-- test_login_with_retry_retries_until_success._login
-- test_login_with_retry_gives_up_after_max_attempts
-- test_login_with_retry_stops_when_cancelled
-- test_login_with_retry_stops_when_cancelled._should_cancel
+- test_validate_session_treats_non_json_and_network_errors_as_invalid
+- test_validate_session_treats_non_json_and_network_errors_as_invalid._boom
+- _FakeElement
+- _FakeElement.__init__
+- _FakeElement.is_displayed
+- _FakeElement.click
+- _FakeElement.clear
+- _FakeElement.send_keys
+- _FakeDriver
+- _FakeDriver.__init__
+- _FakeDriver.get
+- _FakeDriver.find_elements
+- _FakeDriver.find_element
+- _FakeDriver.get_log
+- _FakeDriver.quit
+- _auto
+- test_auto_login_drives_the_official_login_page_and_captures_the_code
+- test_auto_login_retries_once_with_a_fresh_totp_then_gives_up
+- test_auto_login_retries_once_with_a_fresh_totp_then_gives_up._sleep
+- test_auto_login_reports_a_changed_page_layout
+- test_auto_login_reports_a_missing_browser
+- test_auto_login_reports_a_missing_browser._no_browser
 
 ### fdk_tests/test_summary_scheduler.py
 - _Gen
@@ -192,6 +223,20 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 - test_send_logs_telegram_error_body_on_non_200
 - test_send_logs_exception_with_chat_id
 - test_send_logs_exception_with_chat_id._boom
+
+### fdk_tests/test_telegram_poller.py
+- _Resp
+- _Resp.__init__
+- _Resp.json
+- _drive
+- _drive.run
+- test_poller_removes_the_webhook_then_dispatches_messages_in_order
+- test_poller_removes_the_webhook_then_dispatches_messages_in_order._get
+- test_poller_removes_the_webhook_then_dispatches_messages_in_order._post
+- test_poller_removes_the_webhook_then_dispatches_messages_in_order.handler
+- test_poller_survives_network_errors_and_handler_errors
+- test_poller_survives_network_errors_and_handler_errors._get
+- test_poller_survives_network_errors_and_handler_errors.handler
 
 ### fdk_tests/test_websocket_manager.py
 - _Inner
@@ -232,6 +277,7 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 ### services/fdk_auth_service/server.py
 - init_auth_router
 - telegram_webhook
+- handle_text
 - _handle_hold
 - _handle_restart
 - _handle_send_summary
@@ -244,18 +290,29 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 - ShoonyaAuthenticator.cancel_auth
 - ShoonyaAuthenticator.reset_cancel
 - ShoonyaAuthenticator.reset
+- ShoonyaAuthenticator.submit_code
 - ShoonyaAuthenticator.authenticate
-- ShoonyaAuthenticator._creds
+- ShoonyaAuthenticator._manual_login
+- ShoonyaAuthenticator._exchange_and_adopt
 - ShoonyaAuthenticator._adopt
 - ShoonyaAuthenticator._cancellable_sleep
 
 ### services/fdk_auth_service/shoonya_login.py
 - _sha256
 - _totp_now
+- _snippet
 - _post
-- login
+- bearer_headers
+- oauth_login_url
+- extract_code
+- checksum
+- exchange_code
 - validate_session
-- login_with_retry
+- auto_login_available
+- _chrome_driver
+- _scan_network_for_code
+- _fill
+- auto_login_code
 
 ### services/fdk_auth_service/token_manager.py
 - TokenManager
@@ -527,6 +584,7 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 
 ### services/fdk_telegram_service/message_template.py
 - trade_alert_message
+- shoonya_login_link_message
 - auth_success_message
 - auth_failure_message
 - hold_message
@@ -541,6 +599,13 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 
 ### services/fdk_telegram_service/models.py
 - TelegramMessage
+
+### services/fdk_telegram_service/poller.py
+- TelegramPoller
+- TelegramPoller.__init__
+- TelegramPoller.run
+- TelegramPoller._delete_webhook
+- TelegramPoller._get_updates
 
 ### services/fdk_telegram_service/server.py
 - (none)
@@ -557,6 +622,7 @@ Every file that belongs to fdk (the Fyers Volume Spike Detector merged from fyer
 - SupabaseConfig
 - AppConfig
 - _required
+- _first_present
 - _shoonya_config
 - _channel
 - _optional_channel

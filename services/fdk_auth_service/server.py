@@ -1,7 +1,8 @@
-"""Telegram webhook endpoint for receiving commands (/hld /rst /snd /sdt).
+"""Inbound Telegram messages: commands (/hld /rst /snd /sdt) and, while the Shoonya
+login is waiting for one, the pasted OAuth redirect URL (carries code=...).
 
-The Fyers browser-redirect login (/auth/callback and pasted auth codes) is gone;
-the Shoonya login is headless, so this router only carries commands.
+handle_text() is the single dispatcher; the webhook route and the long poller
+(services/fdk_telegram_service/poller.py) both feed it.
 """
 from fastapi import APIRouter, Request
 from shared.fdk_logger import get_logger
@@ -42,6 +43,12 @@ async def telegram_webhook(request: Request):
     message = body.get("message", {})
     text = message.get("text", "")
     log.info(f"Webhook received: {text!r}")
+    return await handle_text(text)
+
+
+async def handle_text(text: str) -> dict:
+    """Dispatch one inbound Telegram message (from the webhook or the poller)."""
+    global _pending_summary_date
 
     # Check for commands first
     command, rest = parse_command(text)
@@ -61,6 +68,14 @@ async def telegram_webhook(request: Request):
 
     if command == "/sdt":
         return await _handle_summary_date_prompt()
+
+    # The operator pasted the Shoonya redirect URL while the login waits for it
+    auth = getattr(_orchestrator, "authenticator", None)
+    if auth is not None and getattr(auth, "awaiting_manual_login", False) and "code=" in text:
+        if auth.submit_code(text):
+            log.info("Shoonya authorization code received via Telegram")
+            return {"status": "code_received"}
+        return {"status": "code_rejected"}
 
     # Check if we're waiting for a date (from /sdt)
     if _pending_summary_date and text.strip():

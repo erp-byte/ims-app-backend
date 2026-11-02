@@ -10,8 +10,11 @@ touches fdk in exactly three marked places, all in main.py:
 
 Routes (all under FDK_ROUTE_PREFIX = "/fdk"):
     GET  /fdk/health            detector + login status
-    POST /fdk/webhook/telegram  Telegram commands /hld /rst /snd /sdt
+    POST /fdk/webhook/telegram  Telegram commands /hld /rst /snd /sdt (+ pasted login URL)
     *    /fdk/mcp               MCP endpoint (or /fdk/mcp-<FDK_MCP_PATH_SECRET>)
+
+Telegram inbound: with FDK_BASE_URL set, webhooks are registered on all 5 bots;
+without it (no public HTTPS, e.g. the EC2 box) the login bot is long-polled instead.
 
 Nothing starts unless FDK_ENABLED is truthy. A failed fdk start-up (missing
 FDK_* env, Supabase down, dependency missing) is logged and the backend carries
@@ -44,6 +47,8 @@ class FdkState:
         self.mcp: Any = None
         self.mcp_app: Any = None          # ASGI app, set once the lifespan has built it
         self.task: asyncio.Task | None = None
+        self.poller_task: asyncio.Task | None = None   # Telegram long polling (no FDK_BASE_URL)
+        self.telegram_mode: str = "none"               # webhook / polling / none
         self.error: str | None = None
 
 
@@ -87,8 +92,10 @@ async def fdk_health_check():
         # ok / failed / on_hold / waiting_for_market_hours / in_progress
         "login_state": orchestrator.login_state(),
         "authenticated": auth.is_authenticated,
+        "login_method": getattr(auth, "login_method", None),     # cached / auto / manual
         "last_login_at": last_login.isoformat() if last_login else None,
         "last_auth_error": getattr(auth, "last_error", None),
+        "telegram_mode": fdk_state.telegram_mode,
         "market_hours": is_market_hours(),
         "scheduling_enabled": orchestrator.config.scheduling_enabled,
         "fyers_running": orchestrator.fyers.is_running,
@@ -136,22 +143,34 @@ def _build_detector():
 
 
 def _register_telegram(config: AppConfig) -> None:
-    """Register the webhook on all 5 bots and the command menu on the login bot."""
-    from services.fdk_auth_service.tools import register_bot_commands, register_telegram_webhook
+    """Webhook mode: register the webhook on all 5 bots. Polling mode (no public
+    HTTPS URL): drop the login bot's webhook so getUpdates is allowed. Both: the
+    command menu on the login bot."""
+    from services.fdk_auth_service.tools import (
+        delete_telegram_webhook, register_bot_commands, register_telegram_webhook,
+    )
 
-    if not BASE_URL:
-        log.error("FDK_BASE_URL is not set — Telegram webhooks NOT registered; "
-                  "/hld /rst /snd /sdt will not reach this server")
-        return
-    for channel in [
-        config.telegram.login,
-        config.telegram.fyers_trade,
-        config.telegram.fyers_summary,
-        config.telegram.penny_trade,
-        config.telegram.penny_summary,
-    ]:
-        register_telegram_webhook(channel.bot_token)
+    if BASE_URL:
+        for channel in [
+            config.telegram.login,
+            config.telegram.fyers_trade,
+            config.telegram.fyers_summary,
+            config.telegram.penny_trade,
+            config.telegram.penny_summary,
+        ]:
+            register_telegram_webhook(channel.bot_token)
+    else:
+        log.info("FDK_BASE_URL is not set — long-polling the login bot for commands "
+                 "and the pasted Shoonya login URL (no webhooks)")
+        delete_telegram_webhook(config.telegram.login.bot_token)
     register_bot_commands(config.telegram.login.bot_token)
+
+
+def _start_telegram_poller(config: AppConfig) -> asyncio.Task:
+    from services.fdk_auth_service.server import handle_text
+    from services.fdk_telegram_service.poller import TelegramPoller
+
+    return asyncio.create_task(TelegramPoller(config.telegram.login.bot_token, handle_text).run())
 
 
 def _log_supervisor_exit(task: asyncio.Task) -> None:
@@ -196,10 +215,13 @@ async def fdk_lifespan():
         from services.fdk_auth_service.server import init_auth_router
 
         init_auth_router(orchestrator=orchestrator, login_sender=orchestrator.login_sender)
+        fdk_state.telegram_mode = "webhook" if BASE_URL else "polling"
         try:
             await asyncio.to_thread(_register_telegram, config)
         except Exception as exc:
             log.error("fdk Telegram registration failed: %s", exc)
+        if fdk_state.telegram_mode == "polling":
+            fdk_state.poller_task = _start_telegram_poller(config)
         if FDK_SELF_PING:
             if BASE_URL:
                 from services.fdk_supervisor_service.health_monitor import start_self_ping
@@ -232,4 +254,6 @@ async def fdk_lifespan():
             orchestrator.penny.stop()
         if fdk_state.task is not None:
             fdk_state.task.cancel()
+        if fdk_state.poller_task is not None:
+            fdk_state.poller_task.cancel()
         fdk_state.mcp_app = None

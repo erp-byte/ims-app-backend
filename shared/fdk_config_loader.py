@@ -17,14 +17,13 @@ def fdk_enabled() -> bool:
 
 @dataclass
 class ShoonyaConfig:
-    """Shoonya (Finvasia) headless login inputs — no OAuth, no redirect step."""
-    username: str
+    """Shoonya (Finvasia) OAuth login inputs (the API in force since 1 April 2026)."""
+    username: str          # user id, e.g. FA12345
     password: str
-    totp_secret: str
-    vendor_code: str      # retail API users: "<username>_U"
-    api_key: str          # Prism-generated API key
-    imei: str = "abc1234"  # any fixed device identifier; the broker does not validate it
-    redirect_uri: str = ""  # unused by Shoonya's login; accepted so an existing env line is harmless
+    totp_secret: str       # Profile -> Security -> TOTP Setup
+    client_id: str         # API Key Generation screen "Client ID", e.g. FA12345_U
+    secret_code: str       # API Key Generation screen "Secret Code" (checksum input)
+    auto_login: bool = True  # drive the login page headlessly before falling back to the Telegram link
 
 
 @dataclass
@@ -77,15 +76,30 @@ def _required(key: str) -> str:
     return value
 
 
+def _first_present(*keys: str) -> str:
+    """First env var among `keys` that is set; blank -> ValueError; none -> KeyError(keys[0])."""
+    for key in keys:
+        if key in os.environ:
+            return _required(key)
+    raise KeyError(keys[0])
+
+
 def _shoonya_config() -> ShoonyaConfig:
+    username = _required("FDK_SHOONYA_USERNAME")
+    # Shoonya renamed things with its 2026 OAuth API: the old "vendor code" is the
+    # Client ID (retail: <username>_U) and the old "API key" is the Secret Code.
+    try:
+        client_id = _first_present("FDK_SHOONYA_CLIENT_ID", "FDK_SHOONYA_VENDORCODE")
+    except KeyError:
+        client_id = f"{username}_U"
     return ShoonyaConfig(
-        username=_required("FDK_SHOONYA_USERNAME"),
+        username=username,
         password=_required("FDK_SHOONYA_PASSWORD"),
         totp_secret=_required("FDK_SHOONYA_TOTP_SECRET"),
-        vendor_code=_required("FDK_SHOONYA_VENDORCODE"),
-        api_key=_required("FDK_SHOONYA_API_KEY"),
-        imei=os.getenv("FDK_SHOONYA_IMEI", "").strip() or "abc1234",
-        redirect_uri=os.getenv("FDK_SHOONYA_REDIRECT_URI", "").strip(),
+        client_id=client_id,
+        secret_code=_first_present("FDK_SHOONYA_SECRET_CODE", "FDK_SHOONYA_API_KEY"),
+        auto_login=os.getenv("FDK_SHOONYA_AUTO_LOGIN", "true").strip().lower()
+        in ("1", "true", "yes", "on"),
     )
 
 

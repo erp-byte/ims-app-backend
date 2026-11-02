@@ -14,10 +14,10 @@ Dual volume spike detector for NSE stocks. Monitors Fyers WebSocket ticks and al
 ```
 fdk_main.py (fdk_lifespan() + fdk_mount(app); imported by the backend's main.py — not a standalone process)
   GET  /fdk/health            -> status (disabled / unavailable / stopped + error / healthy / on_hold) + login_state
-  POST /fdk/webhook/telegram  -> receives commands from Telegram
+  POST /fdk/webhook/telegram  -> commands from Telegram (webhook mode; with no FDK_BASE_URL the login bot is long-polled instead)
   *    /fdk/mcp               -> MCP endpoint (news + detector tools; /fdk/mcp-<FDK_MCP_PATH_SECRET> if set)
   lifespan (only when FDK_ENABLED=true; any failure is logged and the backend carries on):
-    startup: build orchestrator (worker thread, 120 s cap) -> register webhooks (all 5 bots, needs FDK_BASE_URL)
+    startup: build orchestrator (worker thread, 120 s cap) -> Telegram webhooks (FDK_BASE_URL set) or long polling
              -> optional self-ping (FDK_SELF_PING) -> orchestrator.run() as a task
     shutdown: stop detectors, cancel the task
 
@@ -49,10 +49,10 @@ Candor backend — only the fdk-owned paths are shown (FDK_FILES.md is the autho
 │   └── fdk_models.py                # Pydantic: TickData, TradeAlert, DetectorConfig
 ├── services/
 │   ├── fdk_auth_service/
-│   │   ├── shoonya_login.py         # Shoonya headless login (QuickAuth / UserDetails over HTTP)
-│   │   ├── shoonya_authenticator.py # ShoonyaAuthenticator — the only login
+│   │   ├── shoonya_login.py         # Shoonya OAuth: code -> GenAcsTok, UserDetails, headless-browser login
+│   │   ├── shoonya_authenticator.py # ShoonyaAuthenticator — cached -> browser -> Telegram link
 │   │   ├── token_manager.py         # Supabase CRUD for the session table (shoonya_tokens)
-│   │   ├── server.py                # POST /fdk/webhook/telegram (commands)
+│   │   ├── server.py                # handle_text(): commands + pasted login URL; POST /fdk/webhook/telegram
 │   │   └── tools.py                 # register/delete Telegram webhook
 │   ├── fdk_fyers_service/               # Isolated fyers detector + summary
 │   │   ├── service.py               # FyersService (detector + controller lifecycle)
@@ -72,6 +72,7 @@ Candor backend — only the fdk-owned paths are shown (FDK_FILES.md is the autho
 │   │   └── health_monitor.py        # Self-ping for Render keep-alive
 │   ├── fdk_telegram_service/
 │   │   ├── bot_handler.py           # TelegramSender (one per bot+chat pair)
+│   │   ├── poller.py                # TelegramPoller — long polling on the login bot (no public URL)
 │   │   ├── message_template.py      # Alert/auth message templates
 │   │   └── command_parser.py        # parse_command(), parse_date()
 │   ├── fdk_summary_service/
@@ -101,13 +102,13 @@ Candor backend — only the fdk-owned paths are shown (FDK_FILES.md is the autho
 | Variable | Purpose |
 |----------|---------|
 | `FDK_FYERS_CLIENT_ID` | Optional. Fyers app id read only by the dormant Fyers data socket (there is no Fyers login any more); leave empty |
-| `FDK_SHOONYA_USERNAME` | Shoonya client id. The Shoonya login is the only login; with scheduling on the first login runs at 09:13 IST and `/rst` forces one at any time |
-| `FDK_SHOONYA_PASSWORD` | Shoonya login password (hashed before sending) |
-| `FDK_SHOONYA_TOTP_SECRET` | TOTP secret from the Shoonya app / Prism |
-| `FDK_SHOONYA_VENDORCODE` | Vendor code (retail API users: `<username>_U`) |
-| `FDK_SHOONYA_API_KEY` | Prism-generated API key |
-| `FDK_SHOONYA_IMEI` | Any fixed device identifier (default `abc1234`) |
-| `FDK_SHOONYA_REDIRECT_URI` | Unused by Shoonya's login; kept for parity |
+| `FDK_SHOONYA_USERNAME` | Shoonya user id (e.g. `FA12345`). The Shoonya OAuth login is the only login; with scheduling on the first login runs at 09:13 IST and `/rst` forces one at any time |
+| `FDK_SHOONYA_PASSWORD` | Shoonya login password (typed into Shoonya's own login page by the headless browser) |
+| `FDK_SHOONYA_TOTP_SECRET` | TOTP secret (Profile → Security → TOTP Setup) |
+| `FDK_SHOONYA_CLIENT_ID` | "Client ID" on the API Key Generation screen, e.g. `FA12345_U` (default `<username>_U`; `FDK_SHOONYA_VENDORCODE` accepted as a fallback) |
+| `FDK_SHOONYA_SECRET_CODE` | "Secret Code" on the same screen — checksum input for GenAcsTok (`FDK_SHOONYA_API_KEY` accepted as a fallback) |
+| `FDK_SHOONYA_AUTO_LOGIN` | `true` (default): headless-browser login first, Telegram link as fallback; `false`: Telegram link only |
+| `FDK_CHROME_BINARY` / `FDK_CHROMEDRIVER` | Optional paths for the headless browser (the image installs `/usr/bin/chromium` and `/usr/bin/chromedriver`) |
 | `FDK_LOGIN_BOT_TOKEN` | Login bot token |
 | `FDK_LOGIN_CHAT_ID` | Login chat ID — login success/failure, daily token reset, /hld /rst responses |
 | `FDK_FYERS_TRADE_BOT_TOKEN` | Fyers trade bot token |
@@ -125,7 +126,7 @@ Candor backend — only the fdk-owned paths are shown (FDK_FILES.md is the autho
 | `FDK_PORT` | Read for parity only; unused inside the backend (uvicorn owns the port) |
 | `FDK_SCHEDULING_ENABLED` | Enable market-hour scheduling (default true) |
 | `FDK_ENABLED` | Master switch — nothing fdk starts unless truthy (default false) |
-| `FDK_BASE_URL` | Public https URL of the backend; Telegram webhooks are registered to it (empty = not registered, logged as an error) |
+| `FDK_BASE_URL` | Public https URL of the backend; Telegram webhooks are registered to it. Empty = the login bot is long-polled instead (commands and the pasted login URL still work; no public URL needed) |
 | `FDK_SELF_PING` | Opt-in 7-min self-ping thread, needs FDK_BASE_URL (default false; the backend has its own keep-alive) |
 | `FDK_MCP_PATH_SECRET` | Optional; serves MCP at `/fdk/mcp-<secret>` instead of `/fdk/mcp` |
 | `FDK_NEWS_BOT_TOKEN` / `FDK_NEWS_CHAT_ID` | Optional news bot used by the MCP `send_news_to_telegram` tool |
@@ -172,20 +173,32 @@ CREATE INDEX IF NOT EXISTS idx_sector_mappings_symbol ON sector_mappings (symbol
 
 **Auto-seed:** On first run, if `stock_symbols` or `sector_mappings` are empty, `SymbolManager` seeds from `config/fdk_symbols.json` and `config/fdk_sectors.json`. After that, Supabase is the source of truth.
 
-## Auth Flow (Shoonya, headless)
+## Auth Flow (Shoonya OAuth)
 
-No browser, OAuth or webhook step — the login is a direct REST call made by the orchestrator:
+Shoonya's API since 1 April 2026 (SEBI algo framework) has **no password/TOTP API login**; the
+only way in is its OAuth page, and the token exchange must come from the **whitelisted static IP**.
+The orchestrator runs this ladder (`services/fdk_auth_service/shoonya_authenticator.py`):
 
-1. **Cached session**: `shoonya_tokens` row less than 8 h old → `UserDetails` check with the broker.
+1. **Cached session**: `shoonya_tokens` row less than 8 h old → `UserDetails` check (Bearer token).
    Accepted → "Shoonya Authentication Successful! Session active." on the login bot.
-2. **Fresh login**: `QuickAuth` with user id, sha256(password), TOTP from `FDK_SHOONYA_TOTP_SECRET`,
-   vendor code, sha256(user id|API key) and the IMEI. Up to 5 attempts 60 s apart; `/hld` and
-   `/rst` cancel the wait. Success → new `shoonya_tokens` row + the success message.
-3. **Failure**: "Shoonya Authentication Failed" with the broker's message (also in `/fdk/health`
-   as `last_auth_error`), then a 300 s cooldown before the supervisor loop tries again.
-4. **Then idle**: the tick feed is still the dormant Fyers socket (step 2 wires Shoonya), so no
-   "Monitoring Started" message; `/fdk/health` shows `login_state: ok` with `last_login_at`.
+2. **Headless-browser login** (`FDK_SHOONYA_AUTO_LOGIN=true`, Chrome in the image): opens
+   `https://api.shoonya.com/OAuthlogin/investor-entry-level/login?api_key=<client id>&route_to=<user id>`,
+   fills user id / password / TOTP, clicks LOGIN and reads the redirect's `code=` from the browser's
+   network log — the recipe on Shoonya's own "Python Authentication (Selenium)" page. Resubmits once
+   if the TOTP window rolled over; two attempts, then falls through.
+3. **Telegram link**: the login bot sends `https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id=<client id>`.
+   The operator logs in (user id, password, OTP/TOTP) and pastes the full URL of the page they land
+   on — it carries `?code=...` — into the login chat (webhook or long polling). The link is resent
+   every 5 minutes until then; `/hld` and `/rst` cancel the wait. `/fdk/health` shows
+   `login_state: awaiting_manual_login` meanwhile.
+4. **Exchange**: `POST NorenWClientAPI/GenAcsTok` with `{"code", "checksum": sha256(client_id + secret_code + code), "uid"}`
+   → `access_token` (valid for the trading day, no refresh). Stored in `shoonya_tokens`, sent as
+   `Authorization: Bearer` afterwards. A rejected code is reported on Telegram and the wait continues.
+5. **Then idle**: the tick feed is still the dormant Fyers socket (step 2 wires Shoonya's
+   `wss://api.shoonya.com/NorenWSAPI/`), so no "Monitoring Started" message; `/fdk/health` shows
+   `login_state: ok`, `login_method: cached|auto|manual` and `last_login_at`.
 
+No redirect URL has to be hosted: the code is read from the browser (step 2) or pasted (step 3).
 Timing: with `FDK_SCHEDULING_ENABLED=true` the first login runs at 09:13 IST; `/rst` forces one at
 any time; the 17:00 IST wipe clears `shoonya_tokens` so the next open is a fresh login.
 
@@ -321,12 +334,33 @@ At 16:30 IST (SummaryScheduler checks every 30s):
 - Dependencies: `requirements.txt` pulls in `-r fdk_requirements.txt`; `fyers-apiv3` is installed separately
   with `pip install --no-deps -r fdk_requirements_nodeps.txt` because its metadata pins an older `requests`.
   A Render-native build command must run both installs, not just `pip install -r requirements.txt`.
-- Telegram webhooks are registered at start-up to `FDK_BASE_URL` + `/fdk/webhook/telegram`; the MCP endpoint
-  is `/fdk/mcp` (or `/fdk/mcp-<FDK_MCP_PATH_SECRET>`).
+- Host: the Shoonya token exchange and API calls only work from the static IP whitelisted on the
+  account, so fdk runs on the EC2 box (Elastic IP), not on App Runner. With no public HTTPS URL
+  there, leave `FDK_BASE_URL` empty: the login bot is long-polled for commands and the pasted
+  login URL. With `FDK_BASE_URL` set, webhooks are registered to `FDK_BASE_URL` + `/fdk/webhook/telegram`.
+  The MCP endpoint is `/fdk/mcp` (or `/fdk/mcp-<FDK_MCP_PATH_SECRET>`).
+- The image installs chromium + chromium-driver for the headless login (`--build-arg FDK_BROWSER=0`
+  skips them; the Telegram-link login still works without a browser).
 - Self-ping is opt-in (`FDK_SELF_PING=true`, needs `FDK_BASE_URL`); the backend already runs its own
   keep-alive job. Hosts have run on UTC, so always use `datetime.now(IST)`, never a plain `datetime.now()`.
 
 ## Changelog
+
+### 2026-11-02 - Shoonya OAuth login (the API in force since 1 April 2026)
+- The QuickAuth/vendor-code login and the `NorenWClientTP` base were retired by Shoonya under SEBI's
+  algo framework (they answer 502). `shoonya_login.py` now mirrors the vendor's NorenRestApiOAuth
+  SDK: REST base `NorenWClientAPI`, `GenAcsTok` with `checksum = sha256(client_id + secret_code + code)`,
+  `Authorization: Bearer` on every call, `UserDetails` to validate a stored session.
+- Ladder in `ShoonyaAuthenticator`: cached session → headless-browser login on Shoonya's own page
+  (official Selenium recipe; `FDK_SHOONYA_AUTO_LOGIN`) → Telegram link: the login bot sends the OAuth
+  URL, the operator logs in and pastes the URL they land on (`code=...`), resent every 5 min.
+  `/fdk/health` reports `login_state: awaiting_manual_login` and `login_method` (cached/auto/manual).
+- Env: `FDK_SHOONYA_CLIENT_ID` (old `VENDORCODE`, default `<username>_U`) and `FDK_SHOONYA_SECRET_CODE`
+  (old `API_KEY`) replace vendor code / API key / IMEI / redirect URI; old names still accepted.
+- Telegram inbound without a public URL: `TelegramPoller` long-polls the login bot when
+  `FDK_BASE_URL` is empty (`telegram_mode: polling` in health); `handle_text()` is the single dispatcher.
+- Deployment: run on the host whose static IP is whitelisted at Shoonya; chromium + chromium-driver
+  are installed in the image for the browser login (`--build-arg FDK_BROWSER=0` to skip).
 
 ### 2026-11-02 - Fyers login removed
 - Deleted the Fyers webhook/TOTP login: `authenticator.py`, `totp_login.py`, `totp_handler.py`,

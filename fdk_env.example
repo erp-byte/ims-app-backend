@@ -5,22 +5,24 @@
 
 # Master switch and integration
 FDK_ENABLED=false
-FDK_BASE_URL=                      # public https URL of this backend (no trailing slash)
+FDK_BASE_URL=                      # public https URL of this backend (no trailing slash); empty = long-poll the login bot instead of webhooks
 FDK_SELF_PING=false                # opt-in 7-min self-ping thread (backend has its own keep-alive)
 FDK_SCHEDULING_ENABLED=true        # market-hour scheduling 09:13-16:00 IST
 FDK_MCP_PATH_SECRET=               # optional: serves MCP at /fdk/mcp-<secret> instead of /fdk/mcp
 FDK_PORT=8000                      # unused inside the backend (uvicorn owns the port); kept for parity
 
-# Shoonya — the only login (headless, no redirect step). With scheduling on, the first
-# login runs at 09:13 IST; send /rst on Telegram to force one. The tick feed is still the
-# dormant Fyers socket, so the orchestrator logs in and idles until step 2 wires Shoonya.
-FDK_SHOONYA_USERNAME=
+# Shoonya OAuth login (the API in force since 1 April 2026). The host running fdk must be
+# the static IP whitelisted under Profile -> API Key Generation on trade.shoonya.com.
+# With scheduling on, the first login runs at 09:13 IST; send /rst on Telegram to force one.
+# The tick feed is still the dormant Fyers socket, so the orchestrator logs in and idles.
+FDK_SHOONYA_USERNAME=              # user id, e.g. FA12345
 FDK_SHOONYA_PASSWORD=
-FDK_SHOONYA_TOTP_SECRET=
-FDK_SHOONYA_VENDORCODE=            # retail API users: <username>_U
-FDK_SHOONYA_API_KEY=               # Prism -> API section
-FDK_SHOONYA_IMEI=abc1234           # any fixed device identifier; the broker does not validate it
-FDK_SHOONYA_REDIRECT_URI=          # unused by Shoonya's login; kept for parity
+FDK_SHOONYA_TOTP_SECRET=           # Profile -> Security -> TOTP Setup (base32)
+FDK_SHOONYA_CLIENT_ID=             # "Client ID" on the API Key Generation screen, e.g. FA12345_U (default: <username>_U; FDK_SHOONYA_VENDORCODE still accepted)
+FDK_SHOONYA_SECRET_CODE=           # "Secret Code" on the same screen (eye icon); FDK_SHOONYA_API_KEY still accepted
+FDK_SHOONYA_AUTO_LOGIN=true        # drive the login page in headless Chrome first; false = Telegram link only
+FDK_CHROME_BINARY=                 # optional: chromium binary (default /usr/bin/chromium in the image)
+FDK_CHROMEDRIVER=                  # optional: chromedriver path (default /usr/bin/chromedriver in the image)
 
 # Fyers app id — optional; only the dormant Fyers data socket reads it (the Fyers login
 # was removed, so leave it empty)

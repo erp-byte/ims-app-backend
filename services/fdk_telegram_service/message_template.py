@@ -15,6 +15,17 @@ def trade_alert_message(alert: TradeAlert) -> str:
     )
 
 
+def shoonya_login_link_message(login_url: str) -> str:
+    return (
+        f"<b>Shoonya login needed</b>\n\n"
+        f"Open this link and log in with your Shoonya user id, password and OTP/TOTP:\n"
+        f"{login_url}\n\n"
+        f"Then paste the full URL of the page you land on here "
+        f"(it contains <code>code=...</code>).\n"
+        f"<i>Link resent every 5 minutes until logged in.</i>"
+    )
+
+
 def auth_success_message(broker: str = "Shoonya", detail: str = "Session active.") -> str:
     return f"<b>{broker} Authentication Successful!</b>\n{detail}"
 

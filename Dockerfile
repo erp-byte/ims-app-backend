@@ -9,6 +9,11 @@ COPY requirements.txt fdk_requirements.txt fdk_requirements_nodeps.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
  && pip install --no-cache-dir --no-deps -r fdk_requirements_nodeps.txt
 
+# fdk — headless Chromium for the Shoonya browser login (FDK_SHOONYA_AUTO_LOGIN). Build with
+# --build-arg FDK_BROWSER=0 to skip it (the Telegram-link login still works). Remove to drop fdk.
+ARG FDK_BROWSER=1
+RUN if [ "$FDK_BROWSER" = "1" ]; then \n      apt-get update && apt-get install -y --no-install-recommends chromium chromium-driver \n      && rm -rf /var/lib/apt/lists/*; \n    fi
+
 COPY . .
 
 EXPOSE 8000

@@ -24,6 +24,7 @@ from shared.fdk_constants import (
 from services.fdk_telegram_service import TelegramSender
 from services.fdk_telegram_service.message_template import (
     auth_success_message, auth_failure_message, shoonya_login_link_message,
+    shoonya_login_paused_message,
 )
 from .token_manager import TokenManager
 from . import shoonya_login
@@ -54,7 +55,12 @@ class ShoonyaAuthenticator:
         self.last_error: str | None = None
         self.login_method: str | None = None     # cached / auto / manual
         self.awaiting_manual_login = False
-        # Tunables (tests shorten them)
+        # The orchestrator points this at its market-hours check so the manual
+        # wait yields (no link spam, 17:00 reset keeps running) when a login
+        # would not be used anyway.
+        self.keep_waiting = lambda: True
+        # Tunables (tests shorten them). The browser recipe already resubmits
+        # once internally, so two attempts are plenty before the Telegram link.
         self.auto_attempts = AUTO_LOGIN_MAX_ATTEMPTS
         self.auto_retry_delay = AUTO_LOGIN_RETRY_DELAY
         self.resend_interval = LOGIN_URL_RETRY_INTERVAL
@@ -113,6 +119,8 @@ class ShoonyaAuthenticator:
                 result = await asyncio.to_thread(
                     shoonya_login.auto_login_code,
                     self.cfg.client_id, self.cfg.username, self.cfg.password, self.cfg.totp_secret,
+                    cancelled=self._cancel_event.is_set,
+                    redirect_hint=self.cfg.redirect_hint,
                 )
                 if result.get("code"):
                     if await self._exchange_and_adopt(result["code"], "auto"):
@@ -120,6 +128,8 @@ class ShoonyaAuthenticator:
                     break                               # the code was fine, the exchange was not: config problem -> manual
                 log.warning(f"Shoonya browser login failed: {result.get('error')}")
                 self.last_error = result.get("error")
+                if result.get("fatal"):
+                    break                               # no browser to drive: retrying cannot help
                 if attempt < self.auto_attempts:
                     await self._cancellable_sleep(self.auto_retry_delay)
         elif self.cfg.auto_login:
@@ -142,6 +152,12 @@ class ShoonyaAuthenticator:
                     await asyncio.wait_for(self._code_event.wait(), timeout=self.resend_interval)
                 except asyncio.TimeoutError:
                     if self._cancel_event.is_set():
+                        return False
+                    if not self.keep_waiting():
+                        # e.g. market closed: hand control back to the supervisor loop
+                        # (17:00 reset, market-hours gate); it re-enters at the next open.
+                        log.info("Shoonya manual login paused — a login would not be used now")
+                        await self.login_sender.send_async(shoonya_login_paused_message())
                         return False
                     log.info("Shoonya login link resent (still waiting for the pasted URL)")
                     continue

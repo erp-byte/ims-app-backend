@@ -6,12 +6,18 @@ from shared.fdk_constants import BASE_URL, WEBHOOK_PATH
 log = get_logger("auth_tools")
 
 
-def register_telegram_webhook(bot_token: str):
-    """Register the Telegram webhook URL with the Bot API."""
+def register_telegram_webhook(bot_token: str, secret_token: str | None = None):
+    """Register the Telegram webhook URL with the Bot API.
+
+    With secret_token, Telegram sends it back in the X-Telegram-Bot-Api-Secret-Token
+    header of every delivery, which the webhook route then requires."""
     webhook_url = f"{BASE_URL}{WEBHOOK_PATH}"
+    payload = {"url": webhook_url, "allowed_updates": ["message"]}
+    if secret_token:
+        payload["secret_token"] = secret_token
     resp = requests.post(
         f"https://api.telegram.org/bot{bot_token}/setWebhook",
-        json={"url": webhook_url, "allowed_updates": ["message"]},
+        json=payload,
         timeout=10
     )
     data = resp.json()

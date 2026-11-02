@@ -63,6 +63,35 @@ def test_poller_removes_the_webhook_then_dispatches_messages_in_order(monkeypatc
     assert gets[1][1]["timeout"] == 0
 
 
+def test_poller_only_listens_to_the_login_chat(monkeypatch, caplog):
+    import logging
+    handled, gets = [], []
+    batches = [[{"update_id": 1, "message": {"chat": {"id": 111}, "text": "/hld from the login chat"}},
+                {"update_id": 2, "message": {"chat": {"id": 999}, "text": "/hld from a stranger"}},
+                {"update_id": 3, "message": {"chat": {"id": 111},
+                                             "text": "https://x/?code=SECRETCODE&x=1"}}]]
+
+    def _get(url, params=None, timeout=None, **kw):
+        gets.append(1)
+        return _Resp({"ok": True, "result": batches.pop(0) if batches else []})
+
+    monkeypatch.setattr(requests, "get", _get)
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp({"ok": True}))
+
+    async def handler(text):
+        handled.append(text)
+        if "code=" in text:
+            raise RuntimeError("boom")
+
+    poller = TelegramPoller("tok", handler, chat_id="111", timeout=0, idle_pause=0)
+    with caplog.at_level(logging.ERROR, logger="fdk.telegram_poller"):
+        _drive(poller, lambda: len(gets) >= 3)
+
+    assert handled == ["/hld from the login chat", "https://x/?code=SECRETCODE&x=1"]
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "SECRETCODE" not in logged and "code=***" in logged     # one-time code never logged
+
+
 def test_poller_survives_network_errors_and_handler_errors(monkeypatch):
     calls = {"get": 0, "handled": 0}
 

@@ -50,16 +50,22 @@ def fresh_state(monkeypatch):
     """Reset the module-level fdk state and isolate from any FDK_* already in the environment."""
     for optional in ("FDK_MCP_PATH_SECRET", "FDK_NEWS_BOT_TOKEN", "FDK_NEWS_CHAT_ID",
                      "FDK_SCHEDULING_ENABLED", "FDK_FYERS_CLIENT_ID",
-                     "FDK_SHOONYA_IMEI", "FDK_SHOONYA_REDIRECT_URI"):
+                     "FDK_SHOONYA_IMEI", "FDK_SHOONYA_REDIRECT_URI",
+                     "FDK_TELEGRAM_WEBHOOK_SECRET"):
         monkeypatch.delenv(optional, raising=False)
     monkeypatch.setattr(fdk_main, "FDK_SELF_PING", False)   # evaluated at import time
-    fdk_main.fdk_state.__init__()
-    fdk_auth_server._orchestrator = fdk_auth_server._login_sender = None
-    fdk_auth_server._pending_summary_date = False
+    _reset_server_globals()
     yield
+    _reset_server_globals()
+
+
+def _reset_server_globals():
     fdk_main.fdk_state.__init__()
     fdk_auth_server._orchestrator = fdk_auth_server._login_sender = None
     fdk_auth_server._pending_summary_date = False
+    fdk_auth_server._allowed_chat_ids = set()
+    fdk_auth_server._webhook_secret = ""
+    fdk_auth_server._webhook_enabled = True
 
 
 @pytest.fixture
@@ -168,25 +174,41 @@ def test_enabled_builds_registers_and_serves(fresh_state, monkeypatch, posted,
         assert isinstance(health["market_hours"], bool)
         assert health["scheduling_enabled"] is True
 
-        # A pasted login URL is ignored unless the authenticator is waiting for one...
-        pasted = {"message": {"text": "https://trade.shoonya.com/?code=abc123"}}
-        assert client.post("/fdk/webhook/telegram", json=pasted).json() == {"status": "ok"}
+        # A pasted login URL is answered but not used unless the authenticator is waiting for one...
+        pasted = {"message": {"chat": {"id": 1}, "text": "https://trade.shoonya.com/?code=abc123"}}
+        assert client.post("/fdk/webhook/telegram", json=pasted).json() == {"status": "code_ignored"}
+        sent = [kw.get("data", {}).get("text", "") for u, kw in posted if u.endswith("/sendMessage")]
+        assert any("no login is waiting" in t.lower() for t in sent)
         # ...and handed to it when it is
         state.orchestrator.authenticator.awaiting_manual_login = True
         assert client.post("/fdk/webhook/telegram", json=pasted).json() == {"status": "code_received"}
         assert state.orchestrator.authenticator._pending_code == "abc123"
         assert client.get("/fdk/health").json()["login_state"] == "awaiting_manual_login"
+        # a paste without a usable code gets a hint back
+        bad = {"message": {"chat": {"id": 1}, "text": "here is the code=   "}}
+        assert client.post("/fdk/webhook/telegram", json=bad).json() == {"status": "code_rejected"}
+        sent = [kw.get("data", {}).get("text", "") for u, kw in posted if u.endswith("/sendMessage")]
+        assert any("paste the full url" in t.lower() for t in sent)
+        # messages from a chat that is not one of the five configured bots are ignored
+        stranger = {"message": {"chat": {"id": 424242}, "text": "/hld"}}
+        assert client.post("/fdk/webhook/telegram", json=stranger).json() == {"status": "ignored_chat"}
+        # ...and so is a body with no chat at all (Telegram always sends one; a forger may not)
+        assert client.post("/fdk/webhook/telegram", json={"message": {"text": "/hld"}}).json() == \
+            {"status": "ignored_chat"}
+        assert client.get("/fdk/health").json()["status"] == "healthy"
         state.orchestrator.authenticator.awaiting_manual_login = False
 
         # Telegram command path -> orchestrator
-        resp = client.post("/fdk/webhook/telegram", json={"message": {"text": "/hld holiday"}})
+        resp = client.post("/fdk/webhook/telegram",
+                           json={"message": {"chat": {"id": 1}, "text": "/hld holiday"}})
         assert resp.json() == {"status": "hold_activated"}
         assert client.get("/fdk/health").json()["status"] == "on_hold"
 
-        # A pasted Fyers redirect URL is just an ordinary message now
+        # A pasted Fyers redirect URL is not a login any more: it gets the same
+        # "no login is waiting" answer as any other stray code= paste
         resp = client.post("/fdk/webhook/telegram",
-                           json={"message": {"text": "https://x/?auth_code=abc123"}})
-        assert resp.json() == {"status": "ok"}
+                           json={"message": {"chat": {"id": 1}, "text": "https://x/?auth_code=abc123"}})
+        assert resp.json() == {"status": "code_ignored"}
 
         # MCP mounted under /fdk and answering (stateless, JSON responses)
         init = _mcp(client, "initialize", protocolVersion="2025-06-18", capabilities={},
@@ -205,6 +227,27 @@ def test_enabled_builds_registers_and_serves(fresh_state, monkeypatch, posted,
     assert fdk_main.fdk_state.orchestrator.authenticator._cancel_event.is_set()
 
 
+def test_webhook_secret_is_registered_and_enforced(fresh_state, monkeypatch, posted,
+                                                   fake_supabase, idle_orchestrator):
+    for key, value in FDK_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("FDK_TELEGRAM_WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setattr(fdk_main, "BASE_URL", "http://fdk.test")
+    from services.fdk_auth_service import tools as fdk_auth_tools
+    monkeypatch.setattr(fdk_auth_tools, "BASE_URL", "http://fdk.test")
+
+    with TestClient(_make_app()) as client:
+        secrets = {kw["json"].get("secret_token") for u, kw in posted if u.endswith("/setWebhook")}
+        assert secrets == {"s3cret"}
+        body = {"message": {"chat": {"id": 1}, "text": "/hld"}}
+        assert client.post("/fdk/webhook/telegram", json=body).status_code == 403
+        wrong = {"X-Telegram-Bot-Api-Secret-Token": "nope"}
+        assert client.post("/fdk/webhook/telegram", json=body, headers=wrong).status_code == 403
+        right = {"X-Telegram-Bot-Api-Secret-Token": "s3cret"}
+        assert client.post("/fdk/webhook/telegram", json=body, headers=right).json() == \
+            {"status": "hold_activated"}
+
+
 def test_polling_mode_when_no_public_url(fresh_state, monkeypatch, posted,
                                          fake_supabase, idle_orchestrator):
     for key, value in FDK_ENV.items():
@@ -219,8 +262,65 @@ def test_polling_mode_when_no_public_url(fresh_state, monkeypatch, posted,
         assert any(u.endswith("/bottok-login/deleteWebhook") for u, _ in posted)
         assert sum(1 for u, _ in posted if u.endswith("/setMyCommands")) == 1
         assert client.get("/fdk/health").json()["telegram_mode"] == "polling"
+        # no webhook is registered, so the route must not accept commands from anyone
+        body = {"message": {"chat": {"id": 1}, "text": "/hld"}}
+        assert client.post("/fdk/webhook/telegram", json=body).status_code == 404
+        assert client.get("/fdk/health").json()["status"] == "healthy"
 
     assert fdk_main.fdk_state.poller_task.cancelled() or fdk_main.fdk_state.poller_task.done()
+
+
+def test_polling_handler_carries_the_login_chat(fresh_state, monkeypatch, posted,
+                                               fake_supabase, idle_orchestrator):
+    from services.fdk_telegram_service import poller as poller_mod
+
+    captured = {}
+
+    class _CapturingPoller:
+        def __init__(self, bot_token, handler, *, chat_id=None, **kw):
+            captured.update(handler=handler, chat_id=chat_id)
+
+        async def run(self):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(poller_mod, "TelegramPoller", _CapturingPoller)
+    for key, value in FDK_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(fdk_main, "BASE_URL", "")
+
+    with TestClient(_make_app()) as client:
+        assert captured["chat_id"] == "1"               # the poller listens to the login chat only
+        # ...so what it forwards comes from that chat and must pass the (fail-closed) allowlist
+        assert asyncio.run(captured["handler"]("/hld holiday")) == {"status": "hold_activated"}
+        assert client.get("/fdk/health").json()["status"] == "on_hold"
+
+
+def test_failed_webhook_registration_is_reported(fresh_state, monkeypatch, posted,
+                                                fake_supabase, idle_orchestrator):
+    for key, value in FDK_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(fdk_main, "BASE_URL", "http://fdk.test")
+    from services.fdk_auth_service import tools as fdk_auth_tools
+    monkeypatch.setattr(fdk_auth_tools, "BASE_URL", "http://fdk.test")
+
+    def _post(url, *args, **kwargs):
+        posted.append((url, kwargs))
+        if url.endswith("/bottok-fs/setWebhook"):
+            raise requests.ConnectionError("telegram unreachable")
+        if url.endswith("/bottok-pt/setWebhook"):
+            return FakeResponse({"ok": False, "description": "Bad Request: bad webhook"})
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, "post", _post)
+
+    with TestClient(_make_app()) as client:
+        # one bot's failure must not stop the others from being registered
+        assert sum(1 for u, _ in posted if u.endswith("/setWebhook")) == 5
+        assert sum(1 for u, _ in posted if u.endswith("/setMyCommands")) == 1
+        health = client.get("/fdk/health").json()
+        assert health["status"] == "healthy"
+        # ...but the operator must see that deliveries may still hit a stale registration
+        assert health["telegram_mode"] == "webhook_failed"
 
 
 def test_startup_failure_is_contained(fresh_state, monkeypatch, posted):

@@ -88,6 +88,73 @@ def test_rejects_a_malformed_or_empty_totp_secret_at_construction():
             sa.ShoonyaAuthenticator(config, FakeTokenManager(), FakeSender())
 
 
+def test_browser_login_is_tried_twice_by_default_and_passes_the_redirect_hint(monkeypatch):
+    seen, calls = {}, []
+
+    def _auto(client_id, username, password, totp_secret, **kw):
+        calls.append(username)
+        seen.update(kw)
+        return {"error": "x"}
+
+    monkeypatch.setattr(sa.shoonya_login, "validate_session", lambda u, t: (False, "No token"))
+    monkeypatch.setattr(sa.shoonya_login, "auto_login_available", lambda: True)
+    monkeypatch.setattr(sa.shoonya_login, "auto_login_code", _auto)
+    config = _config()
+    config.shoonya.redirect_hint = "https://my-app.example.com/cb"
+    auth = sa.ShoonyaAuthenticator(config, FakeTokenManager(), FakeSender())
+
+    assert auth.auto_attempts == 2
+    auth.auto_retry_delay = 0
+    auth.resend_interval = 0.05
+
+    async def run():
+        task = asyncio.create_task(auth.authenticate())
+        for _ in range(100):
+            if auth.awaiting_manual_login:
+                break
+            await asyncio.sleep(0.01)
+        assert seen["cancelled"]() is False         # the hook reads the live cancel event...
+        auth.cancel_auth()
+        assert seen["cancelled"]() is True          # ...so /hld, /rst and shutdown abort the browser
+        return await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(run())
+    assert calls == ["FA12345", "FA12345"]          # exactly two attempts, then the manual link
+    assert seen.get("redirect_hint") == "https://my-app.example.com/cb"
+
+
+def test_fatal_browser_error_skips_straight_to_the_manual_link(monkeypatch):
+    tm, sender = FakeTokenManager(), FakeSender()
+    auth, auto_calls, _ = _auth(tm, sender, monkeypatch,
+                                auto={"error": "browser unavailable: no chromedriver", "fatal": True})
+    auth.auto_attempts = 3
+
+    async def run():
+        task = asyncio.create_task(auth.authenticate())
+        for _ in range(100):
+            if auth.awaiting_manual_login:
+                break
+            await asyncio.sleep(0.01)
+        auth.cancel_auth()
+        return await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(run())
+    assert auto_calls == ["FA12345"]              # one try, not three
+    assert any("client_id=FA12345_U" in m for m in sender.messages)
+
+
+def test_manual_wait_yields_to_the_supervisor_when_told_to_stop_waiting(monkeypatch):
+    tm, sender = FakeTokenManager(), FakeSender()
+    auth, _, _ = _auth(tm, sender, monkeypatch, auto_login=False)
+    auth.keep_waiting = lambda: False             # e.g. market closed: let run() regain control
+
+    assert asyncio.run(asyncio.wait_for(auth.authenticate(), timeout=5)) is False
+    assert auth.awaiting_manual_login is False
+    assert auth.is_authenticated is False
+    assert any("client_id=FA12345_U" in m for m in sender.messages)      # link sent once
+    assert any("paused" in m.lower() for m in sender.messages)
+
+
 def test_reuses_a_cached_session_that_the_broker_still_accepts(monkeypatch):
     tm, sender = FakeTokenManager(token="acc-cached"), FakeSender()
     auth, auto_calls, exchange_calls = _auth(tm, sender, monkeypatch, validate=(True, "Valid"))

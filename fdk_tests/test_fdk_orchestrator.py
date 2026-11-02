@@ -68,6 +68,34 @@ def test_login_state_tells_waiting_from_failing_from_ok(offline):
     assert orch.login_state() == "on_hold"
 
 
+def test_login_state_reads_parked_after_a_failed_day(offline):
+    from services.fdk_supervisor_service import ochestrator as orch_mod
+
+    orch = _orchestrator()
+    orch.config.scheduling_enabled = True
+    orch.authenticator.last_error = "no authorization code within 120s"   # the day's browser failure
+    offline.setattr(orch_mod, "is_market_hours", lambda: False)
+    assert orch.login_state() == "waiting_for_market_hours"   # parked overnight, not "failed"
+    offline.setattr(orch_mod, "is_market_hours", lambda: True)
+    assert orch.login_state() == "failed"
+
+
+def test_manual_login_wait_follows_market_hours(offline):
+    from services.fdk_supervisor_service import ochestrator as orch_mod
+
+    orch = _orchestrator()
+    keep_waiting = orch.authenticator.keep_waiting
+
+    orch.config.scheduling_enabled = False
+    assert keep_waiting() is True
+
+    orch.config.scheduling_enabled = True
+    offline.setattr(orch_mod, "is_market_hours", lambda: False)
+    assert keep_waiting() is False                   # market closed: stop resending the link
+    offline.setattr(orch_mod, "is_market_hours", lambda: True)
+    assert keep_waiting() is True
+
+
 def test_run_retries_the_initial_supabase_loads_until_they_succeed(offline, caplog):
     from services.fdk_supervisor_service import ochestrator as orch_mod
     from services.fdk_auth_service import shoonya_authenticator as sa

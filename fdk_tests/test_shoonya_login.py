@@ -187,7 +187,9 @@ class _FakeElement:
 class _FakeDriver:
     """Mimics the slice of the Selenium WebDriver the login uses."""
 
-    def __init__(self, code="ABC123", code_after_polls=2, inputs=3, password_field_delay=0):
+    def __init__(self, code="ABC123", code_after_polls=2, inputs=3, password_field_delay=0,
+                 redirect="https://trade.shoonya.com/landing?code={code}&route_to=x",
+                 rerender_after_login=False, body_text="", current_url=""):
         self.urls = []
         self.inputs = [_FakeElement() for _ in range(inputs)]
         self.hidden = _FakeElement(displayed=False)
@@ -196,27 +198,45 @@ class _FakeDriver:
         self.code_after_polls = code_after_polls
         self.polls = 0
         self.password_field_delay = password_field_delay
+        self.redirect = redirect
+        self.rerender_after_login = rerender_after_login
+        self.generations = [self.inputs]
+        self.body = _FakeElement()
+        self.body.text = body_text
+        self.current_url = current_url
         self.quit_called = False
 
     def get(self, url):
         self.urls.append(url)
 
+    def _current_inputs(self):
+        if self.rerender_after_login and self.login_button.clicks >= 1 and len(self.generations) == 1:
+            # the SPA re-rendered after LOGIN: old elements go stale, new ones appear
+            for old in self.inputs:
+                old.stale = True
+            self.inputs = [_FakeElement() for _ in self.inputs]
+            self.generations.append(self.inputs)
+        return self.inputs
+
     def find_elements(self, by, selector):
+        inputs = self._current_inputs()
         if selector == "input[type='password']":
             if self.password_field_delay > 0:
                 self.password_field_delay -= 1
                 return []
-            return [self.inputs[1]] if len(self.inputs) > 1 else []
-        return [self.hidden] + self.inputs
+            return [inputs[1]] if len(inputs) > 1 else []
+        return [self.hidden] + inputs
 
     def find_element(self, by, selector):
+        if by == "tag name" and selector == "body":
+            return self.body
         assert "LOGIN" in selector
         return self.login_button
 
     def get_log(self, kind):
         self.polls += 1
         if self.code and self.polls >= self.code_after_polls:
-            url = f"https://trade.shoonya.com/landing?code={self.code}&route_to=x"
+            url = self.redirect.format(code=self.code)
             msg = {"message": {"method": "Network.requestWillBeSent",
                                "params": {"request": {"url": url}}}}
             return [{"message": json.dumps(msg)}]
@@ -224,6 +244,19 @@ class _FakeDriver:
 
     def quit(self):
         self.quit_called = True
+
+
+def _stale_guard(method):
+    def wrapper(self, *args, **kwargs):
+        if getattr(self, "stale", False):
+            raise RuntimeError("stale element reference: stale element not found")
+        return method(self, *args, **kwargs)
+    return wrapper
+
+
+_FakeElement.click = _stale_guard(_FakeElement.click)
+_FakeElement.clear = _stale_guard(_FakeElement.clear)
+_FakeElement.send_keys = _stale_guard(_FakeElement.send_keys)
 
 
 def _auto(driver, **kw):
@@ -247,20 +280,123 @@ def test_auto_login_drives_the_official_login_page_and_captures_the_code():
     assert driver.quit_called
 
 
-def test_auto_login_retries_once_with_a_fresh_totp_then_gives_up():
+def test_auto_login_resubmits_exactly_once_then_gives_up():
     driver = _FakeDriver(code=None)
     clock = {"t": 0.0}
-    codes = iter(["111111", "222222", "222222"])
+    generated = []
+
+    def _totp(secret):                       # a real TOTP is different every time we look
+        generated.append(f"{len(generated):06d}")
+        return generated[-1]
 
     def _sleep(s):
         clock["t"] += 30            # every poll moves the clock 30 s -> hits the 60 s window fast
 
-    result = _auto(driver, sleep=_sleep, clock=lambda: clock["t"], totp_now=lambda s: next(codes))
+    result = _auto(driver, sleep=_sleep, clock=lambda: clock["t"], totp_now=_totp)
 
     assert "error" in result and "code" not in result
-    assert driver.inputs[2].value == "222222"            # refilled with the new TOTP once
-    assert driver.login_button.clicks == 2
+    assert driver.login_button.clicks == 2               # first submit + one resubmit, never more
+    assert driver.inputs[2].value == generated[1]
     assert driver.quit_called
+
+
+def test_auto_login_stops_when_cancelled():
+    driver = _FakeDriver(code=None)
+    polls = {"n": 0}
+
+    def _cancelled():
+        polls["n"] += 1
+        return polls["n"] > 3
+
+    result = _auto(driver, cancelled=_cancelled)
+
+    assert result == {"error": "cancelled"}
+    assert driver.quit_called
+
+
+def test_auto_login_caps_the_page_load_time():
+    driver = _FakeDriver()
+    driver.page_load_timeout = None
+    driver.set_page_load_timeout = lambda seconds: setattr(driver, "page_load_timeout", seconds)
+
+    _auto(driver, page_wait=12)
+
+    assert driver.page_load_timeout == 12
+
+
+def test_auto_login_accepts_a_long_code_on_a_non_shoonya_redirect():
+    long_code = "A" * 32
+    driver = _FakeDriver(code=long_code, redirect="https://my-app.example.com/cb?code={code}")
+
+    assert _auto(driver) == {"code": long_code}
+
+
+def test_auto_login_accepts_the_registered_redirect_even_with_a_short_code():
+    driver = _FakeDriver(code="short1", redirect="https://my-app.example.com/cb?code={code}")
+
+    assert _auto(driver, redirect_hint="https://my-app.example.com/cb") == {"code": "short1"}
+
+
+def test_auto_login_ignores_short_code_params_on_foreign_urls():
+    driver = _FakeDriver(code="en", redirect="https://cdn.example.net/app.js?code={code}")
+    clock = {"t": 0.0}
+
+    def _sleep(s):
+        clock["t"] += 30
+
+    result = _auto(driver, sleep=_sleep, clock=lambda: clock["t"], totp_now=lambda s: "123456")
+
+    assert "error" in result
+
+
+def test_totp_resubmit_requeries_the_inputs_after_the_page_rerenders():
+    driver = _FakeDriver(code="LATE1", code_after_polls=10 ** 6, rerender_after_login=True)
+    clock = {"t": 0.0}
+    codes = iter(["111111", "222222"])
+
+    def _sleep(s):
+        clock["t"] += 30
+        if driver.login_button.clicks >= 2:        # second submit done: let the code appear
+            driver.code_after_polls = 0
+
+    result = _auto(driver, sleep=_sleep, clock=lambda: clock["t"], totp_now=lambda s: next(codes))
+
+    assert result == {"code": "LATE1"}
+    # fresh elements, not the stale ones — and ALL refilled: re-created inputs start blank
+    assert [e.value for e in driver.generations[1]] == [USER, "Pass@123", "222222"]
+    assert driver.login_button.clicks == 2
+
+
+def test_failure_reports_the_page_url_and_visible_text():
+    driver = _FakeDriver(code=None, body_text="  Invalid OTP.\n Please try again.  ",
+                         current_url="https://api.shoonya.com/OAuthlogin/investor-entry-level/login?x=1")
+    clock = {"t": 0.0}
+
+    def _sleep(s):
+        clock["t"] += 30
+
+    result = _auto(driver, sleep=_sleep, clock=lambda: clock["t"], totp_now=lambda s: "123456")
+
+    assert "Invalid OTP. Please try again." in result["error"]
+    assert "investor-entry-level/login" in result["error"]
+
+
+def test_failure_redacts_the_code_and_points_at_the_redirect_setting():
+    # the login itself worked, but the redirect went to an unknown host with a short code:
+    # the diagnostics must explain that without leaking the one-time code into logs/health
+    driver = _FakeDriver(code="short1", redirect="https://my-app.example.com/cb?code={code}",
+                         current_url="https://my-app.example.com/cb?code=short1",
+                         body_text="Logged in. code=short1")
+    clock = {"t": 0.0}
+
+    def _sleep(s):
+        clock["t"] += 30
+
+    result = _auto(driver, sleep=_sleep, clock=lambda: clock["t"], totp_now=lambda s: "123456")
+
+    assert "short1" not in result["error"]
+    assert "code=***" in result["error"]
+    assert "FDK_SHOONYA_REDIRECT_URI" in result["error"]
 
 
 def test_auto_login_reports_a_changed_page_layout():
@@ -280,3 +416,4 @@ def test_auto_login_reports_a_missing_browser():
                                      driver_factory=_no_browser, sleep=lambda s: None)
 
     assert "chromedriver not found" in result["error"]
+    assert result["fatal"] is True            # no point retrying: go straight to the Telegram link

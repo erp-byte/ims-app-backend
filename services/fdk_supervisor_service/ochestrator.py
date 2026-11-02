@@ -49,6 +49,7 @@ class Orchestrator:
         self.authenticator = ShoonyaAuthenticator(
             config, self.token_manager, self.login_sender,
         )
+        self.authenticator.keep_waiting = self._login_wait_allowed
 
         # Isolated services — each manages its own detector + controller
         self.fyers = FyersService(
@@ -103,6 +104,10 @@ class Orchestrator:
         await self._close_dispatcher_async()
         log.info("Detectors on hold")
 
+    def _login_wait_allowed(self) -> bool:
+        """Keep the Telegram login link alive only while a login would be used (market hours)."""
+        return (not self.config.scheduling_enabled) or is_market_hours()
+
     def login_state(self) -> str:
         """One word for operators: ok / failed / on_hold / waiting_for_market_hours / in_progress."""
         if self.on_hold:
@@ -112,10 +117,12 @@ class Orchestrator:
             return "ok"
         if getattr(auth, "awaiting_manual_login", False):
             return "awaiting_manual_login"       # link sent on Telegram, waiting for the pasted URL
+        if self.config.scheduling_enabled and not is_market_hours():
+            # Parked (also after a paused manual wait): nothing is being attempted, so a
+            # failure earlier in the day is history — it stays visible as last_auth_error.
+            return "waiting_for_market_hours"
         if getattr(auth, "last_error", None):
             return "failed"
-        if self.config.scheduling_enabled and not is_market_hours():
-            return "waiting_for_market_hours"
         return "in_progress"
 
     def request_restart(self):

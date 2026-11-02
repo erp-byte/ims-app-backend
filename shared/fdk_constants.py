@@ -33,11 +33,11 @@ PENNY_TRADE_THRESHOLD = 5_000_000     # Rs 50 lakh (0.50 Cr)
 MIN_VOLUME_SPIKE = 1000
 
 # Timing
-LOGIN_URL_RETRY_INTERVAL = 300        # cooldown after an exhausted login cycle (5 min)
+LOGIN_URL_RETRY_INTERVAL = 300        # the Telegram login link is resent this often (5 min)
 TOKEN_VALIDITY_SECONDS = 28800        # 8 hours
 
-# Headless login retry policy
-AUTO_LOGIN_MAX_ATTEMPTS = 5           # attempts before reporting failure and cooling down
+# Headless (browser) login retry policy
+AUTO_LOGIN_MAX_ATTEMPTS = 2           # browser attempts before the Telegram link (recipe resubmits once itself)
 AUTO_LOGIN_RETRY_DELAY = 60           # seconds between attempts
 
 # Integration into the Candor backend — every fdk route lives under this prefix

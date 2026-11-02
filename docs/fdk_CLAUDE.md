@@ -107,7 +107,8 @@ Candor backend — only the fdk-owned paths are shown (FDK_FILES.md is the autho
 | `FDK_SHOONYA_TOTP_SECRET` | TOTP secret (Profile → Security → TOTP Setup) |
 | `FDK_SHOONYA_CLIENT_ID` | "Client ID" on the API Key Generation screen, e.g. `FA12345_U` (default `<username>_U`; `FDK_SHOONYA_VENDORCODE` accepted as a fallback) |
 | `FDK_SHOONYA_SECRET_CODE` | "Secret Code" on the same screen — checksum input for GenAcsTok (`FDK_SHOONYA_API_KEY` accepted as a fallback) |
-| `FDK_SHOONYA_AUTO_LOGIN` | `true` (default): headless-browser login first, Telegram link as fallback; `false`: Telegram link only |
+| `FDK_SHOONYA_AUTO_LOGIN` | `true` (default): headless-browser login first (two attempts), Telegram link as fallback; `false`: Telegram link only |
+| `FDK_SHOONYA_REDIRECT_URI` | Optional. Redirect URL registered on the Shoonya account, if any; the browser login also accepts the code when the post-login redirect goes there |
 | `FDK_CHROME_BINARY` / `FDK_CHROMEDRIVER` | Optional paths for the headless browser (the image installs `/usr/bin/chromium` and `/usr/bin/chromedriver`) |
 | `FDK_LOGIN_BOT_TOKEN` | Login bot token |
 | `FDK_LOGIN_CHAT_ID` | Login chat ID — login success/failure, daily token reset, /hld /rst responses |
@@ -130,6 +131,7 @@ Candor backend — only the fdk-owned paths are shown (FDK_FILES.md is the autho
 | `FDK_SELF_PING` | Opt-in 7-min self-ping thread, needs FDK_BASE_URL (default false; the backend has its own keep-alive) |
 | `FDK_MCP_PATH_SECRET` | Optional; serves MCP at `/fdk/mcp-<secret>` instead of `/fdk/mcp` |
 | `FDK_NEWS_BOT_TOKEN` / `FDK_NEWS_CHAT_ID` | Optional news bot used by the MCP `send_news_to_telegram` tool |
+| `FDK_TELEGRAM_WEBHOOK_SECRET` | Recommended in webhook mode (1-256 chars of `A-Z a-z 0-9 _ -`, anything else fails start-up). Passed to `setWebhook` as `secret_token`; a delivery whose `X-Telegram-Bot-Api-Secret-Token` header does not match is answered 403. Without it, anyone who knows the public URL and a chat id can send commands |
 | `FDK_GOOGLE_PROJECT_ID`, `FDK_GOOGLE_PRIVATE_KEY_ID`, `FDK_GOOGLE_PRIVATE_KEY`, `FDK_GOOGLE_CLIENT_EMAIL`, `FDK_GOOGLE_CLIENT_ID`, `FDK_GOOGLE_CLIENT_X509_CERT_URL` | Alternative to `FDK_GOOGLE_CREDENTIALS_JSON`: the individual service-account fields |
 
 Every name carries the `FDK_` prefix; `fdk_env.example` is the authoritative list.
@@ -184,13 +186,20 @@ The orchestrator runs this ladder (`services/fdk_auth_service/shoonya_authentica
 2. **Headless-browser login** (`FDK_SHOONYA_AUTO_LOGIN=true`, Chrome in the image): opens
    `https://api.shoonya.com/OAuthlogin/investor-entry-level/login?api_key=<client id>&route_to=<user id>`,
    fills user id / password / TOTP, clicks LOGIN and reads the redirect's `code=` from the browser's
-   network log — the recipe on Shoonya's own "Python Authentication (Selenium)" page. Resubmits once
-   if the TOTP window rolled over; two attempts, then falls through.
+   network log — the recipe on Shoonya's own "Python Authentication (Selenium)" page. The redirect
+   counts when it goes to a Shoonya host, to `FDK_SHOONYA_REDIRECT_URI`, or carries a long code. If
+   no code arrives within 60 s the (re-rendered) form is re-read and resubmitted once with a fresh
+   TOTP; a failure reports the page URL and its visible text. Two attempts a minute apart, then
+   falls through; with no browser at all (`fatal`) it goes straight to the link. `/hld`, `/rst` and
+   shutdown abort the browser mid-login.
 3. **Telegram link**: the login bot sends `https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id=<client id>`.
    The operator logs in (user id, password, OTP/TOTP) and pastes the full URL of the page they land
    on — it carries `?code=...` — into the login chat (webhook or long polling). The link is resent
    every 5 minutes until then; `/hld` and `/rst` cancel the wait. `/fdk/health` shows
-   `login_state: awaiting_manual_login` meanwhile.
+   `login_state: awaiting_manual_login` meanwhile. Outside market hours (scheduling on) the wait
+   pauses with a "Shoonya login paused" message and the supervisor re-enters it at the next open;
+   `/rst` restarts it at once. While parked, `/fdk/health` shows `login_state: waiting_for_market_hours`
+   and `last_auth_error` keeps the day's browser error, if any (codes are masked as `code=***`).
 4. **Exchange**: `POST NorenWClientAPI/GenAcsTok` with `{"code", "checksum": sha256(client_id + secret_code + code), "uid"}`
    → `access_token` (valid for the trading day, no refresh). Stored in `shoonya_tokens`, sent as
    `Authorization: Bearer` afterwards. A rejected code is reported on Telegram and the wait continues.
@@ -204,9 +213,18 @@ any time; the 17:00 IST wipe clears `shoonya_tokens` so the next open is a fresh
 
 ## Telegram Commands
 
-Commands are received via webhook at `POST /fdk/webhook/telegram` (all 5 bots share this endpoint).
+Commands are received via webhook at `POST /fdk/webhook/telegram` (all 5 bots share this endpoint)
+or, with `FDK_BASE_URL` empty, by long-polling the login bot — the webhook route then answers 404.
+Only messages from the five configured chat ids are handled (`{"status": "ignored_chat"}` otherwise,
+including a body with no chat); in webhook mode a set `FDK_TELEGRAM_WEBHOOK_SECRET` must match the
+`X-Telegram-Bot-Api-Secret-Token` header (403 otherwise). A pasted login URL is redacted (`code=***`)
+in the logs. `/fdk/health` reports `telegram_mode`: `webhook`, `webhook_failed` (a `setWebhook` call
+failed at start-up — Telegram keeps delivering to the previous registration; restart to retry),
+`polling` or `none`.
 
-**Processing order:** commands → `/sdt` date input → ignore.
+**Processing order:** commands → pasted `code=` URL (`code_received`, answered later by the exchange
+result; `code_rejected` / `code_ignored`, each answered with a hint on the login bot) → `/sdt` date
+input → ignore.
 Any command cancels pending `/sdt` state (`_pending_summary_date` reset to `False`).
 
 ### `/hld [reason]` — Hold
@@ -320,7 +338,7 @@ At 16:30 IST (SummaryScheduler checks every 30s):
 - **Webhook on all bots**: All 5 bots have webhooks set to `/fdk/webhook/telegram` — commands work from any bot chat
 - **Supabase not local JSON**: Token persists across deploys, INSERT-based audit trail
 - **Parameterized detector**: Single `VolumeSpikeDetector` class serves both fyers/penny via `DetectorConfig`
-- **No user ID restriction**: any user in the Telegram group can send the commands
+- **Chat restriction, not user restriction**: messages are handled only when they come from one of the five configured chats; any member of those chats can send the commands
 - **Reactive token refresh**: No timer/polling — detectors run until Fyers rejects the token, then orchestrator re-authenticates and restarts
 - **Telegram commands**: `/hld` stops everything (holidays), `/rst` re-authenticates and restarts
 - **IST everywhere**: All timestamps use `datetime.now(IST)` — works correctly regardless of server timezone
@@ -345,6 +363,27 @@ At 16:30 IST (SummaryScheduler checks every 30s):
   keep-alive job. Hosts have run on UTC, so always use `datetime.now(IST)`, never a plain `datetime.now()`.
 
 ## Changelog
+
+### 2026-11-02 - Browser login hardened; Telegram inbound locked to the configured chats
+- First EC2 run: the headless login resubmitted the TOTP against stale form elements ("stale element
+  reference") and would have kept resubmitting forever. `auto_login_code()` now re-reads the visible
+  inputs before the single resubmit, is bounded (about 2 x 60 s plus a 30 s page-load timeout), polls
+  a `cancelled` hook (`/hld`, `/rst`, shutdown), reports the page URL and visible text on failure,
+  accepts the redirect when it goes to a Shoonya host, to `FDK_SHOONYA_REDIRECT_URI` or carries a
+  long code, and flags a missing browser as `fatal` so the authenticator skips to the Telegram link.
+- `AUTO_LOGIN_MAX_ATTEMPTS` 5 -> 2 (the recipe already resubmits once). The manual wait pauses
+  outside market hours (`keep_waiting`, set by the orchestrator) so the link is not resent all night.
+- Inbound Telegram: `handle_text(text, chat_id)` ignores chats other than the five configured ones,
+  the poller listens to the login chat only, the webhook enforces `FDK_TELEGRAM_WEBHOOK_SECRET` when
+  set, pasted codes are redacted in the logs, and a stray or unusable `code=` paste gets a hint back.
+- `FDK_SHOONYA_CLIENT_ID` may be left blank (default `<username>_U`) instead of raising.
+- Review follow-ups: the chat allowlist fails closed (a body with no chat is ignored; the poller
+  hands the login chat id to the dispatcher); the webhook route answers 404 in polling mode;
+  `FDK_TELEGRAM_WEBHOOK_SECRET` is validated against Telegram's charset at start-up; a failed
+  `setWebhook` no longer skips the remaining bots and shows as `telegram_mode: webhook_failed`;
+  the browser resubmit refills user id and password too (re-created inputs start blank);
+  page diagnostics mask `code=` and point at `FDK_SHOONYA_REDIRECT_URI`; `login_state` reads
+  `waiting_for_market_hours` while parked even after a failed day.
 
 ### 2026-11-02 - Shoonya OAuth login (the API in force since 1 April 2026)
 - The QuickAuth/vendor-code login and the `NorenWClientTP` base were retired by Shoonya under SEBI's

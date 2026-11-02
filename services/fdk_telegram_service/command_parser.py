@@ -1,5 +1,11 @@
 """Parse Telegram message commands."""
+import re
 from datetime import datetime
+
+
+def redact_code(text: str) -> str:
+    """Hide a Shoonya authorization code (a one-time credential) before logging a message."""
+    return re.sub(r"(code=)[^&\s#]+", r"\1***", text or "")
 
 
 def parse_date(text: str) -> datetime | None:

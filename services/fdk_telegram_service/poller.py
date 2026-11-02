@@ -12,16 +12,19 @@ from typing import Awaitable, Callable
 import requests
 
 from shared.fdk_logger import get_logger
+from .command_parser import redact_code
 
 log = get_logger("telegram_poller")
 
 
 class TelegramPoller:
     def __init__(self, bot_token: str, handler: Callable[[str], Awaitable], *,
+                 chat_id: str | int | None = None,
                  timeout: int = 25, idle_pause: float = 0.5, error_backoff: float = 5.0,
                  api_base: str = "https://api.telegram.org"):
         self.token = bot_token
         self.handler = handler
+        self.chat_id = str(chat_id) if chat_id else None   # only this chat is listened to
         self.timeout = timeout            # server-side long-poll wait (seconds)
         self.idle_pause = idle_pause
         self.error_backoff = error_backoff
@@ -44,13 +47,18 @@ class TelegramPoller:
                 continue
             for update in updates:
                 offset = update["update_id"] + 1
-                text = (update.get("message") or {}).get("text")
+                message = update.get("message") or {}
+                text = message.get("text")
                 if not text:
+                    continue
+                chat = str((message.get("chat") or {}).get("id"))
+                if self.chat_id and chat != self.chat_id:
+                    log.warning(f"Ignoring a message from chat {chat} (not the login chat)")
                     continue
                 try:
                     await self.handler(text)
                 except Exception as exc:
-                    log.error(f"Telegram command handler failed for {text!r}: {exc}")
+                    log.error(f"Telegram command handler failed for {redact_code(text)!r}: {exc}")
             if not updates:
                 await asyncio.sleep(self.idle_pause)
 

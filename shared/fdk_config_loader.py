@@ -1,6 +1,7 @@
 """Load and validate all configuration from environment variables."""
 import os
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,7 @@ class ShoonyaConfig:
     client_id: str         # API Key Generation screen "Client ID", e.g. FA12345_U
     secret_code: str       # API Key Generation screen "Secret Code" (checksum input)
     auto_login: bool = True  # drive the login page headlessly before falling back to the Telegram link
+    redirect_hint: str = ""  # redirect URL registered at Shoonya, if any: helps the browser spot the code
 
 
 @dataclass
@@ -41,6 +43,7 @@ class TelegramConfig:
     penny_trade: TelegramChannel
     penny_summary: TelegramChannel
     news: TelegramChannel | None = None  # optional — news bot (MCP send)
+    webhook_secret: str = ""             # optional — Telegram checks it back in every webhook delivery
 
 
 @dataclass
@@ -88,10 +91,9 @@ def _shoonya_config() -> ShoonyaConfig:
     username = _required("FDK_SHOONYA_USERNAME")
     # Shoonya renamed things with its 2026 OAuth API: the old "vendor code" is the
     # Client ID (retail: <username>_U) and the old "API key" is the Secret Code.
-    try:
-        client_id = _first_present("FDK_SHOONYA_CLIENT_ID", "FDK_SHOONYA_VENDORCODE")
-    except KeyError:
-        client_id = f"{username}_U"
+    # The client id is optional; unset OR blank means the retail default.
+    client_id = (os.getenv("FDK_SHOONYA_CLIENT_ID") or os.getenv("FDK_SHOONYA_VENDORCODE")
+                 or "").strip() or f"{username}_U"
     return ShoonyaConfig(
         username=username,
         password=_required("FDK_SHOONYA_PASSWORD"),
@@ -100,6 +102,7 @@ def _shoonya_config() -> ShoonyaConfig:
         secret_code=_first_present("FDK_SHOONYA_SECRET_CODE", "FDK_SHOONYA_API_KEY"),
         auto_login=os.getenv("FDK_SHOONYA_AUTO_LOGIN", "true").strip().lower()
         in ("1", "true", "yes", "on"),
+        redirect_hint=os.getenv("FDK_SHOONYA_REDIRECT_URI", "").strip(),
     )
 
 
@@ -108,6 +111,20 @@ def _channel(token_env: str, chat_id_env: str) -> TelegramChannel:
         bot_token=os.environ[token_env],
         chat_id=os.environ[chat_id_env],
     )
+
+
+# Telegram's setWebhook accepts secret_token only as 1-256 chars of A-Z a-z 0-9 _ -
+_WEBHOOK_SECRET_RE = re.compile(r"[A-Za-z0-9_-]{1,256}")
+
+
+def _webhook_secret() -> str:
+    """Optional; a value Telegram would reject is an error at start-up, not a silent
+    403 on every delivery (the old secret-less webhook would stay registered)."""
+    secret = os.getenv("FDK_TELEGRAM_WEBHOOK_SECRET", "").strip()
+    if secret and not _WEBHOOK_SECRET_RE.fullmatch(secret):
+        raise ValueError("FDK_TELEGRAM_WEBHOOK_SECRET must be 1-256 characters of "
+                         "A-Z a-z 0-9 _ - (Telegram rejects anything else)")
+    return secret
 
 
 def _optional_channel(token_env: str, chat_id_env: str) -> TelegramChannel | None:
@@ -132,6 +149,7 @@ def load_config() -> AppConfig:
             penny_trade=_channel("FDK_PENNY_TRADE_BOT_TOKEN", "FDK_PENNY_TRADE_CHAT_ID"),
             penny_summary=_channel("FDK_PENNY_SUMMARY_BOT_TOKEN", "FDK_PENNY_SUMMARY_CHAT_ID"),
             news=_optional_channel("FDK_NEWS_BOT_TOKEN", "FDK_NEWS_CHAT_ID"),
+            webhook_secret=_webhook_secret(),
         ),
         google=GoogleConfig(
             credentials=google_creds,

@@ -26,6 +26,14 @@ def shoonya_login_link_message(login_url: str) -> str:
     )
 
 
+def shoonya_login_paused_message() -> str:
+    return (
+        "<b>Shoonya login paused</b>\n\n"
+        "No login is needed outside market hours. The link will be sent again at the "
+        "next open (09:13 IST) — or send /rst to get it now."
+    )
+
+
 def auth_success_message(broker: str = "Shoonya", detail: str = "Session active.") -> str:
     return f"<b>{broker} Authentication Successful!</b>\n{detail}"
 

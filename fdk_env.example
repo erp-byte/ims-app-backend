@@ -14,13 +14,16 @@ FDK_PORT=8000                      # unused inside the backend (uvicorn owns the
 # Shoonya OAuth login (the API in force since 1 April 2026). The host running fdk must be
 # the static IP whitelisted under Profile -> API Key Generation on trade.shoonya.com.
 # With scheduling on, the first login runs at 09:13 IST; send /rst on Telegram to force one.
+# Ladder: cached session -> headless-browser login (2 attempts) -> Telegram link, resent every
+# 5 min while the market is open (outside market hours the wait pauses until the next open).
 # The tick feed is still the dormant Fyers socket, so the orchestrator logs in and idles.
 FDK_SHOONYA_USERNAME=              # user id, e.g. FA12345
 FDK_SHOONYA_PASSWORD=
 FDK_SHOONYA_TOTP_SECRET=           # Profile -> Security -> TOTP Setup (base32)
 FDK_SHOONYA_CLIENT_ID=             # "Client ID" on the API Key Generation screen, e.g. FA12345_U (default: <username>_U; FDK_SHOONYA_VENDORCODE still accepted)
 FDK_SHOONYA_SECRET_CODE=           # "Secret Code" on the same screen (eye icon); FDK_SHOONYA_API_KEY still accepted
-FDK_SHOONYA_AUTO_LOGIN=true        # drive the login page in headless Chrome first; false = Telegram link only
+FDK_SHOONYA_REDIRECT_URI=          # optional: redirect URL registered on the account, if any (the browser login then also accepts a code sent there)
+FDK_SHOONYA_AUTO_LOGIN=true        # drive the login page in headless Chrome first (2 attempts), then the Telegram link; false = link only
 FDK_CHROME_BINARY=                 # optional: chromium binary (default /usr/bin/chromium in the image)
 FDK_CHROMEDRIVER=                  # optional: chromedriver path (default /usr/bin/chromedriver in the image)
 
@@ -28,7 +31,8 @@ FDK_CHROMEDRIVER=                  # optional: chromedriver path (default /usr/b
 # was removed, so leave it empty)
 FDK_FYERS_CLIENT_ID=
 
-# Telegram — 5 bot+chat pairs (+ optional news bot for MCP)
+# Telegram — 5 bot+chat pairs (+ optional news bot for MCP). Inbound messages are handled only
+# when they come from one of these chat ids (long polling listens to the login chat alone).
 FDK_LOGIN_BOT_TOKEN=
 FDK_LOGIN_CHAT_ID=
 FDK_FYERS_TRADE_BOT_TOKEN=
@@ -41,6 +45,7 @@ FDK_PENNY_SUMMARY_BOT_TOKEN=
 FDK_PENNY_SUMMARY_CHAT_ID=
 FDK_NEWS_BOT_TOKEN=
 FDK_NEWS_CHAT_ID=
+FDK_TELEGRAM_WEBHOOK_SECRET=       # recommended in webhook mode (1-256 chars of A-Z a-z 0-9 _ -): sent to setWebhook; deliveries without the matching X-Telegram-Bot-Api-Secret-Token header get 403. Polling mode: the webhook route answers 404
 
 # Google Sheets — either the JSON blob, or the individual service-account fields
 FDK_FYERS_GOOGLE_SHEETS_ID=

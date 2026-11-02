@@ -167,7 +167,14 @@ def _chrome_driver():
     return webdriver.Chrome(options=options, service=service)
 
 
-def _scan_network_for_code(driver) -> Optional[str]:
+def _scan_network_for_code(driver, redirect_hint: str = "") -> Optional[str]:
+    """The authorization code from the post-login navigation in Chrome's network log.
+
+    Accepts the redirect when it goes to a Shoonya host (the official recipe), to
+    the redirect URL registered on the account (redirect_hint), or when the code
+    is long enough to be a real OAuth code (so a custom redirect host still works
+    while `?code=en`-style asset parameters are ignored).
+    """
     try:
         entries = driver.get_log("performance")
     except Exception:
@@ -180,10 +187,15 @@ def _scan_network_for_code(driver) -> Optional[str]:
         if message.get("method") != "Network.requestWillBeSent":
             continue
         url = message.get("params", {}).get("request", {}).get("url", "")
-        if "code=" in url and "shoonya" in url.lower():
-            code = parse_qs(urlparse(url).query).get("code", [None])[0]
-            if code:
-                return code
+        if "code=" not in url:
+            continue
+        code = parse_qs(urlparse(url).query).get("code", [None])[0]
+        if not code:
+            continue
+        if ("shoonya" in url.lower()
+                or (redirect_hint and url.startswith(redirect_hint))
+                or len(code) >= 20):
+            return code
     return None
 
 
@@ -193,64 +205,123 @@ def _fill(element, value: str) -> None:
     element.send_keys(value)
 
 
+def _visible_inputs(driver) -> list:
+    """Re-queried every time: the page is a SPA and re-renders after LOGIN."""
+    return [el for el in driver.find_elements("css selector", PAGE_INPUTS) if el.is_displayed()]
+
+
+_CODE_MASK_RE = re.compile(r"(code=)[^&\s#]+")
+
+
+def _page_diagnostics(driver) -> str:
+    """Where the browser ended up and what the page says — for the error message.
+
+    The message reaches the log and /fdk/health, so any code= in it (a one-time
+    credential, when the redirect was one the scanner did not accept) is masked;
+    the hint then names the setting that makes that redirect acceptable.
+    """
+    parts = []
+    hint = ""
+    try:
+        url = getattr(driver, "current_url", "") or ""
+        if url:
+            masked_url = _CODE_MASK_RE.sub(r"\1***", url)
+            parts.append(f"page: {masked_url}")
+            if masked_url != url:
+                hint = ("; the page did redirect with a code the scanner did not accept — "
+                        "set FDK_SHOONYA_REDIRECT_URI to that URL's prefix")
+    except Exception:
+        pass
+    try:
+        text = re.sub(r"\s+", " ", driver.find_element("tag name", "body").text or "").strip()
+        if text:
+            masked_text = _CODE_MASK_RE.sub(r"\1***", text[:200])
+            parts.append(f"text: {masked_text}")
+    except Exception:
+        pass
+    return f" ({'; '.join(parts)}{hint})" if parts else ""
+
+
 def auto_login_code(client_id: str, username: str, password: str, totp_secret: str, *,
                     driver_factory: Optional[Callable] = None, timeout: float = 60.0,
                     page_wait: float = 30.0, poll: float = 0.5,
                     totp_now: Optional[Callable[[str], str]] = None,
+                    cancelled: Optional[Callable[[], bool]] = None,
+                    redirect_hint: str = "",
                     clock: Callable[[], float] = time.monotonic,
                     sleep: Callable[[float], None] = time.sleep) -> dict:
     """Drive Shoonya's login page headlessly and capture the OAuth code.
 
     Mirrors the official "Python Authentication (Selenium)" script: fill the first
     three visible inputs (user id, password, TOTP), click LOGIN, watch the network
-    log for the redirect carrying code=, and resubmit once with a fresh TOTP if the
-    30 s window rolled over. Returns {"code": ...} or {"error": ...}; never raises.
+    log for the redirect carrying code=, and resubmit exactly once with a fresh
+    TOTP if nothing arrived within `timeout`. Bounded to about 2 x timeout plus the
+    page load; `cancelled()` (polled every tick) aborts early. Returns {"code": ...}
+    or {"error": ...} — with "fatal": True when there is no browser to drive, so the
+    caller should not retry. Never raises.
     """
     totp_now = totp_now or _totp_now
+    cancelled = cancelled or (lambda: False)
     try:
         driver = (driver_factory or _chrome_driver)()
     except Exception as exc:
         log.error(f"Shoonya browser login unavailable: {exc}")
-        return {"error": f"browser unavailable: {exc}"}
+        return {"error": f"browser unavailable: {exc}", "fatal": True}
     try:
+        set_timeout = getattr(driver, "set_page_load_timeout", None)
+        if set_timeout:
+            try:
+                set_timeout(page_wait)      # Selenium's default is 300 s
+            except Exception:
+                pass
         driver.get(f"{LOGIN_PAGE_URL}?api_key={client_id}&route_to={username}")
 
         start = clock()
         while not driver.find_elements("css selector", PASSWORD_INPUT):
+            if cancelled():
+                return {"error": "cancelled"}
             if clock() - start > page_wait:
-                return {"error": "login page did not render a password field"}
+                return {"error": "login page did not render a password field"
+                                 + _page_diagnostics(driver)}
             sleep(poll)
 
-        inputs = [el for el in driver.find_elements("css selector", PAGE_INPUTS)
-                  if el.is_displayed()]
+        inputs = _visible_inputs(driver)
         if len(inputs) < 3:
             return {"error": f"login page layout changed ({len(inputs)} visible inputs, "
-                             "expected user id / password / OTP)"}
+                             "expected user id / password / OTP)" + _page_diagnostics(driver)}
         _fill(inputs[0], username)
         _fill(inputs[1], password)
-        otp = totp_now(totp_secret)
-        _fill(inputs[2], otp)
+        _fill(inputs[2], totp_now(totp_secret))
         driver.find_element("xpath", LOGIN_BUTTON).click()
 
+        resubmitted = False
         start = clock()
         while True:
-            code = _scan_network_for_code(driver)
+            if cancelled():
+                return {"error": "cancelled"}
+            code = _scan_network_for_code(driver, redirect_hint)
             if code:
                 return {"code": code}
             if clock() - start > timeout:
-                fresh = totp_now(totp_secret)
-                if fresh == otp:
-                    return {"error": f"no authorization code within {int(timeout)}s "
-                                     "(check user id / password / TOTP secret)"}
-                log.info("Shoonya browser login: TOTP window rolled over, resubmitting once")
-                _fill(inputs[2], fresh)
+                if resubmitted:
+                    return {"error": f"no authorization code within {int(2 * timeout)}s "
+                                     "(check user id / password / TOTP secret)"
+                                     + _page_diagnostics(driver)}
+                inputs = _visible_inputs(driver)        # the page re-rendered: fresh elements
+                if len(inputs) < 3:
+                    return {"error": "login page moved on without an authorization code"
+                                     + _page_diagnostics(driver)}
+                log.info("Shoonya browser login: no code yet, resubmitting once with a fresh TOTP")
+                _fill(inputs[0], username)        # re-created inputs may be blank: refill all
+                _fill(inputs[1], password)
+                _fill(inputs[2], totp_now(totp_secret))
                 driver.find_element("xpath", LOGIN_BUTTON).click()
-                otp = fresh
+                resubmitted = True
                 start = clock()
             sleep(poll)
     except Exception as exc:
         log.error(f"Shoonya browser login failed: {exc}")
-        return {"error": f"browser login failed: {exc}"}
+        return {"error": f"browser login failed: {exc}" + _page_diagnostics(driver)}
     finally:
         try:
             driver.quit()

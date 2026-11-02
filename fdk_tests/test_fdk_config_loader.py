@@ -23,7 +23,7 @@ LEGACY = ("FDK_SHOONYA_VENDORCODE", "FDK_SHOONYA_API_KEY", "FDK_SHOONYA_IMEI",
 REMOVED_FYERS_LOGIN = ("FDK_BROKER", "FDK_FYERS_SECRET_KEY", "FDK_FYERS_REDIRECT_URI",
                        "FDK_FYERS_TOTP_SECRET", "FDK_FYERS_PIN", "FDK_FYERS_USERNAME")
 ALL_KEYS = (list(COMMON) + list(SHOONYA) + list(LEGACY) + list(REMOVED_FYERS_LOGIN)
-            + ["FDK_FYERS_CLIENT_ID", "FDK_SHOONYA_AUTO_LOGIN"])
+            + ["FDK_FYERS_CLIENT_ID", "FDK_SHOONYA_AUTO_LOGIN", "FDK_TELEGRAM_WEBHOOK_SECRET"])
 
 
 @pytest.fixture
@@ -61,8 +61,30 @@ def test_legacy_names_are_accepted_as_fallbacks(env):
 
 def test_client_id_defaults_to_username_with_the_retail_suffix(env):
     env.delenv("FDK_SHOONYA_CLIENT_ID")
-
     assert cfg.load_config().shoonya.client_id == "FA12345_U"
+
+    env.setenv("FDK_SHOONYA_CLIENT_ID", "   ")          # a blank line in .env means "default" too
+    assert cfg.load_config().shoonya.client_id == "FA12345_U"
+
+
+def test_webhook_secret_is_optional(env):
+    env.delenv("FDK_TELEGRAM_WEBHOOK_SECRET", raising=False)
+    assert cfg.load_config().telegram.webhook_secret == ""
+    env.setenv("FDK_TELEGRAM_WEBHOOK_SECRET", " s3cret ")
+    assert cfg.load_config().telegram.webhook_secret == "s3cret"
+
+
+def test_webhook_secret_must_use_telegrams_charset(env):
+    # Telegram's setWebhook rejects anything but 1-256 chars of A-Z a-z 0-9 _ -; a bad value
+    # would leave the old secret-less webhook in force and every delivery answered 403
+    env.setenv("FDK_TELEGRAM_WEBHOOK_SECRET", "fdk!2026.secret")
+    with pytest.raises(ValueError, match="FDK_TELEGRAM_WEBHOOK_SECRET"):
+        cfg.load_config()
+    env.setenv("FDK_TELEGRAM_WEBHOOK_SECRET", "x" * 257)
+    with pytest.raises(ValueError, match="FDK_TELEGRAM_WEBHOOK_SECRET"):
+        cfg.load_config()
+    env.setenv("FDK_TELEGRAM_WEBHOOK_SECRET", "fdk_2026-Secret")
+    assert cfg.load_config().telegram.webhook_secret == "fdk_2026-Secret"
 
 
 def test_secret_code_is_required(env):
@@ -79,6 +101,12 @@ def test_blank_shoonya_credentials_are_rejected(env, key):
 
     with pytest.raises(ValueError, match=key):
         cfg.load_config()
+
+
+def test_registered_redirect_is_kept_as_a_hint_for_the_browser_login(env):
+    assert cfg.load_config().shoonya.redirect_hint == ""
+    env.setenv("FDK_SHOONYA_REDIRECT_URI", "https://my-app.example.com/cb")
+    assert cfg.load_config().shoonya.redirect_hint == "https://my-app.example.com/cb"
 
 
 def test_auto_login_can_be_switched_off(env):

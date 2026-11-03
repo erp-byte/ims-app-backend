@@ -155,6 +155,8 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - FakeDispatcher.close
 - FakeDispatcher.needs_rebuild
 - FakeDispatcher.is_up
+- FakeDispatcher.ticks_seen
+- FakeDispatcher.ready
 - FakeDispatcher.monitored
 - FakeDispatcher.take_coverage_report
 - FakeDispatcher.status
@@ -177,6 +179,11 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_a_long_outage_alerts_once_not_on_every_rebuild
 - test_a_long_outage_alerts_once_not_on_every_rebuild.go_down
 - test_a_long_outage_alerts_once_not_on_every_rebuild.come_back
+- test_monitoring_started_waits_for_the_first_tick_during_trading
+- test_before_the_first_trades_monitoring_started_does_not_wait_for_ticks
+- test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks
+- test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks.go_down
+- test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks.back_but_silent
 - _report
 - test_symbols_the_gateway_did_not_acknowledge_are_named_with_their_detector
 - test_the_same_gap_is_reported_once_and_a_new_one_again
@@ -257,6 +264,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_should_reset_after_reset_time_is_true
 - test_should_not_reset_twice_same_day
 - test_should_not_reset_in_the_morning
+- test_ticks_are_due_between_the_first_trades_and_the_close
 - test_no_rebuild_when_socket_is_healthy
 - test_rebuild_immediately_on_first_unhealthy_check
 - test_no_rebuild_inside_cooldown
@@ -444,6 +452,8 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_a_reconnected_socket_that_stays_quiet_counts_as_stalled
 - test_ticks_going_quiet_during_the_session_needs_a_rebuild
 - test_quiet_after_the_close_is_not_a_stall
+- test_a_rebuilt_feed_that_stays_quiet_counts_as_stalled
+- test_ticks_seen_turns_true_with_the_first_diff
 - test_no_ticks_ever_is_not_a_stall
 - test_ticks_expected_only_until_the_close_ist
 - test_garbage_and_foreign_frames_do_not_reach_the_tick_callback
@@ -478,6 +488,8 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_missing_symbols_are_named_and_split_by_detector
 - test_monitored_counts_only_symbols_with_a_token
 - test_nothing_to_subscribe_opens_no_socket
+- test_a_dispatcher_expecting_ticks_is_ready_only_once_one_arrives
+- test_a_dispatcher_not_expecting_ticks_is_ready_when_subscribed
 - test_status_reports_the_feed
 - test_a_failing_socket_close_still_stops_the_worker
 - test_a_failing_socket_close_still_stops_the_worker.boom
@@ -586,6 +598,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - WebSocketManager.__init__
 - WebSocketManager.is_alive
 - WebSocketManager.is_up
+- WebSocketManager.ticks_seen
 - WebSocketManager.needs_rebuild
 - WebSocketManager._stalled
 - WebSocketManager.coverage
@@ -613,6 +626,8 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - TickDispatcher.rejection_reason
 - TickDispatcher.is_alive
 - TickDispatcher.is_up
+- TickDispatcher.ticks_seen
+- TickDispatcher.ready
 - TickDispatcher.needs_rebuild
 - TickDispatcher.coverage
 - TickDispatcher.status
@@ -785,10 +800,12 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - Orchestrator.request_restart
 - Orchestrator._any_token_expired
 - Orchestrator.feed_status
+- Orchestrator._forget_feed
 - Orchestrator._close_dispatcher
 - Orchestrator._close_dispatcher_async
 - Orchestrator._connect_dispatcher
 - Orchestrator._report_feed_state
+- Orchestrator._remind_if_silent
 - Orchestrator._on_feed_rejected
 - Orchestrator._daily_token_reset
 - Orchestrator._re_authenticate
@@ -805,6 +822,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 
 ### services/fdk_supervisor_service/schedular.py
 - is_market_hours
+- feed_should_be_live
 - should_reset_tokens
 - should_rebuild_socket
 
@@ -848,6 +866,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - summary_date_prompt_message
 - summary_date_invalid_message
 - summary_date_confirm_message
+- feed_still_silent_message
 - websocket_rebuild_message
 
 ### services/fdk_telegram_service/models.py

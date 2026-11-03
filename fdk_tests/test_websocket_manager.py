@@ -130,10 +130,12 @@ def gateway(monkeypatch):
 def build():
     made = []
 
-    def _make(scrips=None, on_tick=None, on_auth_error=None, on_coverage=None):
+    def _make(scrips=None, on_tick=None, on_auth_error=None, on_coverage=None,
+              expect_ticks=False):
         manager = wm.WebSocketManager("FA12345", "FA12345", "TOKEN", on_tick or (lambda f: None),
                                       list(SCRIPS if scrips is None else scrips),
-                                      on_auth_error=on_auth_error, on_coverage=on_coverage)
+                                      on_auth_error=on_auth_error, on_coverage=on_coverage,
+                                      expect_ticks=expect_ticks)
         made.append(manager)
         return manager
 
@@ -439,6 +441,30 @@ def test_quiet_after_the_close_is_not_a_stall(build, monkeypatch):
     assert manager.needs_rebuild() is False
 
 
+def test_a_rebuilt_feed_that_stays_quiet_counts_as_stalled(build, monkeypatch):
+    """After a rebuild during trading, the stall clock starts when the socket opens,
+    not with the first tick: a replacement socket that never ticks is the outage going on.
+    """
+    monkeypatch.setattr(wm, "_ticks_expected", lambda: True)
+    manager = build(expect_ticks=True)
+    manager.connect()
+    assert manager.is_up() is True
+    assert manager.ticks_seen() is False
+    assert manager.needs_rebuild() is False            # just opened: give it the stall window
+    manager._last_tick_at -= wm.FEED_STALL_SECONDS + 1
+    assert manager.needs_rebuild() is True             # ...and no tick came: stalled
+
+
+def test_ticks_seen_turns_true_with_the_first_diff(build, monkeypatch):
+    monkeypatch.setattr(wm, "_ticks_expected", lambda: True)
+    manager = build(expect_ticks=True)
+    manager.connect()
+    FakeApp.instances[0].push(t="tf", e="NSE", tk="1", v="2000")
+    assert wait_for(manager.ticks_seen)
+    manager._last_tick_at -= wm.FEED_STALL_SECONDS + 1
+    assert manager.needs_rebuild() is True             # the ordinary stall rule still applies
+
+
 def test_no_ticks_ever_is_not_a_stall(build, monkeypatch):
     """Subscribed outside trading: the snapshots arrive, no diff ever does."""
     monkeypatch.setattr(wm, "_ticks_expected", lambda: True)
@@ -501,8 +527,9 @@ TOKENS = {"TCS-EQ": "11536", "INFY-EQ": "1594", "NTPC-EQ": "11630"}
 def dispatch():
     made = []
 
-    def _make(detectors, tokens=None):
-        dispatcher = wm.TickDispatcher("FA12345", "FA12345", "TOKEN", detectors, tokens or TOKENS)
+    def _make(detectors, tokens=None, expect_ticks=False):
+        dispatcher = wm.TickDispatcher("FA12345", "FA12345", "TOKEN", detectors, tokens or TOKENS,
+                                       expect_ticks=expect_ticks)
         made.append(dispatcher)
         return dispatcher
 
@@ -741,6 +768,23 @@ def test_nothing_to_subscribe_opens_no_socket(dispatch):
     assert FakeApp.instances == []
     assert dispatcher.is_up() is False
     assert dispatcher.no_token == ["GONE-EQ"]
+
+
+def test_a_dispatcher_expecting_ticks_is_ready_only_once_one_arrives(dispatch):
+    dispatcher = dispatch([FakeDetector("TCS-EQ")], expect_ticks=True)
+    dispatcher.connect()
+    assert dispatcher.is_up() is True
+    assert dispatcher.expect_ticks is True
+    assert dispatcher.ready() is False                 # subscribed, but nothing is trading yet
+    FakeApp.instances[0].push(t="tf", e="NSE", tk="11536", v="2000")
+    assert wait_for(dispatcher.ready)
+    assert dispatcher.status()["ticks"] >= 1
+
+
+def test_a_dispatcher_not_expecting_ticks_is_ready_when_subscribed(dispatch):
+    dispatcher = dispatch([FakeDetector("TCS-EQ")])
+    dispatcher.connect()
+    assert dispatcher.ready() is True
 
 
 def test_status_reports_the_feed(dispatch):

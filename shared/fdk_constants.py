@@ -20,6 +20,8 @@ MARKET_START_TIME = "09:13"
 MARKET_END_TIME = "16:00"
 # Trading closes before the supervisor stands down; ticks stop here.
 MARKET_CLOSE_TIME = "15:30"
+# Continuous trading starts at 09:15; from here a subscribed feed with no ticks is a problem.
+TICKS_START_TIME = "09:16"
 
 # Daily token wipe — clear stored credentials each evening so the next
 # 09:13 login is always a fresh full TOTP login (17:00 IST, after market close).
@@ -34,6 +36,8 @@ SUBSCRIBE_BATCH_DELAY = 0.1           # seconds between subscribe frames
 # Minimum gap between WebSocket rebuilds, so a hard-down socket cannot
 # spam reconnects and Telegram alerts every supervisor tick.
 WS_REBUILD_COOLDOWN = 60
+# While ticks are due and none arrive (rebuilds included), remind the operator this often.
+FEED_SILENT_ALERT_INTERVAL = 900      # 15 min
 
 # Detection thresholds
 FYERS_TRADE_THRESHOLD = 30_000_000    # Rs 3 crore

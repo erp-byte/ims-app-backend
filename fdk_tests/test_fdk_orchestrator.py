@@ -148,16 +148,19 @@ class FakeDispatcher:
     made: list["FakeDispatcher"] = []
     rebuild_needed = False
     up = True
+    ticks = True            # diffs are arriving on the current socket
     rejection = None
     reports: list[dict] = []
 
     @classmethod
     def reset(cls):
         cls.made, cls.rebuild_needed, cls.up, cls.rejection, cls.reports = [], False, True, None, []
+        cls.ticks = True
 
-    def __init__(self, uid, actid, access_token, detectors, instrument_tokens):
+    def __init__(self, uid, actid, access_token, detectors, instrument_tokens, expect_ticks=False):
         self.uid, self.actid, self.access_token = uid, actid, access_token
         self.detectors, self.instrument_tokens = detectors, instrument_tokens
+        self.expect_ticks = expect_ticks
         self.connected = self.closed = False
         self.rejection_reason = None
         self.no_token = []
@@ -178,6 +181,12 @@ class FakeDispatcher:
 
     def is_up(self):
         return FakeDispatcher.up
+
+    def ticks_seen(self):
+        return FakeDispatcher.ticks
+
+    def ready(self):
+        return FakeDispatcher.up and (not self.expect_ticks or FakeDispatcher.ticks)
 
     def monitored(self, detector):
         return len(detector.config.symbols)
@@ -203,6 +212,8 @@ def feed(offline):
     FakeDispatcher.reset()
     offline.setattr(orch_mod, "TickDispatcher", FakeDispatcher)
     offline.setattr(orch_mod, "SUPERVISOR_POLL", 0.005)
+    # Mid-session by default: every socket opened here is expected to tick.
+    offline.setattr(orch_mod, "feed_should_be_live", lambda *a: True)
     offline.setattr(sa.shoonya_login, "validate_session", lambda user, tok: (False, "No token"))
     offline.setattr(sa.shoonya_login, "auto_login_available", lambda: True)
     offline.setattr(sa.shoonya_login, "auto_login_code", lambda *a, **k: {"code": "C1"})
@@ -328,6 +339,53 @@ def test_a_long_outage_alerts_once_not_on_every_rebuild(feed, monkeypatch):
     assert len(_sent(feed, "WebSocket Rebuild")) == 1
     assert _sent(feed, "feed is not up") == []
     assert all(d.closed for d in FakeDispatcher.made[:-1])
+
+
+def test_monitoring_started_waits_for_the_first_tick_during_trading(feed):
+    FakeDispatcher.ticks = False
+    _drive(feed,
+           (_connected, None),
+           (_after(0.05), _set("ticks", True)),       # subscribed and quiet, then trading
+           (lambda: _sent(feed, "Monitoring Started"), None))
+    assert FakeDispatcher.made[0].expect_ticks is True
+    assert len(_sent(feed, "Monitoring Started")) == 1
+    assert _sent(feed, "feed is not up") == []        # it was up, just not ticking yet
+
+
+def test_before_the_first_trades_monitoring_started_does_not_wait_for_ticks(feed, monkeypatch):
+    from services.fdk_supervisor_service import ochestrator as orch_mod
+    monkeypatch.setattr(orch_mod, "feed_should_be_live", lambda *a: False)   # 09:13 connect
+    FakeDispatcher.ticks = False
+    _drive(feed, (lambda: _sent(feed, "Monitoring Started"), None))
+    assert FakeDispatcher.made[0].expect_ticks is False
+
+
+def test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks(feed, monkeypatch):
+    from services.fdk_supervisor_service import ochestrator as orch_mod
+    monkeypatch.setattr(orch_mod, "should_rebuild_socket", lambda needs, last, now: needs)
+    monkeypatch.setattr(orch_mod, "FEED_SILENT_ALERT_INTERVAL", 0.05)
+
+    def go_down():
+        FakeDispatcher.up = False
+        FakeDispatcher.rebuild_needed = True
+
+    def back_but_silent():
+        FakeDispatcher.up = True
+        FakeDispatcher.rebuild_needed = False
+        FakeDispatcher.ticks = False
+
+    _drive(feed,
+           (lambda: _sent(feed, "Monitoring Started"), go_down),
+           (lambda: len(FakeDispatcher.made) >= 3, back_but_silent),
+           (lambda: len(_sent(feed, "still silent")) >= 2, _set("ticks", True)),
+           (lambda: len(_sent(feed, "Monitoring Started")) == 2, None),
+           (_after(0.15), None))
+    assert len(_sent(feed, "WebSocket Rebuild")) == 1
+    silent = _sent(feed, "still silent")
+    assert len(silent) >= 2 and "minute" in silent[0]
+    # recovery ends the reminders
+    assert len(_sent(feed, "still silent")) == len(silent)
+    assert FakeDispatcher.made[-1].expect_ticks is True
 
 
 def _report(missing, acknowledged=2, requested=3):

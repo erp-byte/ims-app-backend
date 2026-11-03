@@ -76,7 +76,8 @@ class WebSocketManager:
     """Owns the socket: handshake, subscriptions, reconnects and health."""
 
     def __init__(self, uid: str, actid: str, access_token: str,
-                 on_tick, scrips: list[str], on_auth_error=None, on_coverage=None):
+                 on_tick, scrips: list[str], on_auth_error=None, on_coverage=None,
+                 expect_ticks: bool = False):
         self.uid = uid
         self.actid = actid
         self.access_token = access_token
@@ -84,9 +85,11 @@ class WebSocketManager:
         self.scrips = scrips
         self.on_auth_error = on_auth_error
         self.on_coverage = on_coverage        # (acknowledged, requested, missing tokens)
+        self.expect_ticks = expect_ticks      # opened mid-session: ticks are due at once
         self.rejection_reason: str | None = None
         self.ws = None
         self.subscribe_count = 0
+        self.tick_count = 0                   # tf frames received in this feed's life
         self._tokens = {scrip.split("|", 1)[1] for scrip in scrips}
         self._acked: set[str] = set()
         self._thread: threading.Thread | None = None
@@ -95,7 +98,10 @@ class WebSocketManager:
         self._all_acked = threading.Event()
         self._opened_at: float | None = None  # None while no socket is open
         self._last_tick_at: float | None = None
-        self._saw_tick = False                # a tf arrived at some point in this feed's life
+        # The stall clock starts with the first tf — or, when ticks are expected from the
+        # start (a rebuild during trading), when the socket opens: a replacement socket
+        # that never ticks is the outage going on, not a quiet pre-open.
+        self._saw_tick = expect_ticks
         self._seen_frames: set = set()
 
     # -- health -------------------------------------------------------------
@@ -106,6 +112,10 @@ class WebSocketManager:
     def is_up(self) -> bool:
         """An open socket the gateway has acknowledged scrips on: the feed is really running."""
         return self.is_alive() and bool(self._acked)
+
+    def ticks_seen(self) -> bool:
+        """A diff (tf) has arrived on this feed: data is actually flowing."""
+        return self.tick_count > 0
 
     def needs_rebuild(self) -> bool:
         """True when only the supervisor can fix this socket.
@@ -232,6 +242,7 @@ class WebSocketManager:
     def _on_tick_frame(self, kind: str, frame: dict):
         if kind == "tf":
             self._saw_tick = True
+            self.tick_count += 1
             self._last_tick_at = time.monotonic()
         else:
             token = str(frame.get("tk"))
@@ -313,8 +324,9 @@ class TickDispatcher:
     """
 
     def __init__(self, uid: str, actid: str, access_token: str, detectors: list,
-                 instrument_tokens: dict[str, str]):
+                 instrument_tokens: dict[str, str], expect_ticks: bool = False):
         self._detectors = list(detectors)
+        self.expect_ticks = expect_ticks
         self._symbol_map: dict[str, list] = {}
         self._token_symbol: dict[str, str] = {}
         self._state: dict[str, dict] = {}
@@ -342,7 +354,7 @@ class TickDispatcher:
         scrips = [f"{FEED_EXCHANGE}|{token}" for token in self._token_symbol]
         self._ws = WebSocketManager(uid, actid, access_token, self._on_frame, scrips,
                                     on_auth_error=self._on_auth_error,
-                                    on_coverage=self._on_coverage)
+                                    on_coverage=self._on_coverage, expect_ticks=expect_ticks)
         log.info(f"TickDispatcher: {len(scrips)} scrips, {len(self._detectors)} detectors")
 
     def _on_frame(self, frame: dict):
@@ -420,6 +432,13 @@ class TickDispatcher:
     def is_up(self) -> bool:
         return self._ws.is_up()
 
+    def ticks_seen(self) -> bool:
+        return self._ws.ticks_seen()
+
+    def ready(self) -> bool:
+        """Up — and, when ticks are due, actually ticking: safe to announce as monitoring."""
+        return self.is_up() and (not self.expect_ticks or self.ticks_seen())
+
     def needs_rebuild(self) -> bool:
         return self._ws.needs_rebuild()
 
@@ -430,6 +449,7 @@ class TickDispatcher:
         acknowledged, requested = self._ws.coverage()
         return {"connected": self._ws.is_up(), "acknowledged": acknowledged,
                 "requested": requested, "no_token": len(self.no_token),
+                "ticks": self._ws.tick_count,
                 "seconds_since_tick": self._ws.seconds_since_tick(), "dropped": self._dropped}
 
     def connect(self):

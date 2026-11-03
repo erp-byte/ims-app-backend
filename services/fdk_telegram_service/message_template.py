@@ -117,6 +117,15 @@ def summary_date_confirm_message(date_str: str, day_name: str) -> str:
     return f"<b>Generating summaries for {date_str} ({day_name})...</b>\n\nPlease wait."
 
 
+def feed_still_silent_message(minutes: int) -> str:
+    return (
+        f"<b>Feed still silent</b>\n\n"
+        f"No ticks from Shoonya for {minutes} minutes during trading, rebuilds included. "
+        f"Nothing is being detected. This reminder repeats until data flows again; "
+        f"send /hld to silence it."
+    )
+
+
 def websocket_rebuild_message() -> str:
     return (
         "<b>WebSocket Rebuild</b>\n\n"

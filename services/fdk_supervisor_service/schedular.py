@@ -1,8 +1,8 @@
 """Market-hours scheduling."""
 from datetime import datetime
 from shared.fdk_constants import (
-    MARKET_START_TIME, MARKET_END_TIME, DAILY_TOKEN_RESET_TIME,
-    WS_REBUILD_COOLDOWN, IST,
+    MARKET_START_TIME, MARKET_END_TIME, MARKET_CLOSE_TIME, TICKS_START_TIME,
+    DAILY_TOKEN_RESET_TIME, WS_REBUILD_COOLDOWN, IST,
 )
 from shared.fdk_logger import get_logger
 
@@ -14,6 +14,17 @@ def is_market_hours() -> bool:
     now = datetime.now(IST)
     current = now.strftime("%H:%M")
     return MARKET_START_TIME <= current < MARKET_END_TIME
+
+
+def feed_should_be_live(current_hhmm: str | None = None) -> bool:
+    """True while a subscribed feed must be delivering ticks (continuous trading).
+
+    A socket opened in this window that never ticks is an outage, not a quiet
+    pre-open; the 09:13 connect is before it, so the day's first socket gets to
+    wait for the first trade.
+    """
+    current = current_hhmm or datetime.now(IST).strftime("%H:%M")
+    return TICKS_START_TIME <= current < MARKET_CLOSE_TIME
 
 
 def should_reset_tokens(current_hhmm: str, last_reset_date: str | None,

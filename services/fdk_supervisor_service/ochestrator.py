@@ -4,13 +4,13 @@ import time
 from datetime import datetime
 from shared.fdk_logger import get_logger
 from shared.fdk_config_loader import AppConfig
-from shared.fdk_constants import IST
+from shared.fdk_constants import FEED_SILENT_ALERT_INTERVAL, IST
 from services.fdk_auth_service.shoonya_authenticator import ShoonyaAuthenticator
 from services.fdk_auth_service.token_manager import TokenManager
 from services.fdk_telegram_service import TelegramSender
 from services.fdk_telegram_service.message_template import (
     feed_coverage_warning_message, feed_not_up_message, feed_rejected_message,
-    monitoring_started_message, websocket_rebuild_message,
+    feed_still_silent_message, monitoring_started_message, websocket_rebuild_message,
 )
 from services.fdk_summary_service import SummaryScheduler
 from services.fdk_sector_service import SymbolManager, init_sector_mapping
@@ -18,7 +18,7 @@ from services.fdk_detector_service.websocket_manager import TickDispatcher
 from services.fdk_fyers_service import FyersService, FyersSummaryService
 from services.fdk_penny_service import PennyService, PennySummaryService
 from .schedular import (
-    is_market_hours, should_reset_tokens, should_rebuild_socket,
+    feed_should_be_live, is_market_hours, should_reset_tokens, should_rebuild_socket,
 )
 
 log = get_logger("orchestrator")
@@ -77,6 +77,8 @@ class Orchestrator:
         self._feed_down_noticed = False     # the operator knows it is down
         self._feed_rejections = 0
         self._feed_parked = False           # rejected repeatedly, waiting for /rst or tomorrow
+        self._feed_silent_since: float | None = None   # outage start, while ticks are due
+        self._silence_alerts = 0            # "still silent" reminders sent for this outage
         self._last_coverage_gap: list[str] | None = None
         self._services_built = False
         self._last_reset_date: str | None = None
@@ -156,15 +158,21 @@ class Orchestrator:
             return {"connected": False, "acknowledged": 0, "requested": 0}
         return self._dispatcher.status()
 
-    def _close_dispatcher(self):
+    def _forget_feed(self):
+        """The operator-facing state of the feed that is going away."""
         self._feed_announced = self._feed_down_noticed = False
+        self._feed_silent_since = None
+        self._silence_alerts = 0
+
+    def _close_dispatcher(self):
+        self._forget_feed()
         if self._dispatcher:
             self._dispatcher.close()
             self._dispatcher = None
 
     async def _close_dispatcher_async(self):
         """_close_dispatcher() with the (slow) socket close off the shared event loop."""
-        self._feed_announced = self._feed_down_noticed = False
+        self._forget_feed()
         dispatcher, self._dispatcher = self._dispatcher, None
         if dispatcher:
             await asyncio.to_thread(dispatcher.close)
@@ -177,9 +185,15 @@ class Orchestrator:
         # Clears any earlier rejection: from here on the flag can only mean this socket.
         self.fyers.update_token(token)
         self.penny.update_token(token)
+        # Opened during continuous trading (a rebuild, /rst): ticks are due at once, so
+        # "Monitoring Started" waits for the first one and silence counts from now.
+        expect_ticks = feed_should_be_live()
+        if expect_ticks and self._feed_silent_since is None:
+            self._feed_silent_since = time.monotonic()
         # actid is the user id on every login path, which is what the vendor SDK sends.
         self._dispatcher = TickDispatcher(
             username, username, token, detectors, self._instrument_tokens,
+            expect_ticks=expect_ticks,
         )
         self._dispatcher.connect()
 
@@ -188,9 +202,11 @@ class Orchestrator:
         dispatcher = self._dispatcher
         if dispatcher is None or self._any_token_expired():   # a rejection has its own message
             return
-        if dispatcher.is_up():
+        if dispatcher.ready():                 # up — and ticking, when ticks are due
             self._feed_rejections = 0
             self._feed_down_noticed = False
+            self._feed_silent_since = None
+            self._silence_alerts = 0
             if not self._feed_announced:
                 self._feed_announced = True
                 await self.login_sender.send_async(
@@ -199,14 +215,33 @@ class Orchestrator:
                         dispatcher.monitored(self.penny.detector),
                     )
                 )
-        elif not self._feed_announced and not self._feed_down_noticed:
+        elif not dispatcher.is_up() and not self._feed_announced and not self._feed_down_noticed:
             self._feed_down_noticed = True
             log.error("Shoonya feed is not up")
             await self.login_sender.send_async(feed_not_up_message(len(dispatcher.no_token)))
+        await self._remind_if_silent(dispatcher)
         report = dispatcher.take_coverage_report()
         if report and report["missing"] != self._last_coverage_gap:
             self._last_coverage_gap = report["missing"]
             await self.login_sender.send_async(feed_coverage_warning_message(report))
+
+    async def _remind_if_silent(self, dispatcher):
+        """While ticks are due and none arrive, say so every FEED_SILENT_ALERT_INTERVAL.
+
+        A rebuild does not end the outage, only ticks do; the clock runs across rebuilds
+        (see the rebuild branch of run()) and stops when the feed is announced again.
+        """
+        since = self._feed_silent_since
+        if since is None or self._feed_announced or not dispatcher.expect_ticks:
+            return
+        if not feed_should_be_live():          # trading closed meanwhile: silence is normal
+            return
+        elapsed = time.monotonic() - since
+        if elapsed >= (self._silence_alerts + 1) * FEED_SILENT_ALERT_INTERVAL:
+            self._silence_alerts += 1
+            minutes = int(elapsed // 60)
+            log.error(f"Shoonya feed still silent after {minutes} minutes of trading")
+            await self.login_sender.send_async(feed_still_silent_message(minutes))
 
     async def _on_feed_rejected(self):
         """The socket refused the session, which REST may still accept.
@@ -366,10 +401,14 @@ class Orchestrator:
                 ):
                     log.error("WebSocket unhealthy — rebuilding dispatcher")
                     was_up, noticed = self._feed_announced, self._feed_down_noticed
+                    silent_since, reminders = self._feed_silent_since, self._silence_alerts
                     await self._close_dispatcher_async()
                     self._last_ws_rebuild = time.monotonic()
                     # One alert per outage; recovering sends Monitoring Started again.
                     self._feed_down_noticed = noticed or was_up
+                    # The outage clock keeps running across rebuilds, until ticks are back.
+                    self._feed_silent_since = silent_since or (time.monotonic() if was_up else None)
+                    self._silence_alerts = reminders
                     if was_up:
                         await self.login_sender.send_async(websocket_rebuild_message())
 

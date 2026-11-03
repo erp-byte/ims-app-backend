@@ -42,6 +42,19 @@ def test_should_not_reset_in_the_morning():
     assert sched.should_reset_tokens("09:13", None, "23-07-2026") is False
 
 
+# --- when the feed must be delivering ticks ---------------------------
+
+def test_ticks_are_due_between_the_first_trades_and_the_close():
+    # 09:13 (the login) and 09:15 (the first trades) are too early to call a feed stalled
+    assert sched.feed_should_be_live("09:13") is False
+    assert sched.feed_should_be_live("09:15") is False
+    assert sched.feed_should_be_live("09:16") is True
+    assert sched.feed_should_be_live("12:00") is True
+    assert sched.feed_should_be_live("15:29") is True
+    assert sched.feed_should_be_live("15:30") is False
+    assert sched.feed_should_be_live("16:00") is False
+
+
 # --- websocket rebuild gate -------------------------------------------
 
 def test_no_rebuild_when_socket_is_healthy():

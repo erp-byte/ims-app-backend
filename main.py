@@ -48,8 +48,6 @@ from services.ims_service.jobwork_dashboard_server import router as jobwork_dash
 from services.ims_service.job_work_server import router as job_work_router
 from services.lot_search_service.server import router as lot_search_router
 from services.packing_service.server import router as packing_router
-# fdk — Shoonya volume-spike detector (see FDK_FILES.md). Delete the three `fdk` blocks in this file to remove it.
-from fdk_main import fdk_lifespan, fdk_mount
 
 
 logger = get_logger("main")
@@ -365,10 +363,7 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Daily report catch-up could not start: %s", exc)
 
-    # fdk — detector + MCP run for the life of the app; a no-op unless FDK_ENABLED=true.
-    # (to remove fdk: replace this `async with` block with a bare `yield`)
-    async with fdk_lifespan():
-        yield
+    yield
 
     scheduler.shutdown()
     rtv_email_shutdown()
@@ -442,7 +437,6 @@ app.include_router(jobwork_dashboard_router)
 app.include_router(job_work_router)
 app.include_router(lot_search_router)
 app.include_router(packing_router)
-fdk_mount(app)  # fdk — /fdk/* routes and the /fdk/mcp mount
 
 
 if __name__ == "__main__":

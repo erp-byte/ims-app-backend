@@ -36,6 +36,3 @@ reportlab>=4.2.0
 
 # Environment
 python-dotenv==1.0.1
-
-# fdk — Shoonya volume spike detector (see FDK_FILES.md). Remove this line to drop its deps.
--r fdk_requirements.txt

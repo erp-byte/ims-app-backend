@@ -1,1 +1,0 @@
-"""Detector service utilities."""

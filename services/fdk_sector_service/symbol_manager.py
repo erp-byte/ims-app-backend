@@ -52,9 +52,12 @@ class SymbolManager:
                     )
                 """)
                 # A database from before the Shoonya switch has the table without the column.
+                # No REFERENCES here: PostgreSQL skips only the column when it exists and
+                # would add a duplicate foreign key on every start-up; the one from the
+                # 2026-11-02 migration (or the CREATE TABLE above) already exists.
                 cur.execute("""
                     ALTER TABLE stock_symbols
-                    ADD COLUMN IF NOT EXISTS isin TEXT REFERENCES instruments (isin)
+                    ADD COLUMN IF NOT EXISTS isin TEXT
                 """)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS sector_mappings (

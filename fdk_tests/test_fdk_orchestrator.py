@@ -190,6 +190,9 @@ class FakeDispatcher:
     def ready(self):
         return FakeDispatcher.up and (not self.expect_ticks or FakeDispatcher.ticks)
 
+    def expect_ticks_from_now(self):
+        self.expect_ticks = True
+
     def monitored(self, detector):
         return len(detector.config.symbols)
 
@@ -360,6 +363,29 @@ def test_before_the_first_trades_monitoring_started_does_not_wait_for_ticks(feed
     FakeDispatcher.ticks = False
     _drive(feed, (lambda: _sent(feed, "Monitoring Started"), None))
     assert FakeDispatcher.made[0].expect_ticks is False
+
+
+def test_the_mornings_socket_is_held_to_ticks_once_trading_starts(feed, monkeypatch):
+    """Subscribed at 09:13, announced, and then no tick ever arrives: by 09:16 that is an
+    outage, and the reminders must say so even though nothing was rebuilt."""
+    from services.fdk_supervisor_service import ochestrator as orch_mod
+    live = {"on": False}
+    monkeypatch.setattr(orch_mod, "feed_should_be_live", lambda *a: live["on"])
+    monkeypatch.setattr(orch_mod, "FEED_SILENT_ALERT_INTERVAL", 0.05)
+    FakeDispatcher.ticks = False
+
+    def trading_starts():
+        live["on"] = True
+
+    _drive(feed,
+           (lambda: _sent(feed, "Monitoring Started"), trading_starts),
+           (lambda: len(_sent(feed, "still silent")) >= 2, _set("ticks", True)),
+           (_after(0.15), None))
+    assert FakeDispatcher.made[0].expect_ticks is True       # promoted, not rebuilt
+    assert len(FakeDispatcher.made) == 1
+    reminders = len(_sent(feed, "still silent"))
+    assert reminders >= 2
+    assert len(_sent(feed, "still silent")) == reminders      # ticks ended the reminders
 
 
 def test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks(feed, monkeypatch):

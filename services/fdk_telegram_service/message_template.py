@@ -133,7 +133,7 @@ def instrument_refresh_message(plan) -> str:
         lines += [f"  {html.escape(old)} is {html.escape(new)} in Shoonya's file ({why})"
                   for _, old, new, why in plan.decisions]
     if plan.missing:
-        lines.append("Missing from Shoonya's file, not subscribed until fixed:")
+        lines.append("Missing from Shoonya's file (still on the old token, which may be dead — check the symbol):")
         lines += [f"  {html.escape(symbol)} (token {token})" for _, symbol, token in plan.missing]
     lines.append("")
     lines.append(f"<i>{len(plan.verified)} instruments verified.</i>")

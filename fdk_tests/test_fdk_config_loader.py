@@ -116,6 +116,16 @@ def test_old_fyers_bot_and_sheet_names_still_work_for_one_release(env):
     assert config.google.shoonya_sheet_id == "old-sheet"
 
 
+def test_a_blank_new_bot_setting_falls_back_to_the_old_name(env):
+    # a .env pasted from fdk_env.example leaves FDK_SHOONYA_TRADE_BOT_TOKEN= empty
+    env.setenv("FDK_SHOONYA_TRADE_BOT_TOKEN", "")
+    env.setenv("FDK_FYERS_TRADE_BOT_TOKEN", "old-t2")
+    assert cfg.load_config().telegram.shoonya_trade.bot_token == "old-t2"
+    env.setenv("FDK_FYERS_TRADE_BOT_TOKEN", "   ")
+    with pytest.raises(KeyError, match="FDK_SHOONYA_TRADE_BOT_TOKEN"):
+        cfg.load_config()
+
+
 def test_a_missing_bot_setting_is_named_by_its_new_name(env):
     env.delenv("FDK_SHOONYA_TRADE_BOT_TOKEN")
     with pytest.raises(KeyError, match="FDK_SHOONYA_TRADE_BOT_TOKEN"):

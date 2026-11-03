@@ -64,6 +64,13 @@ def test_ticks_are_due_between_the_first_trades_and_the_close():
     assert sched.feed_should_be_live("16:00") is False
 
 
+def test_no_ticks_are_due_on_a_weekend():
+    # weekday: Monday = 0 ... Sunday = 6. Holidays still need /hld.
+    assert sched.feed_should_be_live("12:00", weekday=4) is True
+    assert sched.feed_should_be_live("12:00", weekday=5) is False
+    assert sched.feed_should_be_live("12:00", weekday=6) is False
+
+
 # --- websocket rebuild gate -------------------------------------------
 
 def test_no_rebuild_when_socket_is_healthy():

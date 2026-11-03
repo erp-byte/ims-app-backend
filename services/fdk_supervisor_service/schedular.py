@@ -16,14 +16,19 @@ def is_market_hours() -> bool:
     return MARKET_START_TIME <= current < MARKET_END_TIME
 
 
-def feed_should_be_live(current_hhmm: str | None = None) -> bool:
+def feed_should_be_live(current_hhmm: str | None = None, weekday: int | None = None) -> bool:
     """True while a subscribed feed must be delivering ticks (continuous trading).
 
     A socket opened in this window that never ticks is an outage, not a quiet
     pre-open; the 09:13 connect is before it, so the day's first socket gets to
-    wait for the first trade.
+    wait for the first trade. Weekends count as closed (a quiet socket is normal
+    then); exchange holidays still need /hld.
     """
-    current = current_hhmm or datetime.now(IST).strftime("%H:%M")
+    now = datetime.now(IST)
+    current = current_hhmm or now.strftime("%H:%M")
+    weekday = now.weekday() if weekday is None else weekday
+    if weekday >= 5:
+        return False
     return TICKS_START_TIME <= current < MARKET_CLOSE_TIME
 
 

@@ -56,9 +56,11 @@ def test_tables_are_created_with_instruments_first_and_isin_on_stock_symbols(db)
     for column in ("isin TEXT PRIMARY KEY", "shoonya_symbol TEXT NOT NULL UNIQUE",
                    "shoonya_token TEXT NOT NULL UNIQUE", "series TEXT NOT NULL", "verified_on DATE NOT NULL"):
         assert column in instruments
-    # an existing database gets the column added, a new one has it from the start
-    assert any("ALTER TABLE stock_symbols ADD COLUMN IF NOT EXISTS isin TEXT REFERENCES instruments (isin)" in s
-               for s in _sql())
+    # an existing database gets the column added, a new one has it from the start. The ALTER
+    # must not carry REFERENCES: PostgreSQL skips only the column when it exists and would add
+    # a duplicate foreign key (stock_symbols_isin_fkey1, 2, ...) on every start-up.
+    alter = next(s for s in _sql() if "ALTER TABLE stock_symbols ADD COLUMN IF NOT EXISTS isin" in s)
+    assert "REFERENCES" not in alter
     assert any("idx_stock_symbols_isin" in s for s in _sql())
 
 

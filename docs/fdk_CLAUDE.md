@@ -194,8 +194,8 @@ CREATE TABLE IF NOT EXISTS instruments (
 );
 ```
 First filled on 2026-11-02 from `https://api.shoonya.com/NSE_symbols.txt.zip`. Shoonya says to re-download that file
-each trading day, and `InstrumentRefresher` does, once a day from 08:30 IST (before the login) and again on every
-process start: stored instruments are matched on token (the file has no ISIN); only a series move (`ABC-EQ` ->
+each trading day, and `InstrumentRefresher` does, once a day from 08:30 IST (before the login; a process started
+later in the day refreshes at start): stored instruments are matched on token (the file has no ISIN); only a series move (`ABC-EQ` ->
 `ABC-BE`) is renamed automatically, across `instruments`, `stock_symbols` and `sector_mappings` in one transaction,
 after which the supervisor reloads the symbols and rebuilds the detectors; a changed name, a clash with a symbol
 already in use or a token missing from the file is reported on the login bot for the operator to decide; a file with
@@ -204,7 +204,10 @@ nothing. A failed download is retried (`INSTRUMENT_REFRESH_RETRY`, `INSTRUMENT_R
 tokens stay in use for the day. The feed still logs a
 warning when a snapshot's `ts` differs from the stored name.
 
-**Auto-seed:** On first run, if `stock_symbols` or `sector_mappings` are empty, `SymbolManager` seeds from `config/fdk_symbols.json` and `config/fdk_sectors.json`. After that, Supabase is the source of truth.
+**Auto-seed:** On first run, if `instruments`, `stock_symbols` or `sector_mappings` are empty, `SymbolManager` seeds them
+(in that order) from `config/fdk_instruments.json`, `config/fdk_symbols.json` and `config/fdk_sectors.json`; symbols take
+the ISIN of the instrument of the same name, and any symbol still without one is linked by name on every start.
+After that, Supabase is the source of truth. `scripts/fdk_export_seed.py` writes the three files from a live database.
 
 ## Auth Flow (Shoonya OAuth)
 
@@ -278,7 +281,8 @@ checked against the vendor's NorenRestApiOAuth SDK (0.0.41). Not yet run against
    (`feed_should_be_live`: `TICKS_START_TIME` 09:16 to 15:30 IST — a rebuild, `/rst`) expects ticks: its stall clock
    starts when it opens, "Monitoring Started" waits for its first tick, and while ticks are due and none arrive the
    login bot gets "Feed still silent" every `FEED_SILENT_ALERT_INTERVAL` (15 min) until data flows. The 09:13 socket
-   waits for the first trade as before. `/fdk/health` and the MCP `get_detector_status` tool carry a `feed` block:
+   waits for the first trade, then is held to the same rule from 09:16 (`expect_ticks_from_now`). Weekends count as
+   closed; exchange holidays still need `/hld`. `/fdk/health` and the MCP `get_detector_status` tool carry a `feed` block:
    connected, acknowledged, requested, no_token, ticks, seconds_since_tick, dropped.
 
 ## Telegram Commands

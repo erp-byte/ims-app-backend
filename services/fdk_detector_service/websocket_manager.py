@@ -117,6 +117,14 @@ class WebSocketManager:
         """A diff (tf) has arrived on this feed: data is actually flowing."""
         return self.tick_count > 0
 
+    def expect_ticks_from_now(self) -> None:
+        """Trading is live now: a socket opened earlier (09:13) is held to the stall rule
+        from here, so a subscription that never delivers is an outage, not a pre-open."""
+        self.expect_ticks = True
+        self._saw_tick = True
+        if self._last_tick_at is None and self._opened_at is not None:
+            self._last_tick_at = time.monotonic()
+
     def needs_rebuild(self) -> bool:
         """True when only the supervisor can fix this socket.
 
@@ -438,6 +446,10 @@ class TickDispatcher:
     def ready(self) -> bool:
         """Up — and, when ticks are due, actually ticking: safe to announce as monitoring."""
         return self.is_up() and (not self.expect_ticks or self.ticks_seen())
+
+    def expect_ticks_from_now(self) -> None:
+        self.expect_ticks = True
+        self._ws.expect_ticks_from_now()
 
     def needs_rebuild(self) -> bool:
         return self._ws.needs_rebuild()

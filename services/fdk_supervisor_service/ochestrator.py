@@ -216,6 +216,12 @@ class Orchestrator:
         dispatcher = self._dispatcher
         if dispatcher is None or self._any_token_expired():   # a rejection has its own message
             return
+        if not dispatcher.expect_ticks and feed_should_be_live():
+            # The day's first socket opened before trading (09:13). From here its silence
+            # counts: the stall rule applies and reminders run until a tick arrives.
+            dispatcher.expect_ticks_from_now()
+            if not dispatcher.ticks_seen() and self._feed_silent_since is None:
+                self._feed_silent_since = time.monotonic()
         if dispatcher.ready():                 # up — and ticking, when ticks are due
             self._feed_rejections = 0
             self._feed_down_noticed = False
@@ -246,7 +252,7 @@ class Orchestrator:
         (see the rebuild branch of run()) and stops when the feed is announced again.
         """
         since = self._feed_silent_since
-        if since is None or self._feed_announced or not dispatcher.expect_ticks:
+        if since is None or not dispatcher.expect_ticks:
             return
         if not feed_should_be_live():          # trading closed meanwhile: silence is normal
             return

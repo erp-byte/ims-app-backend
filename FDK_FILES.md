@@ -96,6 +96,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_webhook_secret_must_use_telegrams_charset
 - test_bot_and_sheet_settings_use_shoonya_names
 - test_old_fyers_bot_and_sheet_names_still_work_for_one_release
+- test_a_blank_new_bot_setting_falls_back_to_the_old_name
 - test_a_missing_bot_setting_is_named_by_its_new_name
 - test_secret_code_is_required
 - test_blank_shoonya_credentials_are_rejected
@@ -160,6 +161,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - FakeDispatcher.is_up
 - FakeDispatcher.ticks_seen
 - FakeDispatcher.ready
+- FakeDispatcher.expect_ticks_from_now
 - FakeDispatcher.monitored
 - FakeDispatcher.take_coverage_report
 - FakeDispatcher.status
@@ -184,6 +186,8 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_a_long_outage_alerts_once_not_on_every_rebuild.come_back
 - test_monitoring_started_waits_for_the_first_tick_during_trading
 - test_before_the_first_trades_monitoring_started_does_not_wait_for_ticks
+- test_the_mornings_socket_is_held_to_ticks_once_trading_starts
+- test_the_mornings_socket_is_held_to_ticks_once_trading_starts.trading_starts
 - test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks
 - test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks.go_down
 - test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks.back_but_silent
@@ -316,6 +320,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_should_not_reset_in_the_morning
 - test_instruments_refresh_once_a_day_from_0830
 - test_ticks_are_due_between_the_first_trades_and_the_close
+- test_no_ticks_are_due_on_a_weekend
 - test_no_rebuild_when_socket_is_healthy
 - test_rebuild_immediately_on_first_unhealthy_check
 - test_no_rebuild_inside_cooldown
@@ -525,6 +530,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_ticks_going_quiet_during_the_session_needs_a_rebuild
 - test_quiet_after_the_close_is_not_a_stall
 - test_a_rebuilt_feed_that_stays_quiet_counts_as_stalled
+- test_a_quiet_socket_promoted_to_expect_ticks_counts_as_stalled_from_then_on
 - test_ticks_seen_turns_true_with_the_first_diff
 - test_no_ticks_ever_is_not_a_stall
 - test_ticks_expected_only_until_the_close_ist
@@ -561,6 +567,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_monitored_counts_only_symbols_with_a_token
 - test_nothing_to_subscribe_opens_no_socket
 - test_a_dispatcher_expecting_ticks_is_ready_only_once_one_arrives
+- test_promoting_a_dispatcher_makes_readiness_wait_for_ticks
 - test_a_dispatcher_not_expecting_ticks_is_ready_when_subscribed
 - test_status_reports_the_feed
 - test_a_failing_socket_close_still_stops_the_worker
@@ -678,6 +685,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - WebSocketManager.is_alive
 - WebSocketManager.is_up
 - WebSocketManager.ticks_seen
+- WebSocketManager.expect_ticks_from_now
 - WebSocketManager.needs_rebuild
 - WebSocketManager._stalled
 - WebSocketManager.coverage
@@ -707,6 +715,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - TickDispatcher.is_up
 - TickDispatcher.ticks_seen
 - TickDispatcher.ready
+- TickDispatcher.expect_ticks_from_now
 - TickDispatcher.needs_rebuild
 - TickDispatcher.coverage
 - TickDispatcher.status

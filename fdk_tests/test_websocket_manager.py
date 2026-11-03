@@ -455,6 +455,20 @@ def test_a_rebuilt_feed_that_stays_quiet_counts_as_stalled(build, monkeypatch):
     assert manager.needs_rebuild() is True             # ...and no tick came: stalled
 
 
+def test_a_quiet_socket_promoted_to_expect_ticks_counts_as_stalled_from_then_on(build, monkeypatch):
+    """The day's first socket opens before trading; once trading is live its silence must count."""
+    monkeypatch.setattr(wm, "_ticks_expected", lambda: True)
+    manager = build()                                   # expect_ticks=False, like the 09:13 socket
+    manager.connect()
+    manager._last_tick_at = None
+    assert manager.needs_rebuild() is False             # no ticks ever: not a stall, pre-open
+    manager.expect_ticks_from_now()
+    assert manager.expect_ticks is True
+    assert manager.needs_rebuild() is False             # the stall window starts now
+    manager._last_tick_at -= wm.FEED_STALL_SECONDS + 1
+    assert manager.needs_rebuild() is True
+
+
 def test_ticks_seen_turns_true_with_the_first_diff(build, monkeypatch):
     monkeypatch.setattr(wm, "_ticks_expected", lambda: True)
     manager = build(expect_ticks=True)
@@ -779,6 +793,16 @@ def test_a_dispatcher_expecting_ticks_is_ready_only_once_one_arrives(dispatch):
     FakeApp.instances[0].push(t="tf", e="NSE", tk="11536", v="2000")
     assert wait_for(dispatcher.ready)
     assert dispatcher.status()["ticks"] >= 1
+
+
+def test_promoting_a_dispatcher_makes_readiness_wait_for_ticks(dispatch):
+    dispatcher = dispatch([FakeDetector("TCS-EQ")])
+    dispatcher.connect()
+    assert dispatcher.ready() is True
+    dispatcher.expect_ticks_from_now()
+    assert dispatcher.expect_ticks is True and dispatcher.ready() is False
+    FakeApp.instances[0].push(t="tf", e="NSE", tk="11536", v="2000")
+    assert wait_for(dispatcher.ready)
 
 
 def test_a_dispatcher_not_expecting_ticks_is_ready_when_subscribed(dispatch):

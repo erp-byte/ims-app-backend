@@ -110,10 +110,15 @@ def _channel(token_env: str, chat_id_env: str,
     old_token, old_chat = legacy or (None, None)
 
     def read(key, old):
-        if key in os.environ:
-            return os.environ[key]
-        if old and old in os.environ:
-            return os.environ[old]
+        # A blank value (a .env pasted from fdk_env.example) counts as absent, so it
+        # cannot shadow the old name or hand the sender an empty token.
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+        if old:
+            value = os.environ.get(old, "").strip()
+            if value:
+                return value
         raise KeyError(key)
 
     return TelegramChannel(bot_token=read(token_env, old_token), chat_id=read(chat_id_env, old_chat))

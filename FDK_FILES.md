@@ -380,6 +380,9 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_send_logs_telegram_error_body_on_non_200
 - test_send_logs_exception_with_chat_id
 - test_send_logs_exception_with_chat_id._boom
+- _alert
+- test_trade_alert_escapes_symbol_and_sector_for_telegram_html
+- test_summary_escapes_symbols_for_telegram_html
 
 ### fdk_tests/test_telegram_poller.py
 - _Resp

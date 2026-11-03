@@ -61,3 +61,38 @@ def test_send_logs_exception_with_chat_id(sender, monkeypatch, caplog):
         assert sender.send("hello") is False
     logged = " ".join(r.getMessage() for r in caplog.records)
     assert "connection reset" in logged
+
+
+# --- HTML escaping ----------------------------------------------------------
+# Telegram's HTML parse mode requires a bare & to be sent as &amp;. Four symbols (M&M, M&MFIN,
+# J&KBANK, COX&KINGS) and sectors such as "Oil & Gas" carry one.
+
+def _alert(symbol="M&M-EQ", sector="Oil & Gas"):
+    from datetime import datetime
+    from shared.fdk_models import TradeAlert
+    return TradeAlert(symbol=symbol, sector=sector, ltp=1500.5, volume_spike=20000,
+                      trade_value=30_010_000, trade_value_cr=3.0, spike_type="Large Spike",
+                      timestamp=datetime(2026, 11, 3, 10, 0, 0))
+
+
+def test_trade_alert_escapes_symbol_and_sector_for_telegram_html():
+    from services.fdk_telegram_service.message_template import trade_alert_message
+
+    msg = trade_alert_message(_alert())
+
+    assert "<b>Symbol:</b> M&amp;M-EQ" in msg
+    assert "<b>Sector:</b> Oil &amp; Gas" in msg
+    assert msg.count("&") == msg.count("&amp;")       # no bare ampersand anywhere
+
+
+def test_summary_escapes_symbols_for_telegram_html(monkeypatch):
+    from services.fdk_summary_service.summary_generator import SummaryGenerator
+
+    gen = SummaryGenerator("shoonya", None, "sheet-id", SimpleNamespace())
+    monkeypatch.setattr(gen, "_get_records", lambda days_back=0, target_date=None: [
+        {"symbol": "M&M-EQ", "value_str": "3.10"}, {"symbol": "M&M-EQ", "value_str": "4.00"}])
+
+    msg = gen._format_message(0, "Daily")
+
+    assert "<b>M&amp;M-EQ</b>" in msg
+    assert msg.count("&") == msg.count("&amp;")

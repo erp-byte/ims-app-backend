@@ -6,10 +6,11 @@ COVERAGE_NAMES_SHOWN = 20
 
 
 def trade_alert_message(alert: TradeAlert) -> str:
+    # HTML parse mode: a bare & (M&M-EQ, "Oil & Gas") must go out as &amp;.
     return (
         f"<b>LARGE TRADE DETECTED</b>\n\n"
-        f"<b>Symbol:</b> {alert.symbol}\n"
-        f"<b>Sector:</b> {alert.sector}\n"
+        f"<b>Symbol:</b> {html.escape(alert.symbol)}\n"
+        f"<b>Sector:</b> {html.escape(alert.sector)}\n"
         f"<b>LTP:</b> Rs{alert.ltp:,.2f}\n"
         f"<b>Volume:</b> {alert.volume_spike:,}\n"
         f"<b>Value:</b> Rs{alert.trade_value_cr:.2f} Cr\n"

@@ -1,5 +1,6 @@
 """Generates daily/weekly top-15 summaries from Google Sheets data."""
 import asyncio
+import html
 import re
 from datetime import datetime, timedelta
 import gspread
@@ -165,7 +166,7 @@ class SummaryGenerator:
 
         for idx, (symbol, s) in enumerate(top_15, 1):
             avg = s["total_cr"] / s["count"] if s["count"] > 0 else 0
-            msg += (f"{idx}. <b>{symbol}</b>\n"
+            msg += (f"{idx}. <b>{html.escape(symbol)}</b>\n"   # M&M-EQ -> M&amp;M-EQ
                     f"   Count: <b>{s['count']}</b> trades\n"
                     f"   Total Value: Rs.{s['total_cr']:,.2f} Cr\n"
                     f"   Avg per Trade: Rs.{avg:.2f} Cr\n\n")

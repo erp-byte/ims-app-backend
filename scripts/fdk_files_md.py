@@ -27,13 +27,16 @@ FDK_FILES = [
     "fdk_env.example",
     "FDK_FILES.md",
     "scripts/fdk_files_md.py",
+    "scripts/fdk_export_seed.py",
     "shared/fdk_config_loader.py",
     "shared/fdk_constants.py",
     "shared/fdk_exceptions.py",
     "shared/fdk_logger.py",
     "shared/fdk_models.py",
+    "config/fdk_instruments.json",
     "config/fdk_sectors.json",
     "config/fdk_symbols.json",
+    "migrations/2026-11-02_shoonya_only.sql",
     "docs/fdk_CLAUDE.md",
 ]
 # Existing backend files that carry fdk-marked lines (grep for "fdk").

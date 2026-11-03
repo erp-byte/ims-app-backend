@@ -426,6 +426,27 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_send_all_never_propagates
 - test_generator_returning_false_is_logged
 
+### fdk_tests/test_symbol_manager.py
+- _Cursor
+- _Cursor.execute
+- _Cursor.fetchone
+- _Conn
+- _Conn.cursor
+- db
+- _sql
+- _index
+- test_tables_are_created_with_instruments_first_and_isin_on_stock_symbols
+- test_symbols_with_no_isin_are_linked_to_instruments_by_name
+- test_an_empty_database_is_seeded_instruments_first_with_isins
+- test_a_seeded_database_is_left_alone
+- test_a_missing_instruments_file_is_a_warning_not_a_crash
+- test_the_shipped_seed_files_use_shoonya_names
+- test_export_seed_writes_the_three_files_from_the_database
+- test_export_seed_writes_the_three_files_from_the_database.Cursor
+- test_export_seed_writes_the_three_files_from_the_database.Cursor.fetchall
+- test_export_seed_writes_the_three_files_from_the_database.Conn
+- test_export_seed_writes_the_three_files_from_the_database.Conn.cursor
+
 ### fdk_tests/test_telegram.py
 - sender
 - _resp
@@ -541,6 +562,13 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_a_failing_socket_close_still_stops_the_worker.boom
 - test_coverage_counts_scrips_not_symbols
 - test_closing_the_dispatcher_stops_its_threads
+
+### migrations/2026-11-02_shoonya_only.sql
+- (not python)
+
+### scripts/fdk_export_seed.py
+- export_seed
+- main
 
 ### scripts/fdk_files_md.py
 - functions
@@ -778,11 +806,14 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - SymbolManager._get_conn
 - SymbolManager._ensure_tables
 - SymbolManager._seed_if_empty
+- SymbolManager._link_symbols_to_instruments
+- SymbolManager._seed_instruments_from_json
 - SymbolManager._seed_symbols_from_json
 - SymbolManager._seed_sectors_from_json
 - SymbolManager.load_symbols
 - SymbolManager.load_instrument_tokens
 - SymbolManager.load_sector_mapping
+- SymbolManager.seed_instruments
 - SymbolManager.seed_symbols
 - SymbolManager.seed_sectors
 

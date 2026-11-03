@@ -2,7 +2,7 @@
 from datetime import datetime
 from shared.fdk_constants import (
     MARKET_START_TIME, MARKET_END_TIME, MARKET_CLOSE_TIME, TICKS_START_TIME,
-    DAILY_TOKEN_RESET_TIME, WS_REBUILD_COOLDOWN, IST,
+    DAILY_TOKEN_RESET_TIME, INSTRUMENT_REFRESH_START, WS_REBUILD_COOLDOWN, IST,
 )
 from shared.fdk_logger import get_logger
 
@@ -36,6 +36,13 @@ def should_reset_tokens(current_hhmm: str, last_reset_date: str | None,
     means a missed exact minute still fires later the same evening.
     """
     return current_hhmm >= DAILY_TOKEN_RESET_TIME and last_reset_date != today
+
+
+def should_refresh_instruments(current_hhmm: str, last_refresh_date: str | None,
+                               today: str) -> bool:
+    """True once a day from INSTRUMENT_REFRESH_START: Shoonya's symbol file is re-read
+    before the 09:13 login so the day's tokens and names are current."""
+    return current_hhmm >= INSTRUMENT_REFRESH_START and last_refresh_date != today
 
 
 def should_rebuild_socket(needs_rebuild: bool, last_rebuild_ts: float | None,

@@ -27,6 +27,14 @@ TICKS_START_TIME = "09:16"
 # 09:13 login is always a fresh full TOTP login (17:00 IST, after market close).
 DAILY_TOKEN_RESET_TIME = "17:00"
 
+# Shoonya's symbol master, re-read every trading day: tokens and names can change.
+SHOONYA_MASTER_URL = "https://api.shoonya.com/NSE_symbols.txt.zip"
+INSTRUMENT_REFRESH_START = "08:30"    # once a day from here (before the 09:13 login)
+INSTRUMENT_REFRESH_RETRY = 600        # seconds before retrying a failed download
+INSTRUMENT_REFRESH_ATTEMPTS = 3       # per day; then yesterday's tokens stay in use
+MIN_MASTER_ROWS = 2000                # the file has ~10 000 rows; far fewer is a bad download
+MAX_MISSING_TOKEN_RATIO = 0.05        # more stored tokens missing than this: touch nothing
+
 # Shoonya market feed. Scrips are sent in batches rather than one request each,
 # with a short pause between batches, so start-up does not flood the gateway.
 FEED_EXCHANGE = "NSE"

@@ -184,6 +184,16 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks
 - test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks.go_down
 - test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks.back_but_silent
+- test_the_daily_refresh_runs_before_the_universe_is_loaded_and_reloads_on_renames
+- test_the_daily_refresh_runs_before_the_universe_is_loaded_and_reloads_on_renames.once
+- test_the_daily_refresh_runs_before_the_universe_is_loaded_and_reloads_on_renames.refresh
+- test_the_daily_refresh_runs_before_the_universe_is_loaded_and_reloads_on_renames.load_symbols
+- test_a_refresh_that_changes_names_while_running_rebuilds_the_detectors
+- test_a_refresh_that_changes_names_while_running_rebuilds_the_detectors.when_told
+- test_a_refresh_that_changes_names_while_running_rebuilds_the_detectors.trigger
+- test_a_failed_refresh_is_reported_and_does_not_stop_the_day
+- test_a_failed_refresh_is_reported_and_does_not_stop_the_day.once
+- test_a_failed_refresh_is_reported_and_does_not_stop_the_day.boom
 - _report
 - test_symbols_the_gateway_did_not_acknowledge_are_named_with_their_detector
 - test_the_same_gap_is_reported_once_and_a_new_one_again
@@ -254,6 +264,41 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_a_real_rejection_flags_the_token_and_stops_dialling
 - test_close_ends_the_real_socket_and_threads
 
+### fdk_tests/test_instrument_refresh.py
+- _master_text
+- _master
+- _stored
+- test_parse_master_maps_token_to_trading_symbol_and_series
+- test_parse_master_rejects_a_file_with_the_wrong_columns
+- test_parse_master_skips_short_rows
+- test_download_master_unzips_and_parses
+- test_download_master_unzips_and_parses.Resp
+- test_download_master_unzips_and_parses.Resp.raise_for_status
+- test_download_master_unzips_and_parses._get
+- _plan
+- test_unchanged_instruments_are_verified_and_nothing_else
+- test_a_series_move_is_renamed_automatically
+- test_a_name_change_is_reported_not_applied
+- test_a_series_move_onto_a_symbol_already_in_use_is_reported_not_applied
+- test_a_token_missing_from_the_file_is_reported
+- test_too_many_missing_tokens_aborts_the_refresh
+- test_a_file_with_too_few_rows_aborts_the_refresh
+- _Cursor
+- _Cursor.fetchall
+- _Conn
+- _Conn.__init__
+- _Conn.cursor
+- _Conn.commit
+- _Conn.rollback
+- test_apply_renames_the_three_tables_and_stamps_verified_on_in_one_transaction
+- test_apply_writes_nothing_for_an_aborted_plan
+- test_apply_rolls_back_when_a_statement_fails
+- test_apply_rolls_back_when_a_statement_fails.boom
+- test_refresher_loads_stored_rows_plans_and_applies
+- test_refresher_loads_stored_rows_plans_and_applies.connect
+- test_refresh_message_lists_renames_decisions_and_missing
+- test_refresh_message_for_an_aborted_refresh_says_why
+
 ### fdk_tests/test_integrations.py
 - (none)
 
@@ -264,6 +309,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_should_reset_after_reset_time_is_true
 - test_should_not_reset_twice_same_day
 - test_should_not_reset_in_the_morning
+- test_instruments_refresh_once_a_day_from_0830
 - test_ticks_are_due_between_the_first_trades_and_the_close
 - test_no_rebuild_when_socket_is_healthy
 - test_rebuild_immediately_on_first_unhealthy_check
@@ -704,6 +750,18 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 ### services/fdk_sector_service/__init__.py
 - (none)
 
+### services/fdk_sector_service/instrument_refresh.py
+- parse_master
+- download_master
+- RefreshPlan
+- RefreshPlan.changed
+- RefreshPlan.summary
+- plan_refresh
+- apply_plan
+- InstrumentRefresher
+- InstrumentRefresher.__init__
+- InstrumentRefresher.run
+
 ### services/fdk_sector_service/models.py
 - SectorInfo
 
@@ -810,6 +868,8 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - Orchestrator._daily_token_reset
 - Orchestrator._re_authenticate
 - Orchestrator._authenticate_with_checks
+- Orchestrator._load_universe
+- Orchestrator._maybe_refresh_instruments
 - Orchestrator.run
 
 ### services/fdk_supervisor_service/run_controller.py
@@ -824,6 +884,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - is_market_hours
 - feed_should_be_live
 - should_reset_tokens
+- should_refresh_instruments
 - should_rebuild_socket
 
 ### services/fdk_supervisor_service/server.py
@@ -866,6 +927,8 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - summary_date_prompt_message
 - summary_date_invalid_message
 - summary_date_confirm_message
+- instrument_refresh_message
+- instrument_refresh_failed_message
 - feed_still_silent_message
 - websocket_rebuild_message
 

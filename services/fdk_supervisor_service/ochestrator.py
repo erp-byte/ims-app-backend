@@ -4,21 +4,26 @@ import time
 from datetime import datetime
 from shared.fdk_logger import get_logger
 from shared.fdk_config_loader import AppConfig
-from shared.fdk_constants import FEED_SILENT_ALERT_INTERVAL, IST
+from shared.fdk_constants import (
+    FEED_SILENT_ALERT_INTERVAL, INSTRUMENT_REFRESH_ATTEMPTS, INSTRUMENT_REFRESH_RETRY, IST,
+)
 from services.fdk_auth_service.shoonya_authenticator import ShoonyaAuthenticator
 from services.fdk_auth_service.token_manager import TokenManager
 from services.fdk_telegram_service import TelegramSender
 from services.fdk_telegram_service.message_template import (
     feed_coverage_warning_message, feed_not_up_message, feed_rejected_message,
-    feed_still_silent_message, monitoring_started_message, websocket_rebuild_message,
+    feed_still_silent_message, instrument_refresh_failed_message, instrument_refresh_message,
+    monitoring_started_message, websocket_rebuild_message,
 )
 from services.fdk_summary_service import SummaryScheduler
 from services.fdk_sector_service import SymbolManager, init_sector_mapping
+from services.fdk_sector_service.instrument_refresh import InstrumentRefresher
 from services.fdk_detector_service.websocket_manager import TickDispatcher
 from services.fdk_fyers_service import FyersService, FyersSummaryService
 from services.fdk_penny_service import PennyService, PennySummaryService
 from .schedular import (
-    feed_should_be_live, is_market_hours, should_reset_tokens, should_rebuild_socket,
+    feed_should_be_live, is_market_hours, should_refresh_instruments, should_reset_tokens,
+    should_rebuild_socket,
 )
 
 log = get_logger("orchestrator")
@@ -96,6 +101,15 @@ class Orchestrator:
 
         # Symbol/sector manager (Supabase, auto-seeds from JSON on first run)
         self.symbol_manager = SymbolManager(config.supabase.dsn)
+        # Shoonya's symbol file is re-read every trading day: tokens and names can change.
+        self.instrument_refresher = InstrumentRefresher(self.symbol_manager._get_conn)
+        self._last_refresh_date: str | None = None
+        self._refresh_failures = 0
+        self._refresh_retry_at: float | None = None
+        # The symbol universe, loaded from Supabase (again after a refresh renamed something)
+        self._shoonya_symbols: list[str] = []
+        self._penny_symbols: list[str] = []
+        self._sectors: dict[str, str] = {}
 
     def hold(self):
         """Stop all detectors and enter hold mode."""
@@ -310,6 +324,61 @@ class Orchestrator:
         result = await self.authenticator.authenticate()
         return result is not False
 
+    async def _load_universe(self):
+        """Symbols, sectors and tokens from Supabase.
+
+        Supabase calls run in worker threads: the event loop is shared with the backend.
+        Retried: a transient DB error here must not end the supervisor for good.
+        """
+        while True:
+            try:
+                self._shoonya_symbols = await asyncio.to_thread(
+                    self.symbol_manager.load_symbols, "shoonya")
+                self._penny_symbols = await asyncio.to_thread(
+                    self.symbol_manager.load_symbols, "penny")
+                self._sectors = await asyncio.to_thread(self.symbol_manager.load_sector_mapping)
+                self._instrument_tokens = await asyncio.to_thread(
+                    self.symbol_manager.load_instrument_tokens)
+                break
+            except Exception as e:
+                log.error(f"Supabase symbol load failed, retrying in {SUPERVISOR_RETRY_DELAY}s: {e}")
+                await asyncio.sleep(SUPERVISOR_RETRY_DELAY)
+        init_sector_mapping(self._sectors)
+
+    async def _maybe_refresh_instruments(self) -> bool:
+        """Once a day from 08:30 IST, re-read Shoonya's symbol file. True when names changed.
+
+        A failed download is retried a few times, then yesterday's tokens stay in use
+        for the day; the operator hears about the first failure and about every change.
+        """
+        now = datetime.now(IST)
+        today = now.strftime("%d-%m-%Y")
+        if not should_refresh_instruments(now.strftime("%H:%M"), self._last_refresh_date, today):
+            return False
+        if self._refresh_retry_at is not None and time.monotonic() < self._refresh_retry_at:
+            return False
+        try:
+            plan = await asyncio.to_thread(self.instrument_refresher.run)
+        except Exception as e:
+            self._refresh_failures += 1
+            log.error(f"Instrument refresh failed "
+                      f"({self._refresh_failures}/{INSTRUMENT_REFRESH_ATTEMPTS}): {e}")
+            if self._refresh_failures == 1:
+                await self.login_sender.send_async(instrument_refresh_failed_message(str(e)))
+            if self._refresh_failures >= INSTRUMENT_REFRESH_ATTEMPTS:
+                self._last_refresh_date = today          # give up for today
+                self._refresh_failures = 0
+                self._refresh_retry_at = None
+            else:
+                self._refresh_retry_at = time.monotonic() + INSTRUMENT_REFRESH_RETRY
+            return False
+        self._last_refresh_date = today
+        self._refresh_failures = 0
+        self._refresh_retry_at = None
+        if plan.aborted or plan.renames or plan.decisions or plan.missing:
+            await self.login_sender.send_async(instrument_refresh_message(plan))
+        return plan.changed
+
     async def run(self):
         """Main supervisor loop."""
         # Start summary scheduler (runs independently at 16:30 IST)
@@ -320,21 +389,9 @@ class Orchestrator:
         # the 16:30 summaries for the rest of the process's life.
         self._summary_task = asyncio.create_task(summary_scheduler.run())
 
-        # Load symbols and sectors from Supabase
-        # Supabase + Sheets calls run in worker threads: the event loop is shared with the backend.
-        # Retried: a transient DB error here must not end the supervisor for good.
-        while True:
-            try:
-                shoonya_symbols = await asyncio.to_thread(self.symbol_manager.load_symbols, "shoonya")
-                penny_symbols = await asyncio.to_thread(self.symbol_manager.load_symbols, "penny")
-                sectors = await asyncio.to_thread(self.symbol_manager.load_sector_mapping)
-                self._instrument_tokens = await asyncio.to_thread(
-                    self.symbol_manager.load_instrument_tokens)
-                break
-            except Exception as e:
-                log.error(f"Supabase symbol load failed, retrying in {SUPERVISOR_RETRY_DELAY}s: {e}")
-                await asyncio.sleep(SUPERVISOR_RETRY_DELAY)
-        init_sector_mapping(sectors)
+        # Today's symbol file first, so the names and tokens loaded below are current.
+        await self._maybe_refresh_instruments()
+        await self._load_universe()
 
         while True:
             try:
@@ -346,6 +403,15 @@ class Orchestrator:
                     now.strftime("%d-%m-%Y"),
                 ):
                     await self._daily_token_reset(now.strftime("%d-%m-%Y"))
+
+                # Daily 08:30 IST symbol-file refresh. A rename means the detectors and
+                # the feed are built on stale names: reload and rebuild them.
+                if await self._maybe_refresh_instruments():
+                    log.info("Instrument names changed — reloading symbols and rebuilding")
+                    await self._stop_detectors()
+                    await self._close_dispatcher_async()
+                    await self._load_universe()
+                    self._services_built = False
 
                 if self.restart_requested:
                     self.restart_requested = False
@@ -383,8 +449,10 @@ class Orchestrator:
                 # each daily reset so they pick up the fresh token cleanly).
                 if not self._services_built:
                     token = self.authenticator.access_token
-                    await asyncio.to_thread(self.fyers.build, token, shoonya_symbols, sectors)
-                    await asyncio.to_thread(self.penny.build, token, penny_symbols, sectors)
+                    await asyncio.to_thread(
+                        self.fyers.build, token, self._shoonya_symbols, self._sectors)
+                    await asyncio.to_thread(
+                        self.penny.build, token, self._penny_symbols, self._sectors)
                     self._services_built = True
 
                 if self._dispatcher and self._any_token_expired():

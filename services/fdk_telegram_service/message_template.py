@@ -117,6 +117,37 @@ def summary_date_confirm_message(date_str: str, day_name: str) -> str:
     return f"<b>Generating summaries for {date_str} ({day_name})...</b>\n\nPlease wait."
 
 
+def instrument_refresh_message(plan) -> str:
+    """plan: services.fdk_sector_service.instrument_refresh.RefreshPlan."""
+    if plan.aborted:
+        return (
+            f"<b>Instrument refresh skipped</b>\n\n"
+            f"{html.escape(plan.aborted)}.\nNothing was changed; yesterday's tokens stay in use."
+        )
+    lines = ["<b>Instrument refresh</b>", ""]
+    if plan.renames:
+        lines.append("Renamed (series change), feed and sheets follow the new name:")
+        lines += [f"  {html.escape(old)} → {html.escape(new)}" for _, old, new, _ in plan.renames]
+    if plan.decisions:
+        lines.append("Not changed, needs your decision:")
+        lines += [f"  {html.escape(old)} is {html.escape(new)} in Shoonya's file ({why})"
+                  for _, old, new, why in plan.decisions]
+    if plan.missing:
+        lines.append("Missing from Shoonya's file, not subscribed until fixed:")
+        lines += [f"  {html.escape(symbol)} (token {token})" for _, symbol, token in plan.missing]
+    lines.append("")
+    lines.append(f"<i>{len(plan.verified)} instruments verified.</i>")
+    return "\n".join(lines)
+
+
+def instrument_refresh_failed_message(error: str) -> str:
+    return (
+        f"<b>Instrument refresh failed</b>\n\n"
+        f"{html.escape(error)}\n"
+        f"Yesterday's tokens stay in use. Retrying a few times, then giving up for today."
+    )
+
+
 def feed_still_silent_message(minutes: int) -> str:
     return (
         f"<b>Feed still silent</b>\n\n"

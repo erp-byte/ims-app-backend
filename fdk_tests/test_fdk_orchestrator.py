@@ -24,6 +24,8 @@ def offline(monkeypatch):
     for key, value in {**COMMON, **SHOONYA}.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("FDK_SCHEDULING_ENABLED", "false")   # run() must not wait for 09:13 IST
+    from services.fdk_supervisor_service import ochestrator as orch_mod
+    monkeypatch.setattr(orch_mod, "should_refresh_instruments", lambda *a: False)
     monkeypatch.setattr(psycopg2, "connect", lambda *a, **k: FakeConn())
     monkeypatch.setattr(requests, "post", lambda *a, **k: FakeResponse())
     return monkeypatch
@@ -386,6 +388,83 @@ def test_a_rebuilt_feed_that_stays_silent_is_alerted_again_until_it_ticks(feed, 
     # recovery ends the reminders
     assert len(_sent(feed, "still silent")) == len(silent)
     assert FakeDispatcher.made[-1].expect_ticks is True
+
+
+def test_the_daily_refresh_runs_before_the_universe_is_loaded_and_reloads_on_renames(feed, monkeypatch):
+    from services.fdk_supervisor_service import ochestrator as orch_mod
+    from services.fdk_sector_service.instrument_refresh import RefreshPlan
+    calls = []
+    due = {"n": 0}
+
+    def once(*a):
+        due["n"] += 1
+        return due["n"] == 1
+
+    def refresh():
+        calls.append("refresh")
+        return RefreshPlan(verified=["INE1"], renames=[("INE1", "TCS-EQ", "TCS-BE", "BE")])
+
+    real_load = feed.symbol_manager.load_symbols
+
+    def load_symbols(detector):
+        calls.append(detector)
+        return real_load(detector)
+
+    monkeypatch.setattr(orch_mod, "should_refresh_instruments", once)
+    monkeypatch.setattr(feed.instrument_refresher, "run", refresh)
+    monkeypatch.setattr(feed.symbol_manager, "load_symbols", load_symbols)
+
+    _drive(feed, (lambda: _sent(feed, "Monitoring Started"), None))
+
+    assert calls[0] == "refresh"                      # before the first load of the day
+    assert calls.count("shoonya") == 1                # one load, after the refresh
+    renamed = _sent(feed, "TCS-BE")
+    assert renamed and "TCS-EQ" in renamed[0]        # the operator is told what changed
+
+
+def test_a_refresh_that_changes_names_while_running_rebuilds_the_detectors(feed, monkeypatch):
+    from services.fdk_supervisor_service import ochestrator as orch_mod
+    from services.fdk_sector_service.instrument_refresh import RefreshPlan
+    due = {"on": False, "fired": 0}
+
+    def when_told(*a):
+        if due["on"] and due["fired"] == 0:
+            due["fired"] = 1
+            return True
+        return False
+
+    monkeypatch.setattr(orch_mod, "should_refresh_instruments", when_told)
+    monkeypatch.setattr(feed.instrument_refresher, "run",
+                        lambda: RefreshPlan(verified=["INE1"], renames=[("INE1", "TCS-EQ", "TCS-BE", "BE")]))
+
+    def trigger():
+        due["on"] = True
+
+    _drive(feed,
+           (lambda: _sent(feed, "Monitoring Started"), trigger),
+           (lambda: len(FakeDispatcher.made) >= 2, None),
+           (lambda: len(_sent(feed, "Monitoring Started")) == 2, None))
+    assert FakeDispatcher.made[0].closed                # the old feed went with the old names
+    assert feed.loaded.count("shoonya") == 2            # the universe was reloaded
+
+
+def test_a_failed_refresh_is_reported_and_does_not_stop_the_day(feed, monkeypatch, caplog):
+    from services.fdk_supervisor_service import ochestrator as orch_mod
+    due = {"n": 0}
+
+    def once(*a):
+        due["n"] += 1
+        return due["n"] == 1
+
+    def boom():
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(orch_mod, "should_refresh_instruments", once)
+    monkeypatch.setattr(feed.instrument_refresher, "run", boom)
+    with caplog.at_level(logging.ERROR, logger="fdk.orchestrator"):
+        _drive(feed, (lambda: _sent(feed, "Monitoring Started"), None))
+    assert "download failed" in " ".join(r.getMessage() for r in caplog.records)
+    assert _sent(feed, "Instrument refresh failed")
 
 
 def _report(missing, acknowledged=2, requested=3):

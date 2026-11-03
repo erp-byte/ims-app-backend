@@ -42,6 +42,15 @@ def test_should_not_reset_in_the_morning():
     assert sched.should_reset_tokens("09:13", None, "23-07-2026") is False
 
 
+# --- daily instrument refresh ----------------------------------------
+
+def test_instruments_refresh_once_a_day_from_0830():
+    assert sched.should_refresh_instruments("08:29", None, "03-11-2026") is False
+    assert sched.should_refresh_instruments("08:30", None, "03-11-2026") is True
+    assert sched.should_refresh_instruments("11:00", "02-11-2026", "03-11-2026") is True
+    assert sched.should_refresh_instruments("11:00", "03-11-2026", "03-11-2026") is False
+
+
 # --- when the feed must be delivering ticks ---------------------------
 
 def test_ticks_are_due_between_the_first_trades_and_the_close():

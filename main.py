@@ -48,7 +48,7 @@ from services.ims_service.jobwork_dashboard_server import router as jobwork_dash
 from services.ims_service.job_work_server import router as job_work_router
 from services.lot_search_service.server import router as lot_search_router
 from services.packing_service.server import router as packing_router
-# fdk — Fyers Volume Spike Detector (see FDK_FILES.md). Delete the three `fdk` blocks in this file to remove it.
+# fdk — Shoonya volume-spike detector (see FDK_FILES.md). Delete the three `fdk` blocks in this file to remove it.
 from fdk_main import fdk_lifespan, fdk_mount
 
 

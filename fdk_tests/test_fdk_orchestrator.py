@@ -112,7 +112,7 @@ def test_run_retries_the_initial_supabase_loads_until_they_succeed(offline, capl
     offline.setattr(orch_mod, "SUPERVISOR_RETRY_DELAY", 0.01)
     offline.setattr(orch_mod, "TickDispatcher", FakeDispatcher)
     orch = _orchestrator()
-    offline.setattr(orch.fyers, "build", lambda *a, **k: None)
+    offline.setattr(orch.shoonya, "build", lambda *a, **k: None)
     offline.setattr(orch.penny, "build", lambda *a, **k: None)
     offline.setattr(orch, "_connect_dispatcher", lambda: None)
     calls = {"n": 0}
@@ -242,7 +242,7 @@ def feed(offline):
     offline.setattr(orch.symbol_manager, "load_instrument_tokens",
                     lambda: {"TCS-EQ": "11536", "INFY-EQ": "1594", "IDEA-EQ": "14366"})
     offline.setattr(orch.symbol_manager, "load_sector_mapping", lambda: {"TCS-EQ": "IT"})
-    offline.setattr(orch.fyers, "build", build(orch.fyers))
+    offline.setattr(orch.shoonya, "build", build(orch.shoonya))
     offline.setattr(orch.penny, "build", build(orch.penny))
     offline.setattr(orch.login_sender, "send_async", record_message)
     return orch
@@ -632,7 +632,7 @@ def _longest_stall(coroutine_factory):
 @pytest.mark.parametrize("path", ["re_authenticate", "daily_reset", "parking"])
 def test_stopping_the_detectors_does_not_freeze_the_event_loop(feed, monkeypatch, path):
     """stop() can wait 10 s per detector on a Sheets call, and this loop is the backend's."""
-    monkeypatch.setattr(feed.fyers, "stop", lambda: time.sleep(0.25))
+    monkeypatch.setattr(feed.shoonya, "stop", lambda: time.sleep(0.25))
     monkeypatch.setattr(feed.penny, "stop", lambda: time.sleep(0.25))
 
     async def no_login():
@@ -650,7 +650,7 @@ def test_stopping_the_detectors_does_not_freeze_the_event_loop(feed, monkeypatch
 def test_the_supervisor_loop_stops_detectors_off_the_event_loop():
     import inspect
     from services.fdk_supervisor_service.ochestrator import Orchestrator
-    assert "self.fyers.stop()" not in inspect.getsource(Orchestrator.run)
+    assert "self.shoonya.stop()" not in inspect.getsource(Orchestrator.run)
     assert "self.penny.stop()" not in inspect.getsource(Orchestrator.run)
 
 
@@ -684,13 +684,13 @@ def test_feed_status_with_and_without_a_feed(feed):
 
 
 def test_summaries_are_titled_with_the_database_label(feed):
-    assert feed.fyers_summary.generator.name == "shoonya"
+    assert feed.shoonya_summary.generator.name == "shoonya"
 
 
 def test_the_large_cap_detector_config_is_labelled_shoonya(offline, monkeypatch):
-    from services.fdk_fyers_service import service as fyers_service
-    monkeypatch.setattr(fyers_service, "GoogleSheetsManager", lambda *a, **k: None)
-    service = _orchestrator().fyers
+    from services.fdk_shoonya_service import service as shoonya_service
+    monkeypatch.setattr(shoonya_service, "GoogleSheetsManager", lambda *a, **k: None)
+    service = _orchestrator().shoonya
     service.build("sess-1", ["TCS-EQ"], {})
     assert service.detector.config.name == "shoonya"
 
@@ -740,19 +740,19 @@ class _FakeMCP:
 
 @pytest.fixture
 def mcp_tools():
-    from services.fdk_mcp_service.fyers_tools import register_fyers_tools
+    from services.fdk_mcp_service.detector_tools import register_detector_tools
 
     orchestrator = SimpleNamespace(
         symbol_manager=SimpleNamespace(load_symbols=lambda d: {"shoonya": ["TCS-EQ"]}.get(d, [])))
     mcp = _FakeMCP()
-    register_fyers_tools(mcp, orchestrator)
+    register_detector_tools(mcp, orchestrator)
     return mcp.tools
 
 
 def test_detector_status_shows_the_feed(offline):
-    from services.fdk_mcp_service.fyers_tools import register_fyers_tools
+    from services.fdk_mcp_service.detector_tools import register_detector_tools
     mcp = _FakeMCP()
-    register_fyers_tools(mcp, _orchestrator())
+    register_detector_tools(mcp, _orchestrator())
     status = asyncio.run(mcp.tools["get_detector_status"]())
     assert status["feed"]["connected"] is False
 
@@ -772,7 +772,31 @@ def test_operator_messages_do_not_name_the_old_broker():
     assert "Shoonya" in websocket_rebuild_message()
 
 
-# --- the Fyers SDK is gone -------------------------------------------
+# --- the Fyers SDK and name are gone ----------------------------------
+
+def test_the_fyers_name_is_gone_from_the_current_code():
+    """Only history (the changelog, 'merged from fyersdk') and the one-release env fallback
+    (FDK_FYERS_*) may still say Fyers."""
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parents[1]
+    files = (list(root.glob("services/fdk_*/*.py")) + list(root.glob("shared/fdk_*.py"))
+             + [root / "fdk_main.py", root / "fdk_env.example", root / "scripts/fdk_files_md.py"])
+    offenders = []
+    for path in files:
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"fyers(?!dk)", line, re.I) and "FDK_FYERS_" not in line:
+                offenders.append(f"{path.relative_to(root).as_posix()}:{n}")
+    assert offenders == []
+
+
+def test_health_and_status_report_shoonya_running(offline):
+    from services.fdk_mcp_service.detector_tools import register_detector_tools
+    mcp = _FakeMCP()
+    register_detector_tools(mcp, _orchestrator())
+    status = asyncio.run(mcp.tools["get_detector_status"]())
+    assert "shoonya_running" in status and "fyers_running" not in status
+
 
 def test_nothing_imports_the_fyers_sdk():
     root = pathlib.Path(__file__).resolve().parents[1]

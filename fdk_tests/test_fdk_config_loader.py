@@ -5,8 +5,8 @@ from shared import fdk_config_loader as cfg
 
 COMMON = {
     "FDK_LOGIN_BOT_TOKEN": "t1", "FDK_LOGIN_CHAT_ID": "1",
-    "FDK_FYERS_TRADE_BOT_TOKEN": "t2", "FDK_FYERS_TRADE_CHAT_ID": "2",
-    "FDK_FYERS_SUMMARY_BOT_TOKEN": "t3", "FDK_FYERS_SUMMARY_CHAT_ID": "3",
+    "FDK_SHOONYA_TRADE_BOT_TOKEN": "t2", "FDK_SHOONYA_TRADE_CHAT_ID": "2",
+    "FDK_SHOONYA_SUMMARY_BOT_TOKEN": "t3", "FDK_SHOONYA_SUMMARY_CHAT_ID": "3",
     "FDK_PENNY_TRADE_BOT_TOKEN": "t4", "FDK_PENNY_TRADE_CHAT_ID": "4",
     "FDK_PENNY_SUMMARY_BOT_TOKEN": "t5", "FDK_PENNY_SUMMARY_CHAT_ID": "5",
     "FDK_SUPABASE_DSN": "postgresql://fake:fake@localhost/fake",
@@ -22,7 +22,12 @@ LEGACY = ("FDK_SHOONYA_VENDORCODE", "FDK_SHOONYA_API_KEY", "FDK_SHOONYA_IMEI",
           "FDK_SHOONYA_REDIRECT_URI")
 REMOVED_FYERS_LOGIN = ("FDK_BROKER", "FDK_FYERS_SECRET_KEY", "FDK_FYERS_REDIRECT_URI",
                        "FDK_FYERS_TOTP_SECRET", "FDK_FYERS_PIN", "FDK_FYERS_USERNAME")
-ALL_KEYS = (list(COMMON) + list(SHOONYA) + list(LEGACY) + list(REMOVED_FYERS_LOGIN)
+# The bot and sheet settings were renamed from FDK_FYERS_* on 2026-11-03; the old names are
+# read for one release.
+LEGACY_BOTS = ("FDK_FYERS_TRADE_BOT_TOKEN", "FDK_FYERS_TRADE_CHAT_ID",
+               "FDK_FYERS_SUMMARY_BOT_TOKEN", "FDK_FYERS_SUMMARY_CHAT_ID",
+               "FDK_FYERS_GOOGLE_SHEETS_ID", "FDK_SHOONYA_GOOGLE_SHEETS_ID")
+ALL_KEYS = (list(COMMON) + list(SHOONYA) + list(LEGACY) + list(REMOVED_FYERS_LOGIN) + list(LEGACY_BOTS)
             + ["FDK_FYERS_CLIENT_ID", "FDK_SHOONYA_AUTO_LOGIN", "FDK_TELEGRAM_WEBHOOK_SECRET"])
 
 
@@ -85,6 +90,36 @@ def test_webhook_secret_must_use_telegrams_charset(env):
         cfg.load_config()
     env.setenv("FDK_TELEGRAM_WEBHOOK_SECRET", "fdk_2026-Secret")
     assert cfg.load_config().telegram.webhook_secret == "fdk_2026-Secret"
+
+
+def test_bot_and_sheet_settings_use_shoonya_names(env):
+    env.setenv("FDK_SHOONYA_GOOGLE_SHEETS_ID", "sheet-1")
+    config = cfg.load_config()
+    assert config.telegram.shoonya_trade.bot_token == "t2"
+    assert config.telegram.shoonya_summary.chat_id == "3"
+    assert config.google.shoonya_sheet_id == "sheet-1"
+    assert not hasattr(config.telegram, "fyers_trade") and not hasattr(config.google, "fyers_sheet_id")
+
+
+def test_old_fyers_bot_and_sheet_names_still_work_for_one_release(env):
+    for key in ("FDK_SHOONYA_TRADE_BOT_TOKEN", "FDK_SHOONYA_TRADE_CHAT_ID",
+                "FDK_SHOONYA_SUMMARY_BOT_TOKEN", "FDK_SHOONYA_SUMMARY_CHAT_ID"):
+        env.delenv(key)
+    env.setenv("FDK_FYERS_TRADE_BOT_TOKEN", "old-t2")
+    env.setenv("FDK_FYERS_TRADE_CHAT_ID", "22")
+    env.setenv("FDK_FYERS_SUMMARY_BOT_TOKEN", "old-t3")
+    env.setenv("FDK_FYERS_SUMMARY_CHAT_ID", "33")
+    env.setenv("FDK_FYERS_GOOGLE_SHEETS_ID", "old-sheet")
+    config = cfg.load_config()
+    assert (config.telegram.shoonya_trade.bot_token, config.telegram.shoonya_trade.chat_id) == ("old-t2", "22")
+    assert config.telegram.shoonya_summary.bot_token == "old-t3"
+    assert config.google.shoonya_sheet_id == "old-sheet"
+
+
+def test_a_missing_bot_setting_is_named_by_its_new_name(env):
+    env.delenv("FDK_SHOONYA_TRADE_BOT_TOKEN")
+    with pytest.raises(KeyError, match="FDK_SHOONYA_TRADE_BOT_TOKEN"):
+        cfg.load_config()
 
 
 def test_secret_code_is_required(env):

@@ -5,7 +5,7 @@ Covers the three states the backend can be in:
   * FDK_ENABLED=true   -> detector builds, Telegram webhooks registered, /fdk/* and MCP serve
   * start-up failure   -> error is contained, backend keeps running, MCP news tools still serve
 
-Nothing here touches the network, Supabase, Telegram or Fyers: psycopg2 and
+Nothing here touches the network, Supabase, Telegram or Shoonya: psycopg2 and
 requests are faked, and the orchestrator loop is replaced with an idle task.
 """
 import asyncio
@@ -31,8 +31,8 @@ FDK_ENV = {
     "FDK_SHOONYA_CLIENT_ID": "FA12345_U",
     "FDK_SHOONYA_SECRET_CODE": "s" * 64,
     "FDK_LOGIN_BOT_TOKEN": "tok-login", "FDK_LOGIN_CHAT_ID": "1",
-    "FDK_FYERS_TRADE_BOT_TOKEN": "tok-ft", "FDK_FYERS_TRADE_CHAT_ID": "2",
-    "FDK_FYERS_SUMMARY_BOT_TOKEN": "tok-fs", "FDK_FYERS_SUMMARY_CHAT_ID": "3",
+    "FDK_SHOONYA_TRADE_BOT_TOKEN": "tok-ft", "FDK_SHOONYA_TRADE_CHAT_ID": "2",
+    "FDK_SHOONYA_SUMMARY_BOT_TOKEN": "tok-fs", "FDK_SHOONYA_SUMMARY_CHAT_ID": "3",
     "FDK_PENNY_TRADE_BOT_TOKEN": "tok-pt", "FDK_PENNY_TRADE_CHAT_ID": "4",
     "FDK_PENNY_SUMMARY_BOT_TOKEN": "tok-ps", "FDK_PENNY_SUMMARY_CHAT_ID": "5",
     "FDK_SUPABASE_DSN": "postgresql://fake:fake@localhost/fake",
@@ -163,7 +163,8 @@ def test_enabled_builds_registers_and_serves(fresh_state, monkeypatch, posted,
 
         health = client.get("/fdk/health").json()
         assert health["status"] == "healthy"
-        assert health["fyers_running"] is False and health["penny_running"] is False
+        assert health["shoonya_running"] is False and health["penny_running"] is False
+        assert "fyers_running" not in health
         assert health["broker"] == "shoonya"
         assert health["authenticated"] is False
         assert health["last_login_at"] is None
@@ -213,7 +214,7 @@ def test_enabled_builds_registers_and_serves(fresh_state, monkeypatch, posted,
         # MCP mounted under /fdk and answering (stateless, JSON responses)
         init = _mcp(client, "initialize", protocolVersion="2025-06-18", capabilities={},
                     clientInfo={"name": "fdk-test", "version": "0"})
-        assert init["result"]["serverInfo"]["name"] == "fyersdk"
+        assert init["result"]["serverInfo"]["name"] == "fdk"
         tools = {t["name"] for t in _mcp(client, "tools/list", _id=2)["result"]["tools"]}
         assert {"get_detector_status", "get_volume_summary",
                 "list_monitored_symbols", "fetch_news_headlines"} <= tools

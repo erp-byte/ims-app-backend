@@ -1,4 +1,4 @@
-"""MCP server (Streamable HTTP) — news tools + Fyers detector tools.
+"""MCP server (Streamable HTTP) — news tools + detector tools.
 
 Mounted into the Candor backend under /fdk; reachable at /fdk/mcp (or
 /fdk/mcp-<secret> when FDK_MCP_PATH_SECRET is set). Add it in Claude as a
@@ -11,7 +11,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from shared.fdk_logger import get_logger
 from .news_tools import register_news_tools
-from .fyers_tools import register_fyers_tools
+from .detector_tools import register_detector_tools
 
 log = get_logger("mcp_server")
 
@@ -45,7 +45,7 @@ def build_mcp(orchestrator=None) -> FastMCP:
     Render free tier (no sticky sessions) and Claude custom connectors.
     """
     mcp = FastMCP(
-        "fyersdk",
+        "fdk",
         instructions=(
             "News + Shoonya volume spike detector tools. "
             "Use fetch_news_headlines with any RSS URL (see list_news_feeds), "
@@ -64,7 +64,7 @@ def build_mcp(orchestrator=None) -> FastMCP:
     mcp.settings.streamable_http_path = mcp_path()
 
     register_news_tools(mcp, news_sender=_news_sender(orchestrator))
-    register_fyers_tools(mcp, orchestrator)
+    register_detector_tools(mcp, orchestrator)
 
     log.info(f"MCP server built, endpoint path: {mcp.settings.streamable_http_path}")
     return mcp

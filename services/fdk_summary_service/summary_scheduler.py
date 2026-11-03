@@ -19,7 +19,7 @@ class SummaryScheduler:
         """Run every generator, isolating failures.
 
         One detector's summary must never suppress another's: the generators
-        are independent, so a raising fyers generator is logged and the
+        are independent, so a raising shoonya generator is logged and the
         fan-out continues to penny. Never propagates — the caller can then
         always mark the day done instead of re-running the survivors every
         60s until midnight.

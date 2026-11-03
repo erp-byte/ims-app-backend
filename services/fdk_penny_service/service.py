@@ -1,4 +1,4 @@
-"""Penny stock detector service — isolated from fyers."""
+"""Penny stock detector service — isolated from shoonya."""
 from shared.fdk_logger import get_logger
 from shared.fdk_models import DetectorConfig
 from shared.fdk_constants import PENNY_TRADE_THRESHOLD

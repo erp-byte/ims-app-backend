@@ -1,8 +1,8 @@
 """Unit tests for SummaryScheduler fan-out.
 
-The scheduler drives [fyers, penny] in order. Regression cover for two
+The scheduler drives [shoonya, penny] in order. Regression cover for two
 coupling bugs: a raising generator used to abort the whole for-loop (so a
-fyers failure silently suppressed the penny summary too) and left
+shoonya failure silently suppressed the penny summary too) and left
 _last_sent_date unset, re-running the survivors every 60s until midnight.
 """
 import asyncio
@@ -37,23 +37,23 @@ def _run(generators):
 
 
 def test_all_generators_run_when_all_succeed():
-    assert _run([_Gen("fyers"), _Gen("penny")]) == ["fyers", "penny"]
+    assert _run([_Gen("shoonya"), _Gen("penny")]) == ["shoonya", "penny"]
 
 
 def test_raising_generator_does_not_block_the_next_one():
-    """A fyers explosion must not cost the penny summary."""
-    assert _run([_Gen("fyers", raises=True), _Gen("penny")]) == ["fyers", "penny"]
+    """A shoonya explosion must not cost the penny summary."""
+    assert _run([_Gen("shoonya", raises=True), _Gen("penny")]) == ["shoonya", "penny"]
 
 
 def test_send_all_never_propagates(caplog):
     with caplog.at_level(logging.ERROR, logger="fdk.summary_scheduler"):
-        _run([_Gen("fyers", raises=True), _Gen("penny")])
+        _run([_Gen("shoonya", raises=True), _Gen("penny")])
     logged = " ".join(r.getMessage() for r in caplog.records)
-    assert "fyers" in logged and "exploded" in logged
+    assert "shoonya" in logged and "exploded" in logged
 
 
 def test_generator_returning_false_is_logged(caplog):
     with caplog.at_level(logging.WARNING, logger="fdk.summary_scheduler"):
-        _run([_Gen("fyers", result=False), _Gen("penny")])
+        _run([_Gen("shoonya", result=False), _Gen("penny")])
     logged = " ".join(r.getMessage() for r in caplog.records)
-    assert "fyers" in logged
+    assert "shoonya" in logged

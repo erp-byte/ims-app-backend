@@ -1,4 +1,4 @@
-# fdk — Fyers Volume Spike Detector. Every variable fdk reads, all prefixed FDK_.
+# fdk — Shoonya volume-spike detector. Every variable fdk reads, all prefixed FDK_.
 # Copy the ones you need into .env (or the host's env). Enable on ONE backend
 # instance only: each enabled instance runs its own detector and re-points the
 # Telegram webhooks to FDK_BASE_URL.
@@ -31,10 +31,10 @@ FDK_CHROMEDRIVER=                  # optional: chromedriver path (default /usr/b
 # when they come from one of these chat ids (long polling listens to the login chat alone).
 FDK_LOGIN_BOT_TOKEN=
 FDK_LOGIN_CHAT_ID=
-FDK_FYERS_TRADE_BOT_TOKEN=
-FDK_FYERS_TRADE_CHAT_ID=
-FDK_FYERS_SUMMARY_BOT_TOKEN=
-FDK_FYERS_SUMMARY_CHAT_ID=
+FDK_SHOONYA_TRADE_BOT_TOKEN=        # large-cap alerts (the old FDK_FYERS_* names are still read for one release)
+FDK_SHOONYA_TRADE_CHAT_ID=
+FDK_SHOONYA_SUMMARY_BOT_TOKEN=      # large-cap daily summary
+FDK_SHOONYA_SUMMARY_CHAT_ID=
 FDK_PENNY_TRADE_BOT_TOKEN=
 FDK_PENNY_TRADE_CHAT_ID=
 FDK_PENNY_SUMMARY_BOT_TOKEN=
@@ -44,7 +44,7 @@ FDK_NEWS_CHAT_ID=
 FDK_TELEGRAM_WEBHOOK_SECRET=       # recommended in webhook mode (1-256 chars of A-Z a-z 0-9 _ -): sent to setWebhook; deliveries without the matching X-Telegram-Bot-Api-Secret-Token header get 403. Polling mode: the webhook route answers 404
 
 # Google Sheets — either the JSON blob, or the individual service-account fields
-FDK_FYERS_GOOGLE_SHEETS_ID=
+FDK_SHOONYA_GOOGLE_SHEETS_ID=       # large-cap alert sheet (FDK_FYERS_GOOGLE_SHEETS_ID still read for one release)
 FDK_PENNY_GOOGLE_SHEETS_ID=
 FDK_GOOGLE_CREDENTIALS_JSON=
 FDK_GOOGLE_PROJECT_ID=

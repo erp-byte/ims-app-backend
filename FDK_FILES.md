@@ -94,6 +94,9 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_client_id_defaults_to_username_with_the_retail_suffix
 - test_webhook_secret_is_optional
 - test_webhook_secret_must_use_telegrams_charset
+- test_bot_and_sheet_settings_use_shoonya_names
+- test_old_fyers_bot_and_sheet_names_still_work_for_one_release
+- test_a_missing_bot_setting_is_named_by_its_new_name
 - test_secret_code_is_required
 - test_blank_shoonya_credentials_are_rejected
 - test_registered_redirect_is_kept_as_a_hint_for_the_browser_login
@@ -240,6 +243,8 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - test_listing_symbols_defaults_to_the_shoonya_label
 - test_the_fyers_label_is_no_longer_accepted
 - test_operator_messages_do_not_name_the_old_broker
+- test_the_fyers_name_is_gone_from_the_current_code
+- test_health_and_status_report_shoonya_running
 - test_nothing_imports_the_fyers_sdk
 - test_the_fyers_sdk_is_not_installed_by_the_image
 
@@ -708,37 +713,17 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - TickDispatcher.connect
 - TickDispatcher.close
 
-### services/fdk_fyers_service/__init__.py
-- (none)
-
-### services/fdk_fyers_service/service.py
-- FyersService
-- FyersService.__init__
-- FyersService.build
-- FyersService.start
-- FyersService.stop
-- FyersService.detector
-- FyersService.is_running
-- FyersService.token_expired
-- FyersService.update_token
-
-### services/fdk_fyers_service/summary.py
-- FyersSummaryService
-- FyersSummaryService.__init__
-- FyersSummaryService.send_today
-- FyersSummaryService.send_for_date
-
 ### services/fdk_mcp_service/__init__.py
 - (none)
 
-### services/fdk_mcp_service/fyers_tools.py
+### services/fdk_mcp_service/detector_tools.py
 - _parse_date
-- register_fyers_tools
-- register_fyers_tools._unavailable
-- register_fyers_tools.get_detector_status
-- register_fyers_tools.get_volume_summary
-- register_fyers_tools.list_monitored_symbols
-- register_fyers_tools.get_sector_mapping
+- register_detector_tools
+- register_detector_tools._unavailable
+- register_detector_tools.get_detector_status
+- register_detector_tools.get_volume_summary
+- register_detector_tools.list_monitored_symbols
+- register_detector_tools.get_sector_mapping
 
 ### services/fdk_mcp_service/news_tools.py
 - _fetch_feed_sync
@@ -842,6 +827,26 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 
 ### services/fdk_sheets_service/tools.py
 - (none)
+
+### services/fdk_shoonya_service/__init__.py
+- (none)
+
+### services/fdk_shoonya_service/service.py
+- ShoonyaService
+- ShoonyaService.__init__
+- ShoonyaService.build
+- ShoonyaService.start
+- ShoonyaService.stop
+- ShoonyaService.detector
+- ShoonyaService.is_running
+- ShoonyaService.token_expired
+- ShoonyaService.update_token
+
+### services/fdk_shoonya_service/summary.py
+- ShoonyaSummaryService
+- ShoonyaSummaryService.__init__
+- ShoonyaSummaryService.send_today
+- ShoonyaSummaryService.send_for_date
 
 ### services/fdk_summary_service/__init__.py
 - (none)
@@ -991,6 +996,7 @@ Every file that belongs to fdk (the Shoonya volume spike detector merged from fy
 - _first_present
 - _shoonya_config
 - _channel
+- _channel.read
 - _webhook_secret
 - _optional_channel
 - load_config

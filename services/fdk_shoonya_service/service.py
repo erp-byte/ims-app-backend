@@ -1,17 +1,17 @@
-"""Fyers large-cap detector service — isolated from penny."""
+"""Shoonya large-cap detector service — isolated from penny."""
 from shared.fdk_logger import get_logger
 from shared.fdk_models import DetectorConfig
-from shared.fdk_constants import FYERS_TRADE_THRESHOLD
+from shared.fdk_constants import SHOONYA_TRADE_THRESHOLD
 from services.fdk_detector_service.detector import VolumeSpikeDetector
 from services.fdk_sheets_service import GoogleSheetsManager
 from services.fdk_telegram_service import TelegramSender
 from services.fdk_supervisor_service.run_controller import RunController
 
-log = get_logger("fyers_service")
+log = get_logger("shoonya_service")
 
 
-class FyersService:
-    """Encapsulates the fyers detector lifecycle."""
+class ShoonyaService:
+    """Encapsulates the shoonya detector lifecycle."""
 
     def __init__(self, sheet_id: str,
                  google_credentials: dict,
@@ -29,7 +29,7 @@ class FyersService:
         """Build the detector and controller. Call after auth."""
         dc = DetectorConfig(
             name="shoonya",
-            threshold=FYERS_TRADE_THRESHOLD,
+            threshold=SHOONYA_TRADE_THRESHOLD,
             google_sheet_id=self.sheet_id,
             symbols=symbols,
             sector_mapping=sector_map,
@@ -40,8 +40,8 @@ class FyersService:
             sheets, self.trade_sender, self.summary_sender,
         )
         self._controller = RunController(self._detector)
-        log.info(f"Fyers service built ({len(symbols)} symbols, "
-                 f"threshold Rs{FYERS_TRADE_THRESHOLD / 10_000_000:.1f} Cr)")
+        log.info(f"Shoonya service built ({len(symbols)} symbols, "
+                 f"threshold Rs{SHOONYA_TRADE_THRESHOLD / 10_000_000:.1f} Cr)")
 
     def start(self):
         if self._controller and not self._controller.is_running:

@@ -2,15 +2,15 @@
 
 
 class AuthenticationError(Exception):
-    """Fyers authentication failed."""
+    """Shoonya authentication failed."""
 
 
 class TokenExpiredError(Exception):
-    """Fyers access token has expired."""
+    """Shoonya access token has expired."""
 
 
 class WebSocketError(Exception):
-    """Fyers WebSocket connection error."""
+    """Shoonya WebSocket connection error."""
 
 
 class SupabaseError(Exception):

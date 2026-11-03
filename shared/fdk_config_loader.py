@@ -38,8 +38,8 @@ class TelegramChannel:
 @dataclass
 class TelegramConfig:
     login: TelegramChannel
-    fyers_trade: TelegramChannel
-    fyers_summary: TelegramChannel
+    shoonya_trade: TelegramChannel        # large-cap alerts
+    shoonya_summary: TelegramChannel      # large-cap daily summary
     penny_trade: TelegramChannel
     penny_summary: TelegramChannel
     news: TelegramChannel | None = None  # optional — news bot (MCP send)
@@ -49,7 +49,7 @@ class TelegramConfig:
 @dataclass
 class GoogleConfig:
     credentials: dict | None
-    fyers_sheet_id: str
+    shoonya_sheet_id: str                 # large-cap alert sheet
     penny_sheet_id: str
 
 
@@ -60,7 +60,7 @@ class SupabaseConfig:
 
 @dataclass
 class AppConfig:
-    shoonya: ShoonyaConfig                # the only login (the Fyers login was removed)
+    shoonya: ShoonyaConfig                # the only login
     telegram: TelegramConfig
     google: GoogleConfig
     supabase: SupabaseConfig
@@ -103,11 +103,20 @@ def _shoonya_config() -> ShoonyaConfig:
     )
 
 
-def _channel(token_env: str, chat_id_env: str) -> TelegramChannel:
-    return TelegramChannel(
-        bot_token=os.environ[token_env],
-        chat_id=os.environ[chat_id_env],
-    )
+def _channel(token_env: str, chat_id_env: str,
+             legacy: tuple[str, str] | None = None) -> TelegramChannel:
+    """A bot+chat pair. `legacy` names (the FDK_FYERS_* ones, renamed 2026-11-03) are
+    read when the new ones are absent, for one release; a missing value names the new key."""
+    old_token, old_chat = legacy or (None, None)
+
+    def read(key, old):
+        if key in os.environ:
+            return os.environ[key]
+        if old and old in os.environ:
+            return os.environ[old]
+        raise KeyError(key)
+
+    return TelegramChannel(bot_token=read(token_env, old_token), chat_id=read(chat_id_env, old_chat))
 
 
 # Telegram's setWebhook accepts secret_token only as 1-256 chars of A-Z a-z 0-9 _ -
@@ -140,8 +149,10 @@ def load_config() -> AppConfig:
         shoonya=_shoonya_config(),
         telegram=TelegramConfig(
             login=_channel("FDK_LOGIN_BOT_TOKEN", "FDK_LOGIN_CHAT_ID"),
-            fyers_trade=_channel("FDK_FYERS_TRADE_BOT_TOKEN", "FDK_FYERS_TRADE_CHAT_ID"),
-            fyers_summary=_channel("FDK_FYERS_SUMMARY_BOT_TOKEN", "FDK_FYERS_SUMMARY_CHAT_ID"),
+            shoonya_trade=_channel("FDK_SHOONYA_TRADE_BOT_TOKEN", "FDK_SHOONYA_TRADE_CHAT_ID",
+                                   legacy=("FDK_FYERS_TRADE_BOT_TOKEN", "FDK_FYERS_TRADE_CHAT_ID")),
+            shoonya_summary=_channel("FDK_SHOONYA_SUMMARY_BOT_TOKEN", "FDK_SHOONYA_SUMMARY_CHAT_ID",
+                                     legacy=("FDK_FYERS_SUMMARY_BOT_TOKEN", "FDK_FYERS_SUMMARY_CHAT_ID")),
             penny_trade=_channel("FDK_PENNY_TRADE_BOT_TOKEN", "FDK_PENNY_TRADE_CHAT_ID"),
             penny_summary=_channel("FDK_PENNY_SUMMARY_BOT_TOKEN", "FDK_PENNY_SUMMARY_CHAT_ID"),
             news=_optional_channel("FDK_NEWS_BOT_TOKEN", "FDK_NEWS_CHAT_ID"),
@@ -149,7 +160,8 @@ def load_config() -> AppConfig:
         ),
         google=GoogleConfig(
             credentials=google_creds,
-            fyers_sheet_id=os.environ.get("FDK_FYERS_GOOGLE_SHEETS_ID", ""),
+            shoonya_sheet_id=(os.environ.get("FDK_SHOONYA_GOOGLE_SHEETS_ID")
+                              or os.environ.get("FDK_FYERS_GOOGLE_SHEETS_ID", "")),
             penny_sheet_id=os.environ.get("FDK_PENNY_GOOGLE_SHEETS_ID", ""),
         ),
         supabase=SupabaseConfig(

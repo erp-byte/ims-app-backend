@@ -11,7 +11,7 @@ OUT = ROOT / "FDK_FILES.md"
 FDK_DIRS = [
     "services/fdk_auth_service",
     "services/fdk_detector_service",
-    "services/fdk_fyers_service",
+    "services/fdk_shoonya_service",
     "services/fdk_mcp_service",
     "services/fdk_penny_service",
     "services/fdk_sector_service",

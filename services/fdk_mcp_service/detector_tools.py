@@ -1,11 +1,11 @@
-"""Fyers tools — read-only views over the volume spike detector system."""
+"""Detector tools — read-only views over the volume spike detector system."""
 import asyncio
 from datetime import datetime
 
 from shared.fdk_constants import IST
 from shared.fdk_logger import get_logger
 
-log = get_logger("mcp_fyers")
+log = get_logger("mcp_detector")
 
 VALID_DETECTORS = ("shoonya", "penny")
 
@@ -19,8 +19,8 @@ def _parse_date(date_str: str) -> datetime | None:
     return None
 
 
-def register_fyers_tools(mcp, orchestrator) -> None:
-    """Attach Fyers detector tools to a FastMCP instance.
+def register_detector_tools(mcp, orchestrator) -> None:
+    """Attach the detector tools to a FastMCP instance.
 
     orchestrator may be None (standalone/test mode) — tools then report
     that the detector system is unavailable.
@@ -46,7 +46,7 @@ def register_fyers_tools(mcp, orchestrator) -> None:
             "last_auth_error": getattr(auth, "last_error", None),
             "on_hold": orchestrator.on_hold,
             "feed": orchestrator.feed_status(),
-            "fyers_running": orchestrator.fyers.is_running,
+            "shoonya_running": orchestrator.shoonya.is_running,
             "penny_running": orchestrator.penny.is_running,
             "market_hours": is_market_hours(),
             "authenticated": orchestrator.authenticator.is_authenticated,
@@ -76,7 +76,7 @@ def register_fyers_tools(mcp, orchestrator) -> None:
             if target is None:
                 return {"error": "Invalid date. Use DD-MM-YYYY."}
 
-        service = (orchestrator.fyers_summary if detector == "shoonya"
+        service = (orchestrator.shoonya_summary if detector == "shoonya"
                    else orchestrator.penny_summary)
         days_back = max(0, min(int(days_back), 31))
         label = {0: "Daily"}.get(days_back, f"{days_back + 1}-Day")

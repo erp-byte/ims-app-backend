@@ -19,7 +19,7 @@ from services.fdk_summary_service import SummaryScheduler
 from services.fdk_sector_service import SymbolManager, init_sector_mapping
 from services.fdk_sector_service.instrument_refresh import InstrumentRefresher
 from services.fdk_detector_service.websocket_manager import TickDispatcher
-from services.fdk_fyers_service import FyersService, FyersSummaryService
+from services.fdk_shoonya_service import ShoonyaService, ShoonyaSummaryService
 from services.fdk_penny_service import PennyService, PennySummaryService
 from .schedular import (
     feed_should_be_live, is_market_hours, should_refresh_instruments, should_reset_tokens,
@@ -48,8 +48,8 @@ class Orchestrator:
 
         # Create 5 TelegramSender instances (one per bot+chat pair)
         self.login_sender = TelegramSender(config.telegram.login)
-        self.fyers_trade_sender = TelegramSender(config.telegram.fyers_trade)
-        self.fyers_summary_sender = TelegramSender(config.telegram.fyers_summary)
+        self.shoonya_trade_sender = TelegramSender(config.telegram.shoonya_trade)
+        self.shoonya_summary_sender = TelegramSender(config.telegram.shoonya_summary)
         self.penny_trade_sender = TelegramSender(config.telegram.penny_trade)
         self.penny_summary_sender = TelegramSender(config.telegram.penny_summary)
 
@@ -62,10 +62,10 @@ class Orchestrator:
         self.authenticator.keep_waiting = self._login_wait_allowed
 
         # Isolated services — each manages its own detector + controller
-        self.fyers = FyersService(
-            config.google.fyers_sheet_id,
+        self.shoonya = ShoonyaService(
+            config.google.shoonya_sheet_id,
             config.google.credentials,
-            self.fyers_trade_sender, self.fyers_summary_sender,
+            self.shoonya_trade_sender, self.shoonya_summary_sender,
         )
         self.penny = PennyService(
             config.google.penny_sheet_id,
@@ -90,9 +90,9 @@ class Orchestrator:
         self._instrument_tokens: dict[str, str] = {}
 
         # Isolated summary services
-        self.fyers_summary = FyersSummaryService(
+        self.shoonya_summary = ShoonyaSummaryService(
             config.google.credentials,
-            config.google.fyers_sheet_id, self.fyers_summary_sender,
+            config.google.shoonya_sheet_id, self.shoonya_summary_sender,
         )
         self.penny_summary = PennySummaryService(
             config.google.credentials,
@@ -114,7 +114,7 @@ class Orchestrator:
     def hold(self):
         """Stop all detectors and enter hold mode."""
         self.on_hold = True
-        self.fyers.stop()
+        self.shoonya.stop()
         self.penny.stop()
         self._close_dispatcher()
         self.authenticator.cancel_auth()
@@ -125,14 +125,14 @@ class Orchestrator:
         joins and the socket close run in a worker thread so the backend stays responsive."""
         self.on_hold = True
         self.authenticator.cancel_auth()
-        await asyncio.to_thread(self.fyers.stop)
+        await asyncio.to_thread(self.shoonya.stop)
         await asyncio.to_thread(self.penny.stop)
         await self._close_dispatcher_async()
         log.info("Detectors on hold")
 
     async def _stop_detectors(self):
         """stop() can wait on a Sheets call in flight, and this loop is shared with the backend."""
-        await asyncio.to_thread(self.fyers.stop)
+        await asyncio.to_thread(self.shoonya.stop)
         await asyncio.to_thread(self.penny.stop)
 
     def _login_wait_allowed(self) -> bool:
@@ -164,7 +164,7 @@ class Orchestrator:
         log.info("Restart requested")
 
     def _any_token_expired(self) -> bool:
-        return self.fyers.token_expired or self.penny.token_expired
+        return self.shoonya.token_expired or self.penny.token_expired
 
     def feed_status(self) -> dict:
         """For /fdk/health and the MCP status tool: a dead feed must not look healthy."""
@@ -193,11 +193,11 @@ class Orchestrator:
 
     def _connect_dispatcher(self):
         """Create and connect the shared Shoonya feed for both detectors."""
-        detectors = [d for d in (self.fyers.detector, self.penny.detector) if d]
+        detectors = [d for d in (self.shoonya.detector, self.penny.detector) if d]
         username = self.config.shoonya.username
         token = self.authenticator.access_token
         # Clears any earlier rejection: from here on the flag can only mean this socket.
-        self.fyers.update_token(token)
+        self.shoonya.update_token(token)
         self.penny.update_token(token)
         # Opened during continuous trading (a rebuild, /rst): ticks are due at once, so
         # "Monitoring Started" waits for the first one and silence counts from now.
@@ -225,7 +225,7 @@ class Orchestrator:
                 self._feed_announced = True
                 await self.login_sender.send_async(
                     monitoring_started_message(
-                        dispatcher.monitored(self.fyers.detector),
+                        dispatcher.monitored(self.shoonya.detector),
                         dispatcher.monitored(self.penny.detector),
                     )
                 )
@@ -315,7 +315,7 @@ class Orchestrator:
             return  # cancelled by /hld or /rst
 
         token = self.authenticator.access_token
-        self.fyers.update_token(token)
+        self.shoonya.update_token(token)
         self.penny.update_token(token)
 
     async def _authenticate_with_checks(self) -> bool:
@@ -382,7 +382,7 @@ class Orchestrator:
     async def run(self):
         """Main supervisor loop."""
         # Start summary scheduler (runs independently at 16:30 IST)
-        generators = [self.fyers_summary.generator, self.penny_summary.generator]
+        generators = [self.shoonya_summary.generator, self.penny_summary.generator]
         summary_scheduler = SummaryScheduler(generators)
         # Keep a strong reference: the event loop only holds a weak one, so an
         # un-stored task can be garbage-collected mid-flight, silently killing
@@ -427,7 +427,7 @@ class Orchestrator:
                     continue
 
                 if self.config.scheduling_enabled and not is_market_hours():
-                    if self.fyers.is_running or self.penny.is_running or self._dispatcher:
+                    if self.shoonya.is_running or self.penny.is_running or self._dispatcher:
                         log.info("Outside market hours, stopping detectors")
                         await self._stop_detectors()
                         await self._close_dispatcher_async()
@@ -450,7 +450,7 @@ class Orchestrator:
                 if not self._services_built:
                     token = self.authenticator.access_token
                     await asyncio.to_thread(
-                        self.fyers.build, token, self._shoonya_symbols, self._sectors)
+                        self.shoonya.build, token, self._shoonya_symbols, self._sectors)
                     await asyncio.to_thread(
                         self.penny.build, token, self._penny_symbols, self._sectors)
                     self._services_built = True
@@ -498,7 +498,7 @@ class Orchestrator:
                     await self._close_dispatcher_async()
                     continue
 
-                self.fyers.start()
+                self.shoonya.start()
                 self.penny.start()
 
                 await asyncio.sleep(SUPERVISOR_POLL)

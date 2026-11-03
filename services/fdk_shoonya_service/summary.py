@@ -1,14 +1,14 @@
-"""Fyers summary service — isolated from penny."""
+"""Shoonya summary service — isolated from penny."""
 from datetime import datetime
 from shared.fdk_logger import get_logger
 from services.fdk_summary_service import SummaryGenerator
 from services.fdk_telegram_service import TelegramSender
 
-log = get_logger("fyers_summary")
+log = get_logger("shoonya_summary")
 
 
-class FyersSummaryService:
-    """Encapsulates fyers summary generation and sending."""
+class ShoonyaSummaryService:
+    """Encapsulates shoonya summary generation and sending."""
 
     def __init__(self, google_credentials: dict | None,
                  sheet_id: str, summary_sender: TelegramSender):

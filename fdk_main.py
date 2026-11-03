@@ -1,4 +1,4 @@
-"""fdk — Fyers Volume Spike Detector, hosted inside the Candor backend.
+"""fdk — Shoonya volume-spike detector, hosted inside the Candor backend.
 
 Adapted from fyersdk/main.py (the standalone FastAPI entry point). The backend
 touches fdk in exactly three marked places, all in main.py:
@@ -99,7 +99,7 @@ async def fdk_health_check():
         "telegram_mode": fdk_state.telegram_mode,
         "market_hours": is_market_hours(),
         "scheduling_enabled": orchestrator.config.scheduling_enabled,
-        "fyers_running": orchestrator.fyers.is_running,
+        "shoonya_running": orchestrator.shoonya.is_running,
         "penny_running": orchestrator.penny.is_running,
         "feed": orchestrator.feed_status(),
     }
@@ -157,8 +157,8 @@ def _register_telegram(config: AppConfig) -> list[str]:
     if BASE_URL:
         for channel in [
             config.telegram.login,
-            config.telegram.fyers_trade,
-            config.telegram.fyers_summary,
+            config.telegram.shoonya_trade,
+            config.telegram.shoonya_summary,
             config.telegram.penny_trade,
             config.telegram.penny_summary,
         ]:
@@ -235,7 +235,7 @@ async def fdk_lifespan():
         tg = config.telegram
         init_auth_router(
             orchestrator=orchestrator, login_sender=orchestrator.login_sender,
-            allowed_chat_ids=[c.chat_id for c in (tg.login, tg.fyers_trade, tg.fyers_summary,
+            allowed_chat_ids=[c.chat_id for c in (tg.login, tg.shoonya_trade, tg.shoonya_summary,
                                                   tg.penny_trade, tg.penny_summary)],
             webhook_secret=tg.webhook_secret,
             webhook_enabled=bool(BASE_URL),
@@ -264,7 +264,7 @@ async def fdk_lifespan():
         fdk_state.task.add_done_callback(_log_supervisor_exit)
 
     try:
-        # News tools work even without the detector; fyers tools then report "unavailable".
+        # News tools work even without the detector; detector tools then report "unavailable".
         fdk_state.mcp, fdk_state.mcp_app = _build_mcp(orchestrator)
     except Exception as exc:
         log.error("fdk MCP endpoint not available: %s", exc)

@@ -163,7 +163,7 @@ async def _handle_send_summary():
         await _login_sender.send_async(summary_generating_message())
 
     log.info("Send summary command received")
-    await _orchestrator.fyers_summary.send_today()
+    await _orchestrator.shoonya_summary.send_today()
     await _orchestrator.penny_summary.send_today()
 
     return {"status": "summary_sent"}
@@ -203,7 +203,7 @@ async def _handle_summary_date_input(text: str):
         )
 
     log.info(f"Generating summaries for {date_str} ({day_name})")
-    await _orchestrator.fyers_summary.send_for_date(target_date)
+    await _orchestrator.shoonya_summary.send_for_date(target_date)
     await _orchestrator.penny_summary.send_for_date(target_date)
 
     return {"status": "summary_sent", "date": date_str}

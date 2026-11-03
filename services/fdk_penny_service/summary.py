@@ -1,4 +1,4 @@
-"""Penny summary service — isolated from fyers."""
+"""Penny summary service — isolated from shoonya."""
 from datetime import datetime
 from shared.fdk_logger import get_logger
 from services.fdk_summary_service import SummaryGenerator

@@ -2723,8 +2723,13 @@ def update_inward(
             {"txno": transaction_no},
         ).fetchall()
         # Primary key = line_number; fall back to item_description for legacy rows whose
-        # line_number is still NULL (pre-migration) or absent.
-        existing_art_by_line = {r.line_number: dict(r._mapping) for r in existing_arts if r.line_number is not None}
+        # line_number is still NULL (pre-migration) or absent. The _bulk_entry_* article
+        # table has no line_number column at all, so there it is description-keyed only —
+        # reading r.line_number there raises (prod 2026-11-03, TR-20261103164557).
+        _v2_art = _is_v2_tables(tables)
+        existing_art_by_line = {
+            r.line_number: dict(r._mapping) for r in existing_arts if r.line_number is not None
+        } if _v2_art else {}
         existing_art_by_desc = {r.item_description: dict(r._mapping) for r in existing_arts}
 
         for article in payload.articles:
@@ -2771,9 +2776,14 @@ def update_inward(
                         art_changes,
                     )
             else:
-                # New article — insert
+                # New article — insert. line_number only exists on the _v2 tables; the
+                # _bulk_entry_* fallback omits the column (same rule as the box insert below).
+                _ins_cols, _ins_params = _ARTICLE_COLUMNS, _ARTICLE_PARAMS
+                if not _v2_art:
+                    _ins_cols = _ins_cols.replace("line_number, ", "")
+                    _ins_params = _ins_params.replace(":line_number, ", "")
                 db.execute(
-                    text(f"INSERT INTO {tables['art']} ({_ARTICLE_COLUMNS}) VALUES ({_ARTICLE_PARAMS})"),
+                    text(f"INSERT INTO {tables['art']} ({_ins_cols}) VALUES ({_ins_params})"),
                     [art_data],
                 )
             articles_count += 1
